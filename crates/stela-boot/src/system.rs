@@ -329,6 +329,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         || system.install_source.is_some()
         || system.nor.is_some()
         || system.network_check.is_some()
+        || system.gpu_check
         || system.audio_check.is_some()
         || !system.usb_storage.is_empty()
         || system.input

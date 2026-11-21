@@ -303,6 +303,10 @@ pub struct System {
     /// POST once to this `http://` URL at start and report the reply
     /// (`--network-check URL`).
     pub network_check: Option<String>,
+    /// Start the PC's GPUs as a macOS boot does, report what each driver
+    /// bound and whether a Metal device opened, and stop before the guest's
+    /// storage is opened or any guest instruction runs (`--gpu-check`).
+    pub gpu_check: bool,
     /// Check exclusively owned conventional HDA after ExitBootServices.
     pub audio_check: Option<AudioCheck>,
     /// Explicit whole-controller handoff for the audio check's physical clock.
@@ -405,6 +409,7 @@ impl Default for System {
             profile: false,
             ecid: None,
             network_check: None,
+            gpu_check: false,
             audio_check: None,
             audio_own_hpet: false,
             native_pci_own_ioapic: false,
@@ -683,6 +688,7 @@ impl System {
             (self.audio_check.is_some(), "--audio-check"),
             (self.audio_own_hpet, "--audio-own-hpet"),
             (self.network_check.is_some(), "--network-check"),
+            (self.gpu_check, "--gpu-check"),
         ]
         .into_iter()
         .find_map(|(enabled, flag)| enabled.then_some(flag))
@@ -862,6 +868,7 @@ impl fmt::Display for System {
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
+        line.flag("--gpu-check", self.gpu_check)?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
         line.flag("--native-pci-own-ioapic", self.native_pci_own_ioapic)?;
