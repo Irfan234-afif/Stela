@@ -40,9 +40,28 @@ fn diagnostic_options_are_typed() {
             "--native-shared-check",
         ),
         ("--system --gpu-check", "--gpu-check"),
+        ("--system --restart-at-stop", "--restart-at-stop"),
     ] {
         assert_eq!(System::parse(text).unwrap().diagnostic_option(), Some(flag));
     }
+}
+
+#[test]
+fn restart_at_stop_round_trips_beside_a_check_and_is_given_once() {
+    for text in [
+        "--system --restart-at-stop",
+        "--system --gpu-check --restart-at-stop",
+        &format!("--system --storage {DISK} --external-disks --restart-at-stop"),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert!(options.restart_at_stop, "{text}");
+        assert_eq!(System::parse(&options.to_string()), Ok(options), "{text}");
+    }
+    assert!(!System::default().restart_at_stop);
+    assert_eq!(
+        System::parse("--system --restart-at-stop --restart-at-stop").unwrap_err(),
+        Error::DuplicateRestartAtStop
+    );
 }
 
 #[test]

@@ -839,6 +839,9 @@ fn load(
     if let Some(power) = &power {
         crate::stop::arm(power, tsc_hz);
     }
+    if system.restart_at_stop {
+        crate::stop::restart_at_stop();
+    }
     let random_seed = match crate::entropy::retain_seed() {
         Ok((region, source)) => {
             output::arguments(format_args!("HOST entropy seeded source={source}\n"));

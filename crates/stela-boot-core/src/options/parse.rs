@@ -214,6 +214,9 @@ impl ParseState<'_> {
                 flag(&mut options.audio_own_hpet, Error::DuplicateAudioHpet)?;
             }
             "--gpu-check" => flag(&mut options.gpu_check, Error::DuplicateGpuCheck)?,
+            "--restart-at-stop" => {
+                flag(&mut options.restart_at_stop, Error::DuplicateRestartAtStop)?;
+            }
             "--native-pci-own-ioapic" => {
                 flag(
                     &mut options.native_pci_own_ioapic,
