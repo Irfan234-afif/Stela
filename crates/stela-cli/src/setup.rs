@@ -237,9 +237,43 @@ fn fix(usb: &Path, words: &str) -> String {
 }
 
 /// How a message says to start over: the hidden `uninstall` is never
-/// suggested.
+/// suggested, but on a shared drive ([`start_over`]).
 const START_OVER: &str = "start over with `stela create` on the stick's whole disk, which \
     erases it";
+
+/// How a message says to start over on the stick that holds `usb`:
+/// [`START_OVER`], but on a drive shared with other files
+/// ([`host::shared_volumes`]), which is never erased: there the hidden
+/// `uninstall` removes the setup and a create makes it again on the same
+/// volume, and neither touches the other files.
+fn start_over(host: &dyn Host, usb: &Path) -> String {
+    let shared = host
+        .volume(usb)
+        .ok()
+        .and_then(|volume| volume.disk)
+        .and_then(|id| {
+            host.disks()
+                .ok()?
+                .into_iter()
+                .find(|disk| disk.identifier == id)
+        })
+        .is_some_and(|disk| !host::shared_volumes(host, &disk).is_empty());
+    match shared {
+        true => "start over with `stela uninstall` and then `stela create` on the same volume: \
+            stela never erases this disk, which holds other files"
+            .into(),
+        false => START_OVER.into(),
+    }
+}
+
+/// [`start_over`] as a sentence of its own: `Start over with …`.
+fn start_over_sentence(host: &dyn Host, usb: &Path) -> String {
+    let advice = start_over(host, usb);
+    let mut letters = advice.chars();
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
+}
 
 /// `word` as a shell takes it as one argument.
 fn quoted(word: &str) -> String {
@@ -1116,9 +1150,10 @@ impl Request {
                      SIZE",
                     host::DISK_EXAMPLE
                 );
+                // The wizard's create erases the stick it is given.
                 let sticks: Vec<_> = home::sticks(environment)?
                     .into_iter()
-                    .filter(|stick| stick.disk.bytes >= home::NETWORK_MIN)
+                    .filter(|stick| stick.disk.bytes >= home::NETWORK_MIN && !stick.shared)
                     .collect();
                 ensure!(
                     !sticks.is_empty(),

@@ -411,12 +411,14 @@ pub(crate) struct Create {
     /// this computer cannot read it.
     #[arg(long, requires = "target", hide = true)]
     disk_serial: Option<String>,
-    /// Erase the other file system a `--target` holds.
-    #[arg(long, requires = "target", hide = true)]
+    /// Erase the other file system the Mac's SSD holds: the `--target`
+    /// partition, or without one the stick's raw partition.
+    #[arg(long, hide = true)]
     erase_target: bool,
     /// Write fresh machine state over bytes that are neither blank nor
-    /// Stela's machine state.
-    #[arg(long, requires = "target", hide = true)]
+    /// Stela's machine state, of the `--target` partition or the stick's
+    /// raw partition.
+    #[arg(long, hide = true)]
     initialize_nor: bool,
     /// The new install's name (macOS by default).
     #[arg(long, hide = true)]

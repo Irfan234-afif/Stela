@@ -548,11 +548,11 @@ pub(super) fn check(host: &dyn Host, request: &Request) -> Result<Checked> {
             "{} holds {what}; --erase-target erases it",
             region.identifier
         )),
-        // A partition of the stick itself: `--target` names the PC's disks
-        // only, so `--erase-target` cannot reach it.
+        // A partition of the stick itself, chosen without `--target`, which
+        // `--erase-target` erases all the same.
         Contents::Other(what) if request.external_disks => bail!(
             "{} on the stick holds {what}, not a Stela macOS disk; installing macOS onto it \
-             would erase it. Copy off what you keep, then delete or wipe that partition.",
+             would erase it. Copy off what you keep, then pass --erase-target to erase it.",
             region.identifier
         ),
         Contents::Other(what) => bail!(
