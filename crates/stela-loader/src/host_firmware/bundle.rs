@@ -64,7 +64,7 @@ enum Port {
 
 /// Every recipe family, in the order a volume short of room keeps them: the
 /// small network and Bluetooth files first, the GPU's large images last.
-const ALL: [(&str, &[Recipe], Port); 10] = [
+const ALL: [(&str, &[Recipe], Port); 11] = [
     (
         "Wi-Fi regulatory database",
         recipes::REGULATORY,
@@ -78,6 +78,11 @@ const ALL: [(&str, &[Recipe], Port); 10] = [
     (
         "MediaTek Bluetooth",
         recipes::MEDIATEK_BLUETOOTH,
+        Port::Always,
+    ),
+    (
+        "Realtek Bluetooth",
+        recipes::REALTEK_BLUETOOTH,
         Port::Always,
     ),
     ("Intel Bluetooth", recipes::INTEL_RSA, Port::Always),
@@ -587,6 +592,7 @@ fn usb() -> Selection {
     let mut selection = Selection::default();
     selection.members(recipes::REALTEK_USB, &[], "usb ethernet");
     selection.members(recipes::MEDIATEK_BLUETOOTH, &[], "usb bluetooth");
+    selection.members(recipes::REALTEK_BLUETOOTH, &[], "usb bluetooth");
     selection.members(recipes::INTEL_RSA, &[], "usb bluetooth");
     selection
 }

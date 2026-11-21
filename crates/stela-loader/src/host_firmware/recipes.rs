@@ -798,6 +798,25 @@ pub const REALTEK_WIFI: &[Recipe] = &[
     ),
 ];
 
+/// btrtl's RTL8852BU files, under the rtlwifi licence WHENCE names for
+/// `rtl_bt/`. linux-firmware keeps `rtl_bt/rtl8852bu_config.bin` as a link
+/// to `rtl_bt/rtl8761bu_config.bin`, so the link's target is pinned and
+/// served under the name btrtl asks for ([`select_realtek_bluetooth`]).
+pub const REALTEK_BLUETOOTH: &[Recipe] = &[
+    wifi(
+        "rtl_bt/rtl8852bu_fw.bin",
+        129733,
+        "c2b0d34a4ff8a8ea136993f0dc4ba657522d84231b4094c2a53cda39afc91c57",
+        &REALTEK_WIFI_LICENSE,
+    ),
+    wifi(
+        "rtl_bt/rtl8761bu_config.bin",
+        6,
+        "6c28a3f07c6a30ed208c4b64862a23f02b7d93543ea980edd24df16bab45095f",
+        &REALTEK_WIFI_LICENSE,
+    ),
+];
+
 const REGULATORY_LICENSE: Artifact = Artifact {
     source: WIRELESS_REGDB,
     revision: WIRELESS_REGDB_REVISION,
@@ -2271,6 +2290,35 @@ fn select_mediatek_bluetooth(request: &Request) -> Option<&'static Recipe> {
         .flatten()
 }
 
+/// The Realtek USB Bluetooth driver's request for an RTL8852BU's EPATCH v2
+/// image or its configuration (`realtek::identity::Identity`), bound to the
+/// observed stock ROM's LMP subversion 0x8852. The configuration is the
+/// file `rtl_bt/rtl8852bu_config.bin` links to.
+fn select_realtek_bluetooth(request: &Request) -> Option<&'static Recipe> {
+    let usb: Vec<_> = request.target.hardware.split(':').collect();
+    if usb.len() != 4 || usb[0] != "usb" || !usb[1..].iter().all(|f| hex_field(f, 4)) {
+        return None;
+    }
+    let mut fields = request
+        .target
+        .revision
+        .strip_prefix("epatch-v2:")?
+        .split(':');
+    fields.next()?.strip_prefix("hci-")?;
+    let (_, subversion) = fields.next()?.strip_prefix("lmp-")?.split_once('-')?;
+    if subversion != "8852" {
+        return None;
+    }
+    let member = match request.name.as_str() {
+        "rtl_bt/rtl8852bu_fw.bin" => "rtl_bt/rtl8852bu_fw.bin",
+        "rtl_bt/rtl8852bu_config.bin" => "rtl_bt/rtl8761bu_config.bin",
+        _ => return None,
+    };
+    REALTEK_BLUETOOTH
+        .iter()
+        .find(|recipe| recipe.image.member == member)
+}
+
 /// Bind each original PCI/SYS_CFG1 request to its own chip's pinned image.
 /// Provisioning preserves observations; it grants no native radio admission.
 fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
@@ -2450,6 +2498,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "wifi-intel" => select_intel_wifi(request),
         "wifi-mt792x" => select_mediatek_wifi(request),
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
+        "realtek-bluetooth-usb-epatch-v2" => select_realtek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
         "xe" => select_xe(request),
@@ -3494,6 +3543,69 @@ mod tests {
             assert!(
                 Plan::select(&mediatek_bluetooth(name, hardware, revision)).is_err(),
                 "{revision}"
+            );
+        }
+    }
+
+    fn realtek_bluetooth(name: &str, hardware: &str, revision: &str) -> Inventory {
+        let mut request =
+            wifi_inventory("realtek-bluetooth-usb-epatch-v2", name, hardware).requests()[0].clone();
+        request.target.revision = revision.into();
+        // The configuration's own minimum, as the driver asks for it.
+        request.minimum_bytes = 6;
+        let mut observed = Inventory::default();
+        observed.observe(request.view()).unwrap();
+        observed
+    }
+
+    #[test]
+    fn realtek_bluetooth_recipes_follow_the_rtl8852bu_rom_and_the_config_link() {
+        // A TX20E's Bluetooth half, as `Identity::revision_label` names it.
+        let rom = "epatch-v2:hci-0b-000b:lmp-0b-8852:manufacturer-005d:register-8852-none:rom-01:security-00-00";
+        let image = "rtl_bt/rtl8852bu_fw.bin";
+        let config = "rtl_bt/rtl8852bu_config.bin";
+        let plan = Plan::select(&realtek_bluetooth(image, "usb:13d3:3570:0000", rom)).unwrap();
+        assert_eq!(plan.selections[0].recipe.image.member, image);
+        assert_eq!(plan.artifacts().len(), 2);
+        let recipe = plan.selections[0].recipe;
+        assert_eq!(
+            (recipe.image.revision, recipe.license.member),
+            (
+                WIFI_FIRMWARE_REVISION,
+                "LICENSES/LICENCE.rtlwifi_firmware.txt"
+            )
+        );
+        // linux-firmware links the configuration to the 8761BU's.
+        let plan = Plan::select(&realtek_bluetooth(config, "usb:13d3:3570:0000", rom)).unwrap();
+        assert_eq!(plan.selections[0].request.name, config);
+        assert_eq!(
+            plan.selections[0].recipe.image.member,
+            "rtl_bt/rtl8761bu_config.bin"
+        );
+        assert_eq!(plan.selections[0].recipe.image.length, 6);
+        for (name, hardware, revision) in [
+            (
+                image,
+                "usb:13d3:3570:0000",
+                rom.replace("lmp-0b-8852", "lmp-0b-8761"),
+            ),
+            (
+                image,
+                "usb:13d3:3570:0000",
+                rom.replacen("epatch-v2", "epatch-v1", 1),
+            ),
+            (image, "usb:13d3:3570", rom.into()),
+            (image, "pci:10ec:b852:0000", rom.into()),
+            ("rtl_bt/rtl8761bu_fw.bin", "usb:13d3:3570:0000", rom.into()),
+            (
+                "rtl_bt/rtl8761bu_config.bin",
+                "usb:13d3:3570:0000",
+                rom.into(),
+            ),
+        ] {
+            assert!(
+                Plan::select(&realtek_bluetooth(name, hardware, &revision)).is_err(),
+                "{name} {hardware} {revision}"
             );
         }
     }
