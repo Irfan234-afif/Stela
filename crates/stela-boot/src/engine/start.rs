@@ -3155,6 +3155,9 @@ fn start_devices(
             && !options.guest_network
             && translation_store.is_none()
             && fdr_partition.is_none()
+            // The GPU check starts the devices as a macOS boot does: the
+            // GPUs come up in this branch, beside the USB its log is on.
+            && !options.gpu_check
         {
             (
                 Vec::new(),
