@@ -551,6 +551,84 @@ pub(super) unsafe fn mediatek_wifi(
     }
 }
 
+/// Read an RTL8852B's identity before any driver powers it, as
+/// `rtw89_pci_probe` maps BAR2 and `rtw89_chip_info_setup` then reads
+/// SYS_CFG1 in `rtw89_read_chip_ver` before `rtw89_mac_pwr_on`.
+///
+/// The function is claimed and stays unmastered: memory decoding is turned
+/// on, bus mastering, INTx and MSI stay off, and the one MMIO access is the
+/// read of SYS_CFG1. The returned owner keeps the function and its mapping
+/// for the rest of the boot; a failure hands back what it claimed.
+///
+/// # Safety
+/// [`NativeServices`]' contract holds for `services`.
+#[expect(
+    clippy::result_large_err,
+    reason = "a failed read hands back the owners that must outlive the claim"
+)]
+pub(super) unsafe fn realtek_ax_identity(
+    services: &dyn NativeServices,
+    address: Address,
+) -> Result<(realtek_wifi::identity::Unpowered, Box<dyn Any>), Failure> {
+    let Claimed {
+        mut function,
+        domain,
+        bars,
+    } = claim(services, address)?;
+    let bar2_bytes = match bars[2] {
+        Some(Bar::Memory { size, .. }) => size,
+        _ => 0,
+    };
+    let registers = match map(services, address, &bars, 2) {
+        Ok(registers) => registers,
+        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+    };
+    // The mapping refuses a BAR2 too small to hold SYS_CFG1 here, so the
+    // read below cannot leave it.
+    let sys_cfg1 = match registers.address(0xf0, 4) {
+        Ok(sys_cfg1) => sys_cfg1,
+        Err(error) => {
+            return Err(keep_error(
+                Error::Native(ServiceError::Mapping(error)),
+                (function, domain, registers),
+            ));
+        }
+    };
+    let configured = (|| -> Result<_, Error> {
+        let config = function.config();
+        let identity = (
+            config.read16(0x2c)?,
+            config.read16(0x2e)?,
+            config.read8(0x08)?,
+        );
+        let msi = function.interrupts()?.msi.is_some();
+        function.enable_polled_decode()?;
+        Ok((identity, msi))
+    })();
+    let ((subsystem_vendor, subsystem_device, pci_revision), msi) = match configured {
+        Ok(configured) => configured,
+        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+    };
+    let observed = realtek_wifi::identity::Observed {
+        vendor: function.vendor,
+        device: function.device,
+        subsystem_vendor,
+        subsystem_device,
+        pci_revision,
+        // SAFETY: `sys_cfg1` is the 4 bytes at 0xf0 of this function's
+        // owned, uncached BAR2 mapping, and memory decoding is on.
+        sys_cfg1: unsafe { crate::bus::mmio::Mmio::new(sys_cfg1.as_ptr() as u64, 4) }.read32(0),
+    };
+    Ok((
+        realtek_wifi::identity::Unpowered {
+            observed,
+            bar2_bytes,
+            msi,
+        },
+        Box::new((function, domain, registers)),
+    ))
+}
+
 /// An RTL8822C station on its hardware.
 pub type RealtekWifi = realtek_wifi::station::Wifi<realtek_wifi::hardware::Hardware>;
 

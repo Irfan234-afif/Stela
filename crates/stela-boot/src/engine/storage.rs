@@ -2150,6 +2150,16 @@ pub unsafe fn open(
             "HOST PCI bridge {address} had bus mastering off: turned on for the devices below it\n"
         ));
     }
+    for (address, read) in &devices.wifi_identities {
+        match read {
+            Ok(read) => {
+                output::arguments(format_args!("HOST WIFI IDENTITY pci={address} {read}\n"))
+            }
+            Err(error) => output::arguments(format_args!(
+                "HOST WIFI IDENTITY pci={address} not read: {error}\n"
+            )),
+        }
+    }
     for (address, class, why) in &devices.unsupported {
         output::arguments(format_args!(
             "HOST UNSUPPORTED pci={address} class={:02x}{:02x}{:02x}: {why}\n",

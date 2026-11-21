@@ -889,6 +889,13 @@ pub struct Devices {
     /// Storage, network, audio and USB functions no driver here takes, with
     /// their class and why.
     pub unsupported: Vec<(Address, [u8; 3], &'static str)>,
+    /// RTL8852B functions a boot given a `--wifi` network read before any
+    /// driver powered them ([`native::realtek_ax_identity`]), or why the read
+    /// failed. Each is also in [`Self::unsupported`].
+    pub wifi_identities: Vec<(
+        Address,
+        Result<crate::net::wifi::realtek::identity::Unpowered, Error>,
+    )>,
     /// PCI bridges found with bus mastering off, which the scan turned on
     /// so the functions below them reach memory and the interrupt
     /// controllers.
@@ -1843,10 +1850,30 @@ pub unsafe fn probe_observed(
             }
             if function.class[..2] == [2, 0x80] {
                 // A chip Linux drives and no driver here does is named once,
-                // with its Linux driver, and left untouched.
+                // with its Linux driver, and left unpowered. An RTL8852B given
+                // a network has its SYS_CFG1 read first, which powers nothing.
                 if let Some(why) =
                     crate::net::wifi::unsupported::reason(function.vendor, function.device)
                 {
+                    if let (Some(_), Some(services)) = (wifi, services)
+                        && function.vendor == 0x10ec
+                        && crate::net::wifi::realtek::identity::RTL8852B_DEVICES
+                            .contains(&function.device)
+                    {
+                        // SAFETY: the caller grants `services`' contract, and
+                        // this loop leaves `function` alone once it is claimed.
+                        let read = match unsafe { native::realtek_ax_identity(services, address) } {
+                            Ok((read, owner)) => {
+                                devices.owners.push(owner);
+                                Ok(read)
+                            }
+                            Err((error, kept)) => {
+                                devices.owners.extend(kept);
+                                Err(error)
+                            }
+                        };
+                        devices.wifi_identities.push((address, read));
+                    }
                     devices.unsupported.push((address, function.class, why));
                     continue;
                 }
@@ -3909,6 +3936,82 @@ mod tests {
             "{:?}",
             devices.failures
         );
+    }
+
+    /// An RTL8852BE is read before power-on only when the boot has a
+    /// network, and stays unsupported either way.
+    #[test]
+    fn an_rtl8852be_is_read_only_with_a_network_and_stays_unsupported() {
+        let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
+        let page = &mut ecam[..4096 / 4];
+        page.fill(0);
+        page[0] = 0xb852 << 16 | 0x10ec;
+        page[2] = 0x0280_0000;
+        let window = EcamWindow {
+            base: ecam.as_mut_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+        };
+        let handoff = Handoff {
+            ecam: alloc::vec![window],
+            mapped: alloc::vec![window.range()],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+            network: None,
+        };
+        let network = Network {
+            ssid: b"test".to_vec(),
+            secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
+            country: None,
+        };
+        let address = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        for wifi in [None, Some(&network)] {
+            let services = services::tests::Refusing::minimum_only();
+            // SAFETY: as in the fixture above: no DMA pages, only the
+            // synthetic ECAM mapped, and every native grant refused.
+            let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+            // SAFETY: as above.
+            let devices = unsafe {
+                probe_with_provider(
+                    &handoff,
+                    PlatformCaptures::default(),
+                    &mut dma,
+                    handoff_provider(&handoff),
+                    Some(&services),
+                    wifi,
+                )
+            };
+            assert!(
+                devices
+                    .unsupported
+                    .iter()
+                    .any(|&(at, _, why)| at == address && why.contains("RTL8852BE")),
+                "{:?}",
+                devices.unsupported
+            );
+            assert!(devices.failures.iter().all(|(at, _)| *at != address));
+            let requested = services.requests.borrow().contains(&address);
+            if wifi.is_none() {
+                assert!(devices.wifi_identities.is_empty());
+                assert!(!requested);
+            } else {
+                assert!(requested);
+                assert!(matches!(
+                    devices.wifi_identities.as_slice(),
+                    [(at, Err(Error::Native(_)))] if *at == address
+                ));
+            }
+        }
     }
 
     /// The chooser refuses a disk whose controller no driver here takes,
