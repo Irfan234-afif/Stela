@@ -51,6 +51,9 @@ pub(super) struct Stick {
     pub(super) volume: Option<PathBuf>,
     pub(super) record: Option<Record>,
     pub(super) state: State,
+    /// It holds other files beside a FAT volume ([`host::shared_volumes`]):
+    /// a setup goes on that volume, and nothing offers to erase the disk.
+    pub(super) shared: bool,
 }
 
 impl Stick {
@@ -80,6 +83,9 @@ impl Stick {
                 "too small: an installer needs 8 GB or more".into()
             }
             State::Empty if self.disk.partitions.is_empty() => "empty".into(),
+            State::Empty if self.shared => {
+                "no Stela on it; shared with other files, so Stela goes on its FAT volume".into()
+            }
             State::Empty => "no Stela on it".into(),
             State::Interrupted => "a create stopped part way".into(),
             State::Replacing(_) => format!("{}, a macOS switch stopped part way", stela()),
@@ -117,6 +123,9 @@ impl Stick {
     pub(super) fn next(&self, several: bool) -> Option<String> {
         match &self.state {
             State::Empty if self.disk.bytes < NETWORK_MIN => None,
+            // Its setup goes on its FAT volume, which is named by a path
+            // that may hold the user's name: no command is spelled out.
+            State::Empty if self.shared => None,
             // Without a terminal, erasing needs the stick typed back.
             State::Empty => Some(format!(
                 "stela create {} --confirm-disk {}",
@@ -215,11 +224,13 @@ fn classify(environment: &Environment<'_>, disk: host::Disk) -> Stick {
             (Some(*record), state)
         }
     };
+    let shared = !host::shared_volumes(environment.host, &disk).is_empty();
     Stick {
         disk,
         volume,
         record,
         state,
+        shared,
     }
 }
 
@@ -551,8 +562,9 @@ fn choices(stick: &Stick, offers: &Offers) -> Vec<Choice> {
         all.push(Choice::Status);
     }
     all.push(Choice::Logs);
-    // A newer Stela's stick is changed by that Stela only.
-    if !matches!(stick.state, State::Newer(_)) {
+    // A newer Stela's stick is changed by that Stela only, and a shared
+    // disk is never erased.
+    if !matches!(stick.state, State::Newer(_)) && !stick.shared {
         all.push(Choice::Erase);
     }
     all.push(Choice::Quit);
@@ -659,6 +671,15 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
             ))?;
             return quit(ui);
         }
+        // Its create would erase the disk, and the other files with it.
+        State::Empty if stick.shared => {
+            ui.warning(
+                "This disk holds other files beside a FAT volume, and stela never erases a disk \
+                 shared with them. To set Stela up on that volume, run `stela create` followed \
+                 by its path.",
+            )?;
+            return quit(ui);
+        }
         State::Empty => return create(environment, request, &stick),
         State::Interrupted => {
             let record = stick.record.as_ref().expect("a setup has its record");
@@ -666,7 +687,11 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
                 "A create stopped part way: {}.",
                 record.resume_summary()
             ))?;
-            first("Finish the create?", &[Choice::Finish, Choice::Erase])?
+            let choices: &[Choice] = match stick.shared {
+                true => &[Choice::Finish],
+                false => &[Choice::Finish, Choice::Erase],
+            };
+            first("Finish the create?", choices)?
         }
         State::Replacing(next) => {
             ui.warning(&format!(

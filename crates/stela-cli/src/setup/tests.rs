@@ -1090,9 +1090,65 @@ fn install_maps_usb_partition_as_guest_ssd() {
 }
 
 #[test]
+fn stick_ssd_takes_the_stela_typed_partition_and_skips_windows_own() {
+    const MSR: &str = "E3C9E316-0B5C-4DB8-817D-F92DF00215AE";
+    const RECOVERY: &str = "{de94bba4-06d1-4d40-a16a-bfd50179d6ac}";
+    let region = stela_formats::payload::gpt::Role::AppleRegion
+        .type_guid()
+        .to_string();
+    let mut f = fixture(64 * GIB, false);
+    add_stick_ssd(&mut f, "disk5s4", REGION_GUID);
+    let raw = |f: &mut Fixture, id: &str, content: &str| {
+        f.host
+            .disks
+            .iter_mut()
+            .find(|d| d.identifier == "disk5")
+            .unwrap()
+            .partitions
+            .push(Partition {
+                identifier: id.into(),
+                content: content.into(),
+                mount: None,
+            });
+    };
+    // Windows's reserved and recovery partitions are no Mac SSD.
+    raw(&mut f, "disk5s5", MSR);
+    raw(&mut f, "disk5s6", RECOVERY);
+    let chosen = |f: &Fixture| super::create::stick_ssd(&f.host, Some("disk5"));
+    assert_eq!(chosen(&f).unwrap().as_deref(), Some("disk5s4"));
+    // Beside another raw partition, the one typed as a Stela Apple region
+    // is, in whatever case the host spells its type.
+    raw(&mut f, "disk5s7", &region.to_lowercase());
+    assert_eq!(chosen(&f).unwrap().as_deref(), Some("disk5s7"));
+    // Two typed ones are refused, naming the type to give the one.
+    raw(&mut f, "disk5s8", &region);
+    let error = chosen(&f).unwrap_err().to_string();
+    assert!(error.contains("several unmounted partitions"), "{error}");
+    assert!(error.contains("disk5s7, disk5s8"), "{error}");
+    assert!(error.contains(&region), "{error}");
+    assert!(!error.contains("--target"), "{error}");
+    // Without a Mac SSD partition, the flags that write one are refused,
+    // not ignored.
+    let f = fixture(64 * GIB, false);
+    for flag in ["erase", "nor"] {
+        let mut create = command(&f, &f.esp);
+        create.dry_run = true;
+        match flag {
+            "erase" => create.erase_target = true,
+            _ => create.initialize_nor = true,
+        }
+        let error = setup(&environment(&f.host), create)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("this create names none"), "{flag}: {error}");
+    }
+}
+
+#[test]
 fn a_partition_with_a_file_system_past_its_first_8_kib_is_never_taken_for_blank() {
     // btrfs, whose first 64 KiB are zeros, on the stick's unmounted
-    // partition: create on its mounted volume refuses it, naming it.
+    // partition: create on its mounted volume refuses it, naming it and the
+    // flag that erases it.
     let mut f = fixture(64 * GIB, false);
     add_stick_ssd(&mut f, "disk5s4", REGION_GUID);
     f.host.write("disk5s4", 0x1_0040, b"_BHRfS_M").unwrap();
@@ -1103,8 +1159,22 @@ fn a_partition_with_a_file_system_past_its_first_8_kib_is_never_taken_for_blank(
         error.contains("disk5s4 on the stick holds btrfs"),
         "{error}"
     );
-    assert!(!error.contains("--erase-target"), "{error}");
+    assert!(
+        error.contains("then pass --erase-target to erase it"),
+        "{error}"
+    );
     assert!(!f.esp.join(RECORD).exists());
+    // --erase-target, with no --target, erases the stick's raw partition.
+    let mut erase = command(&f, &f.esp);
+    erase.erase_target = true;
+    setup(&environment(&f.host), erase).unwrap();
+    assert!(
+        f.host
+            .read("disk5s4", 0x1_0040, 8)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0)
+    );
     // Linux RAID metadata at the end of a PC partition named with --target.
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
@@ -7915,6 +7985,177 @@ fn enter_at_every_question_never_erases_and_a_drive_is_typed_back() {
         let (text, _) = home::report(&home::sticks(&environment(&f.host)).unwrap());
         assert!(text.contains("--confirm-disk"), "{what}:\n{text}");
     }
+}
+
+#[test]
+fn a_disk_shared_with_other_files_is_never_erased_nor_offered_for_it() {
+    use ui::tests::ENTER;
+    // A USB drive whose FAT volume sits beside an NTFS volume, as one
+    // volume of someone's USB SSD made for Stela leaves it.
+    let mut f = fixture(64 * GIB, true);
+    let ntfs = f.esp.with_file_name("Files");
+    fs::create_dir_all(&ntfs).unwrap();
+    f.host
+        .volumes
+        .insert(ntfs.clone(), (FileSystem::Ntfs, 100 * GIB, Some("disk5")));
+    let usb = f
+        .host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap();
+    usb.removal = host::Removal::Drive;
+    usb.partitions.push(Partition {
+        identifier: "disk5s3".into(),
+        content: "Microsoft Basic Data".into(),
+        mount: Some(ntfs.clone()),
+    });
+    let size = host::size_text(usb.bytes);
+    f.host.serials.insert("disk5".into(), "TESTSERIAL".into());
+    let before = stick_files(&f);
+    // Named whole, with its size typed back and the erase accepted, it is
+    // refused before anything is erased, its NTFS volume named by its file
+    // system and never by its path.
+    for dry_run in [true, false] {
+        let mut erase = command(&f, Path::new("disk5"));
+        erase.confirm_disk = Some(size.clone());
+        erase.confirmed = true;
+        erase.dry_run = dry_run;
+        let error = setup(&environment(&f.host), erase).unwrap_err().to_string();
+        assert!(
+            error.contains("holds a volume formatted NTFS beside a FAT volume"),
+            "{error}"
+        );
+        assert!(
+            error.contains("never erases a disk shared with other files"),
+            "{error}"
+        );
+        assert!(!error.contains(&*ntfs.to_string_lossy()), "{error}");
+    }
+    assert!(f.host.erased.borrow().is_empty());
+    assert_eq!(stick_files(&f), before);
+    // Plain `stela` lists it as shared, names no erase for it, and says
+    // where its setup goes instead of asking to erase it.
+    let sticks = home::sticks(&environment(&f.host)).unwrap();
+    assert!(
+        sticks
+            .iter()
+            .any(|stick| stick.disk.identifier == "disk5" && stick.shared)
+    );
+    let (text, _) = home::report(&sticks);
+    assert!(!text.contains("--confirm-disk"), "{text}");
+    assert!(text.contains("shared with other files"), "{text}");
+    let (shown, result, _) = plain_stela(&f, &[ENTER, ENTER], &[]);
+    result.unwrap();
+    assert!(
+        shown.contains("stela never erases a disk shared with them"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Erase and create"), "{shown}");
+    assert!(!shown.contains("will be erased"), "{shown}");
+    assert!(f.host.erased.borrow().is_empty());
+    assert_eq!(stick_files(&f), before);
+    // Without its NTFS volume the same drive is erased as before, once its
+    // size is typed back.
+    let usb = f
+        .host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap();
+    usb.partitions.pop();
+    let mut erase = command(&f, Path::new("disk5"));
+    erase.confirm_disk = Some(size);
+    erase.dry_run = true;
+    let report = setup(&environment(&f.host), erase).unwrap();
+    assert!(report.contains("Would erase disk5"), "{report}");
+}
+
+#[test]
+fn a_named_volume_that_is_not_the_setup_s_never_loses_files() {
+    // Every directory of the setup's `stela` folder, mirrored on the
+    // stick's other volume with a file of someone's in each.
+    fn mirror(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        fs::write(to.join("theirs.txt"), b"theirs").unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                mirror(&entry.path(), &to.join(entry.file_name()));
+            }
+        }
+    }
+    let f = made_by(Some(release::CURRENT));
+    let volume = stela_volume(&f);
+    mirror(&volume.join("stela"), &f.data.join("stela"));
+    let theirs = snapshot(&f.data);
+    let setup_files = snapshot(&volume);
+    // Named by that other volume, maintenance takes the setup's own FAT32
+    // volume: its status reads, and its uninstall removes the setup there
+    // and leaves the other volume as it was.
+    rerun(&f, |c| {
+        c.action = Action::Status;
+        c.usb = f.data.clone();
+    })
+    .unwrap();
+    rerun(&f, |c| {
+        c.action = Action::Uninstall;
+        c.usb = f.data.clone();
+    })
+    .unwrap();
+    assert_eq!(snapshot(&f.data), theirs);
+    assert!(!f.esp.join(RECORD).exists());
+    assert_ne!(snapshot(&volume), setup_files);
+}
+
+#[test]
+fn a_setup_on_a_shared_drive_is_kept_up_but_never_offered_for_erasing() {
+    use ui::tests::ENTER;
+    // A ready setup on the STELA volume of a USB drive that also holds the
+    // fixture's HFS+ volume.
+    let mut f = made_by(Some(release::CURRENT));
+    f.host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap()
+        .removal = host::Removal::Drive;
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &[ENTER], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains("This stick is ready."), "{shown}");
+    assert!(
+        !shown.contains("Erase it and make a new installer"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Start over"), "{shown}");
+    assert!(f.host.erased.borrow().is_empty());
+    assert_eq!(stick_files(&f), before);
+    // Its maintenance goes on as on any stick.
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(status.contains("Stela"), "{status}");
+    // Starting over is told as uninstall and a create on the same volume,
+    // never as the whole-disk erase a stick's advice names.
+    let again = setup(&environment(&f.host), command(&f, &f.esp))
+        .unwrap_err()
+        .to_string();
+    assert!(again.contains("already holds Stela"), "{again}");
+    assert!(
+        again.contains(
+            "start over with `stela uninstall` and then `stela create` on the same volume"
+        ),
+        "{again}"
+    );
+    assert!(!again.contains("whole disk"), "{again}");
+    let error = rerun(&f, |c| {
+        c.action = Action::Configure;
+        c.remove_install = Some("macOS".into());
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("stela never erases this disk"), "{error}");
+    assert_eq!(stick_files(&f), before);
 }
 
 thread_local! {

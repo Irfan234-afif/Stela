@@ -53,6 +53,12 @@ impl Usb {
             disk.erasable() && *self == Self::from_disk(&disk, host),
             "the chosen stick changed; run stela again and choose it again"
         );
+        // A volume mounted since it was chosen can make it shared.
+        ensure!(
+            host::shared_volumes(host, &disk).is_empty(),
+            "the chosen stick now holds other files beside its FAT volume, and stela never \
+             erases a disk shared with them; run stela again"
+        );
         Ok(())
     }
 

@@ -358,7 +358,7 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         ensure!(
             record.installs.len() > 1,
             "install \"{name}\" is this setup's only one; to remove it, {}",
-            super::START_OVER
+            super::start_over(environment.host, &command.usb)
         );
         record.installs.retain(|i| i.name != *name);
         if record.default_install.as_deref() == Some(name.as_str()) {

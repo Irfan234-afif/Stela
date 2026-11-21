@@ -22,11 +22,29 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use stela_formats::builds;
+use stela_formats::{builds, payload::gpt};
 
-/// The setup USB's one unmounted partition besides its EFI partition: a
-/// raw partition, which becomes the Mac's internal SSD. `None` when the stick
-/// has none; several are refused, since setup cannot tell them apart.
+/// Partition types no raw stick SSD has, which Windows leaves unmounted on
+/// a drive it formatted: Microsoft's reserved partition and Windows's
+/// recovery partition.
+const NOT_A_STICK_SSD: [&str; 2] = [
+    "E3C9E316-0B5C-4DB8-817D-F92DF00215AE",
+    "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC",
+];
+
+/// `content` names the GPT partition type `guid`, as the hosts spell it:
+/// in either case, with or without braces.
+fn is_partition_type(content: &str, guid: &str) -> bool {
+    content
+        .trim_matches(|c| c == '{' || c == '}')
+        .eq_ignore_ascii_case(guid)
+}
+
+/// The setup USB's raw partition, which becomes the Mac's internal SSD:
+/// the one unmounted partition besides its EFI partition, Windows's
+/// reserved and recovery partitions aside, or among several the one typed
+/// as a Stela Apple region. `None` when the stick has none; several others
+/// are refused, since setup cannot tell them apart.
 pub(super) fn stick_ssd(host: &dyn Host, usb_disk: Option<&str>) -> Result<Option<String>> {
     let Some(usb_disk) = usb_disk else {
         return Ok(None);
@@ -35,19 +53,34 @@ pub(super) fn stick_ssd(host: &dyn Host, usb_disk: Option<&str>) -> Result<Optio
     let Some(disk) = disks.iter().find(|disk| disk.identifier == usb_disk) else {
         return Ok(None);
     };
-    let raw: Vec<&str> = disk
+    let raw: Vec<_> = disk
         .partitions
         .iter()
         .filter(|p| p.content != "EFI" && p.mount.is_none())
+        .filter(|p| {
+            !NOT_A_STICK_SSD
+                .iter()
+                .any(|guid| is_partition_type(&p.content, guid))
+        })
+        .collect();
+    let region = gpt::Role::AppleRegion.type_guid().to_string();
+    let typed: Vec<&str> = raw
+        .iter()
+        .filter(|p| is_partition_type(&p.content, &region))
         .map(|p| p.identifier.as_str())
         .collect();
-    match raw[..] {
+    let candidates = match typed[..] {
+        [] => raw.iter().map(|p| p.identifier.as_str()).collect(),
+        _ => typed,
+    };
+    match candidates[..] {
         [] => Ok(None),
         [partition] => Ok(Some(partition.into())),
         _ => bail!(
-            "{usb_disk} has several unmounted partitions ({}); name the Mac's internal SSD with \
-             --target",
-            raw.join(", ")
+            "{usb_disk} has several unmounted partitions ({}) that could be the Mac's internal \
+             SSD; give that one, and only that one, the Stela Apple region partition type \
+             {region}",
+            candidates.join(", ")
         ),
     }
 }
@@ -385,7 +418,7 @@ impl Resume {
         let [install] = &previous.installs[..] else {
             bail!(
                 "the create that stopped on this stick cannot be finished; {}",
-                super::START_OVER
+                super::start_over(environment.host, &command.usb)
             );
         };
         let mut differences = Vec::new();
@@ -437,16 +470,16 @@ impl Resume {
         let Some(ecid) = install.ecid else {
             bail!(
                 "the create that stopped on this stick cannot be finished; {}",
-                super::START_OVER
+                super::start_over(environment.host, &command.usb)
             );
         };
         if !differences.is_empty() {
             bail!(
                 "this stick holds a create that stopped and differs from this one: {}. Finish it \
-                 with {}, or start over with `stela create` on the stick's whole disk, which \
-                 erases it",
+                 with {}, or {}",
                 differences.join(", "),
-                super::fix(&command.usb, "repair")
+                super::fix(&command.usb, "repair"),
+                super::start_over(environment.host, &command.usb)
             );
         }
         // Every restore bundle intact and current, or all prepared again.
@@ -596,7 +629,7 @@ pub(super) fn plan(
                 command.usb.display(),
                 super::fix(&command.usb, "update"),
                 super::fix(&command.usb, "update --macos VERSION"),
-                super::START_OVER
+                super::start_over(host, &command.usb)
             ),
         },
     };
@@ -608,6 +641,12 @@ pub(super) fn plan(
         None => stick_ssd(host, usb_disk.as_deref())?,
     };
     let target = command.target.clone().or(stick.clone());
+    // Both write the Mac's SSD partition, which setup must know first.
+    ensure!(
+        target.is_some() || !(command.erase_target || command.initialize_nor),
+        "--erase-target and --initialize-nor write the Mac's SSD partition, and this create \
+         names none: name it with --target, or give the stick an unmounted partition for it"
+    );
     // With no disk named here, Install macOS chooses the PC's disk in
     // stela.efi.
     let installed = match &target {
@@ -898,6 +937,16 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             "{disk} ({}) is an internal disk; stela erases only a removable USB stick",
             found.name
         );
+        // Typing the disk back does not make its other files expendable.
+        let shared = host::shared_volumes(host, &found);
+        ensure!(
+            shared.is_empty(),
+            "{disk} ({}) holds {} beside a FAT volume, and stela never erases a disk shared with \
+             other files. Name that FAT volume instead (`stela create` followed by its path) to \
+             set Stela up on it, or delete the other partitions yourself first",
+            found.name,
+            shared.join(" and ")
+        );
         if let Some(why) = found.why_typed() {
             ensure!(
                 command
@@ -955,7 +1004,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
                 "this stick holds an {} create that stopped, which goes on as it began. Run it \
                  again without --installer, or {}",
                 kind.name(),
-                super::START_OVER
+                super::start_over(host, &command.usb)
             );
             command.install_image = Some(kind);
         } else if !esp.join(RECORD).exists() {

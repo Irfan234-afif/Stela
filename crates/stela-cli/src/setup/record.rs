@@ -514,8 +514,8 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
     );
     ensure!(
         schema == u64::from(RECORD_SCHEMA),
-        "this stick was made by a stela too old for this one to read. Start over with \
-         `stela create` on the stick's whole disk, which erases it"
+        "this stick was made by a stela too old for this one to read. {}",
+        super::start_over_sentence(environment.host, usb)
     );
     let mut value = header;
     // A data partition out of reach is reported as that: the record's old
@@ -533,8 +533,8 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         .with_context(|| format!("cannot read setup record {}", path.display()))?;
     ensure!(
         !record.installs.is_empty(),
-        "this stick's setup names no install. Start over with `stela create` on the stick's \
-         whole disk, which erases it"
+        "this stick's setup names no install. {}",
+        super::start_over_sentence(environment.host, usb)
     );
     Ok(record)
 }
@@ -587,9 +587,14 @@ pub(super) fn current_volume(host: &dyn Host, esp: &Path, usb: &Path) -> PathBuf
 }
 
 /// [`current_volume`] without the fallback to the EFI partition: why the
-/// data partition is out of reach ([`medium::reach`]).
+/// data partition is out of reach ([`medium::reach`]). A volume named on
+/// the command line is the data partition only when it is the stick's
+/// FAT32 one beside the EFI partition ([`medium::locate`]): another volume
+/// of the same disk, such as a USB drive's other files, never takes the
+/// record's paths, which `update`, `repair` and `uninstall` write and
+/// remove; the stick's own data partition is found instead.
 fn reached_volume(host: &dyn Host, esp: &Path, usb: &Path) -> Result<PathBuf> {
-    if usb != esp {
+    if usb != esp && medium::locate(host, esp, Some(usb)).is_ok() {
         return Ok(usb.to_path_buf());
     }
     medium::reach(host, esp)

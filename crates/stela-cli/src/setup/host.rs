@@ -248,6 +248,40 @@ impl Disk {
     }
 }
 
+/// The other volumes that make `disk` shared: a drive (a disk erased only
+/// once it is typed back, [`typed_reason`]) with a FAT or exFAT data volume,
+/// as a stick's, beside a mounted volume of another file system (NTFS,
+/// ext4, APFS, HFS+) or one the host cannot read, holds someone's files
+/// beside the stick's, as a setup made on one volume of a USB SSD does.
+/// Setup never erases such a disk, whatever is typed back: its whole-disk
+/// erase would take those files along. A stick keeps the usual
+/// confirmation, which lists what is on it. Each is named by its file
+/// system alone, since a volume path may hold the user's name; empty when
+/// `disk` is not shared.
+pub(crate) fn shared_volumes(host: &dyn Host, disk: &Disk) -> Vec<String> {
+    if disk.why_typed().is_none() {
+        return Vec::new();
+    }
+    let mut stick = false;
+    let mut others = Vec::new();
+    for mount in disk
+        .partitions
+        .iter()
+        .filter(|partition| partition.content != "EFI")
+        .filter_map(|partition| partition.mount.as_deref())
+    {
+        match host.volume(mount) {
+            Ok(Volume {
+                filesystem: FileSystem::Fat | FileSystem::ExFat,
+                ..
+            }) => stick = true,
+            Ok(volume) => others.push(format!("a volume formatted {}", volume.filesystem)),
+            Err(_) => others.push("a volume whose file system cannot be read".into()),
+        }
+    }
+    if stick { others } else { Vec::new() }
+}
+
 /// `typed` is a disk's model `name`, or its size as [`size_text`] shows
 /// it, ignoring case and spaces: `64.0 GB`, `64.0GB`, and for a whole
 /// number of GB also `64 GB` and `64GB`. The number is the one shown, to
