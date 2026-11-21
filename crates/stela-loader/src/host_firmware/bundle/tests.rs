@@ -24,8 +24,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     // of Navi 21.
     if Ports::BUILT == Ports::ALL {
         assert_eq!(count + 4, recipes().count());
-        // The recipes' recorded lengths: 121 files, 184.9 MiB.
-        assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
+        // The recipes' recorded lengths: 131 files, 186.1 MiB.
+        assert_eq!((count, bytes), (131, 195_180_640), "{count} {bytes}");
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());

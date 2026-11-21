@@ -58,7 +58,9 @@ pub enum Reset {
     /// function along. amdgpu resets the GPU on init, MODE1 through the SMU,
     /// when the PSP's secure OS still runs from an earlier driver
     /// (`soc24_need_reset_on_init`, `nv_need_reset_on_init`), and otherwise
-    /// takes it as the firmware left it, as Linux does at every boot. The
+    /// takes it as the firmware left it, as Linux does at every boot; an APU
+    /// such as Cezanne is never reset on init (`soc15_need_reset_on_init`),
+    /// since MODE2 through the SMU is the only reset it has. The
     /// gated function issues no request until amdgpu sets its master bit,
     /// and from then on the private domain bounds what anything the
     /// firmware left running in the GPU can reach.

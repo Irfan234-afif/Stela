@@ -307,8 +307,8 @@ fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
     let mut inventory = Inventory::default();
     stela_loader::host_firmware::recipes::require_amdgpu(&mut inventory, device).map_err(|_| {
         ServiceError::Refused(
-            "Stela pins amdgpu's firmware only for Ryzen 7000 and 9000 desktop graphics, \
-                 not for this GPU",
+            "Stela pins amdgpu's firmware only for Ryzen 5000G, 7000 and 9000 graphics, \
+                 the Radeon RX 6800-6950 XT and the RX 9070, not for this GPU",
         )
     })?;
     Ok(inventory)

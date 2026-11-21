@@ -1127,9 +1127,9 @@ const fn amdgpu(member: &'static str, length: usize, sha256: &'static str) -> Re
 }
 
 /// What amdgpu loads on the GPUs with pinned files, named as the driver
-/// names them: the graphics core's microcode (`gfx_v10_0.c`), the security
-/// processor's table of contents and trusted applications (`psp_v13_0.c`),
-/// the DMA engine's (`sdma_v5_2.c`), the display microcontroller's
+/// names them: the graphics core's microcode (`gfx_v9_0.c`, `gfx_v10_0.c`),
+/// the security processor's images (`psp_v12_0.c`, `psp_v13_0.c`), the DMA
+/// engine's (`sdma_v4_0.c`, `sdma_v5_2.c`), the display microcontroller's
 /// (`amdgpu_dm.c`) and the video decoder's (`amdgpu_vcn.c`).
 pub const AMDGPU: &[Recipe] = &[
     amdgpu(
@@ -1316,6 +1316,61 @@ pub const AMDGPU: &[Recipe] = &[
         114164,
         "286458c7911172734dd514631dcfba9690c2242f24f9be72afd6b56c0341974a",
     ),
+    // Cezanne's, by the chip's name (`amdgpu_ucode_legacy_naming`): graphics
+    // core 9.3.0 loads no separate MEC2 image
+    // (`gfx_v9_0_load_mec2_fw_bin_support`), and the security processor
+    // takes only its ASD and TA, since its sOS is the board firmware's.
+    amdgpu(
+        "amdgpu/green_sardine_ce.bin",
+        36608,
+        "3bba10cff48ec51eb63e78078456596258c9fea2e8b38d91d02be66c0aca70fd",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_pfp.bin",
+        85760,
+        "94e1474b3c8d422e35661d2d584297d891464c173ebf4ad45536277bdf7bdcdc",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_me.bin",
+        69376,
+        "671af908c8d631e659895d62db2e6bffc1d2c87d6db4c08246be0216f468fb9c",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_mec.bin",
+        268224,
+        "0e4c6712f75af494c3fd70386bc07739cab3aafd77c4fe8efb46c0bc1ae4eba6",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_rlc.bin",
+        39928,
+        "66f4397c2e9d19af245f9da290c8678eb1a51cc815fa7864a9383c2cd0db319d",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_sdma.bin",
+        17408,
+        "cba8658ea950a99115ca46ee88c9622240632a0ca1731abbcd18b6d9be9e09de",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_asd.bin",
+        209408,
+        "ebe32baa51bc1fa04dc4df6d7e1f90a3ebb6b0e8931aeb40fc838e0ba2e2c192",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_ta.bin",
+        37632,
+        "53ad33b376b85b90f858c8cc3b4bc6c709135b4bd37340ed69b1f00fecd6626b",
+    ),
+    amdgpu(
+        "amdgpu/green_sardine_vcn.bin",
+        407232,
+        "5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98",
+    ),
+    // DCN 2.1's DMCUB (`amdgpu_dm.c`).
+    amdgpu(
+        "amdgpu/green_sardine_dmcub.bin",
+        121608,
+        "1c9d74c58dd14dacd6d4a330dcf9820b2263d6a7d39fa54c826636a797b4b6a8",
+    ),
 ];
 
 /// A GPU family's name, PCI device IDs and files.
@@ -1326,8 +1381,10 @@ type AmdgpuFamily = (&'static str, &'static [u16], &'static [&'static str]);
 /// only the device can say; the pairing of a PCI device ID with them here is
 /// what the driver's version tables give these GPUs (for Raphael: graphics
 /// core 10.3.6, security processor 13.0.5, DMA engine 5.2.6, display 3.1.5,
-/// video 3.1.2). The driver asks for the video decoder's file in the same
-/// start as the rest and fails without it, so it is required too.
+/// video 3.1.2). For older chips those versions map back to the chip's own
+/// name (`amdgpu_ucode_legacy_naming`): Navi 21's `sienna_cichlid`,
+/// Cezanne's `green_sardine`. The driver asks for the video decoder's file
+/// in the same start as the rest and fails without it, so it is required too.
 const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
     (
         "Ryzen 7000 or 9000 desktop graphics (Raphael, Granite Ridge)",
@@ -1387,6 +1444,25 @@ const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
             "amdgpu/sienna_cichlid_ta.bin",
             "amdgpu/sienna_cichlid_vcn.bin",
             "amdgpu/sienna_cichlid_dmcub.bin",
+        ],
+    ),
+    (
+        "Ryzen 5000G or 5000-series mobile graphics (Cezanne)",
+        // amdgpu's ID table lists 1002:1638 under CHIP_RENOIR, and gives every
+        // Renoir ID but 1636 and 164c the Green Sardine files
+        // (`amdgpu_device_init_apu_flags`). Not yet checked on hardware.
+        &[0x1638],
+        &[
+            "amdgpu/green_sardine_ce.bin",
+            "amdgpu/green_sardine_pfp.bin",
+            "amdgpu/green_sardine_me.bin",
+            "amdgpu/green_sardine_mec.bin",
+            "amdgpu/green_sardine_rlc.bin",
+            "amdgpu/green_sardine_sdma.bin",
+            "amdgpu/green_sardine_asd.bin",
+            "amdgpu/green_sardine_ta.bin",
+            "amdgpu/green_sardine_vcn.bin",
+            "amdgpu/green_sardine_dmcub.bin",
         ],
     ),
 ];
@@ -2697,6 +2773,36 @@ mod tests {
         }
         // One shared notice beside the twelve images.
         assert_eq!(plan.artifacts().len(), 13);
+    }
+
+    #[test]
+    fn cezanne_requires_every_file_amdgpu_asks_for_and_nothing_else() {
+        assert_eq!(
+            amd_gpu_family(0x1638),
+            Some("Ryzen 5000G or 5000-series mobile graphics (Cezanne)")
+        );
+        // Renoir and Lucienne load `renoir_*` files, which are not pinned.
+        assert_eq!(amd_gpu_family(0x1636), None);
+        assert_eq!(amd_gpu_family(0x164c), None);
+        let mut inventory = Inventory::default();
+        require_amdgpu(&mut inventory, 0x1638).unwrap();
+        let plan = Plan::select(&inventory).unwrap();
+        assert_eq!(plan.selections().len(), 10);
+        for selection in plan.selections() {
+            assert_eq!(selection.request.name, selection.recipe.image.member);
+            assert!(
+                selection.request.name.starts_with("amdgpu/green_sardine_"),
+                "{}",
+                selection.request.name
+            );
+            // Graphics core 9.3.0 asks for no separate MEC2 image.
+            assert_ne!(selection.request.name, "amdgpu/green_sardine_mec2.bin");
+            assert_eq!(selection.request.target.driver, "amdgpu");
+            assert!(selection.recipe.image.url().contains(GSP_REVISION));
+            assert_eq!(selection.recipe.license.member, "LICENSES/LICENSE.amdgpu");
+        }
+        // One shared notice beside the ten images.
+        assert_eq!(plan.artifacts().len(), 11);
     }
 
     #[test]
