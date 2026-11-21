@@ -2005,6 +2005,39 @@ pub(super) fn no_metal_device() -> Option<&'static str> {
     Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
 }
 
+/// The GPU check (`--gpu-check`), once the GPUs have started: a line for
+/// each GPU a driver bound, then the verdict, and the boot stops. A Metal
+/// device passes; a GPU that only shows a picture stops with its own code,
+/// as the first step of a port that has a kernel driver and no Vulkan
+/// driver yet; no GPU started fails, naming why.
+#[cfg(feature = "diagnostics")]
+pub(super) fn check() -> ! {
+    #[cfg(feature = "nvk")]
+    let bound = installed().map_or(&[][..], |gpu| gpu.start.bound.as_slice());
+    #[cfg(feature = "nvk")]
+    for gpu in bound {
+        output::arguments(format_args!(
+            "GPU CHECK bound {} driver={} vulkan={}\n",
+            gpu.name,
+            gpu.stack.kernel.driver,
+            if gpu.stack.draws() { "yes" } else { "no" }
+        ));
+    }
+    #[cfg(not(feature = "nvk"))]
+    let bound: &[()] = &[];
+    match no_metal_device() {
+        None => {
+            output::arguments(format_args!("GPU CHECK passed: a Metal device opened\n"));
+            output::terminate(0x10)
+        }
+        Some(reason) if !bound.is_empty() => {
+            output::arguments(format_args!("GPU CHECK no Metal device: {reason}\n"));
+            output::terminate(0x11)
+        }
+        Some(reason) => output::fatal(format_args!("the GPU check failed: {reason}")),
+    }
+}
+
 /// The kexts a boot that gives the GPUs to nouveau links into its system.
 pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
     #[cfg(feature = "nvk")]

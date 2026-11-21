@@ -151,6 +151,12 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
         native_processors,
     } = start(handoff);
     let mut host = open_host(handoff, &mut options, host_firmware, native_processors);
+    // The GPUs have started: the check reports them and stops here, before
+    // the guest's storage is opened or any of its partitions is written.
+    #[cfg(feature = "diagnostics")]
+    if options.gpu_check {
+        gpu::check();
+    }
     let storage = open_storage(handoff, &options, &mut host);
     // A single-user boot is a console, which draws through no GPU; without
     // one it gives macOS no Metal device (`System::hides_agx`).
@@ -3323,12 +3329,14 @@ fn start_devices(
             if let Some(log) = log {
                 crate::log_file::resume(log);
             }
+            // The GPU check starts them as a macOS boot does.
+            let starts_gpus = options.boots_macos() || options.gpu_check;
             let work = kernel_work.inspect_err(|reason| {
-                if options.boots_macos() {
+                if starts_gpus {
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
                 }
             });
-            if options.boots_macos()
+            if starts_gpus
                 && let Ok(work) = work
                 && open_gpus(
                     work,

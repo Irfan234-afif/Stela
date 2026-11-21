@@ -39,9 +39,27 @@ fn diagnostic_options_are_typed() {
             "--system --native-cores 2 --native-shared-check",
             "--native-shared-check",
         ),
+        ("--system --gpu-check", "--gpu-check"),
     ] {
         assert_eq!(System::parse(text).unwrap().diagnostic_option(), Some(flag));
     }
+}
+
+#[test]
+fn the_gpu_check_round_trips_beside_a_boot_and_is_given_once() {
+    for text in [
+        "--system --gpu-check",
+        &format!("--system --storage {DISK} --external-disks --gpu-check"),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert!(options.gpu_check, "{text}");
+        assert_eq!(System::parse(&options.to_string()), Ok(options), "{text}");
+    }
+    assert!(!System::default().gpu_check);
+    assert_eq!(
+        System::parse("--system --gpu-check --gpu-check").unwrap_err(),
+        Error::DuplicateGpuCheck
+    );
 }
 
 #[test]
