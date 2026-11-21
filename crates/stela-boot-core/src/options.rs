@@ -311,6 +311,11 @@ pub struct System {
     /// or failed, once the stop has stored its log, so a diagnostics run
     /// returns to the PC's own boot order unattended (`--restart-at-stop`).
     pub restart_at_stop: bool,
+    /// Start the PC's devices with the `--wifi` network, report how far
+    /// each RTL8852BE came (`wifi_check`), and stop before the guest's
+    /// storage is opened, restarting the PC as `--restart-at-stop` does
+    /// (`--wifi-check`).
+    pub wifi_check: bool,
     /// Check exclusively owned conventional HDA after ExitBootServices.
     pub audio_check: Option<AudioCheck>,
     /// Explicit whole-controller handoff for the audio check's physical clock.
@@ -415,6 +420,7 @@ impl Default for System {
             network_check: None,
             gpu_check: false,
             restart_at_stop: false,
+            wifi_check: false,
             audio_check: None,
             audio_own_hpet: false,
             native_pci_own_ioapic: false,
@@ -695,6 +701,7 @@ impl System {
             (self.network_check.is_some(), "--network-check"),
             (self.gpu_check, "--gpu-check"),
             (self.restart_at_stop, "--restart-at-stop"),
+            (self.wifi_check, "--wifi-check"),
         ]
         .into_iter()
         .find_map(|(enabled, flag)| enabled.then_some(flag))
@@ -876,6 +883,7 @@ impl fmt::Display for System {
         line.value("--network-check", self.network_check.as_deref())?;
         line.flag("--gpu-check", self.gpu_check)?;
         line.flag("--restart-at-stop", self.restart_at_stop)?;
+        line.flag("--wifi-check", self.wifi_check)?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
         line.flag("--native-pci-own-ioapic", self.native_pci_own_ioapic)?;

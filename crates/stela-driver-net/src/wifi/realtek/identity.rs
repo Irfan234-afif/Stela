@@ -62,6 +62,16 @@ pub struct Unpowered {
     pub msi: bool,
 }
 
+impl Unpowered {
+    /// The cut SYS_CFG1 names, or `None` for a read that returned all ones,
+    /// a master abort, or `RTW89_R32_DEAD`, which rtw89 reads from a
+    /// register block that is off.
+    pub fn cut(&self) -> Option<u8> {
+        let word = self.observed.sys_cfg1;
+        (!matches!(word, u32::MAX | 0xdead_beef)).then(|| cut_of(word))
+    }
+}
+
 impl fmt::Display for Unpowered {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let o = self.observed;
@@ -77,12 +87,9 @@ impl fmt::Display for Unpowered {
             if self.msi { "yes" } else { "no" },
             o.sys_cfg1,
         )?;
-        // All ones is a master abort; rtw89 reads `RTW89_R32_DEAD` from a
-        // register block that is off.
-        if matches!(o.sys_cfg1, u32::MAX | 0xdead_beef) {
+        let Some(cut) = self.cut() else {
             return f.write_str(": the function did not answer, so no cut");
-        }
-        let cut = cut_of(o.sys_cfg1);
+        };
         match rtw89_cut_name(cut) {
             Some(name) => write!(f, " cut={cut} ({name})")?,
             None => write!(f, " cut={cut} (past rtw89's CHIP_CFV)")?,
@@ -348,6 +355,21 @@ pub(crate) mod tests {
         assert!(
             read(observed, true).ends_with("cut=9 (past rtw89's CHIP_CFV): read before power-on")
         );
+        let cut = |sys_cfg1| {
+            Unpowered {
+                observed: Observed {
+                    sys_cfg1,
+                    ..observed
+                },
+                bar2_bytes: 0,
+                msi: false,
+            }
+            .cut()
+        };
+        assert_eq!(cut(0x0001_1f00), Some(1));
+        assert_eq!(cut(0xffff_0fff), Some(0));
+        assert_eq!(cut(u32::MAX), None);
+        assert_eq!(cut(0xdead_beef), None);
         for dead in [u32::MAX, 0xdead_beef] {
             observed.sys_cfg1 = dead;
             let line = read(observed, true);

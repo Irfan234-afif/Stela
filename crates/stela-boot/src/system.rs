@@ -330,6 +330,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         || system.nor.is_some()
         || system.network_check.is_some()
         || system.gpu_check
+        || system.wifi_check
         || system.audio_check.is_some()
         || !system.usb_storage.is_empty()
         || system.input
@@ -839,7 +840,9 @@ fn load(
     if let Some(power) = &power {
         crate::stop::arm(power, tsc_hz);
     }
-    if system.restart_at_stop {
+    // The Wi-Fi check runs unattended from the PC's own boot order and
+    // hands it back the same way.
+    if system.restart_at_stop || system.wifi_check {
         crate::stop::restart_at_stop();
     }
     let random_seed = match crate::entropy::retain_seed() {

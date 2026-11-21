@@ -2403,6 +2403,7 @@ pub unsafe fn open(
         usb_disks,
         disks: host_disks,
         power: core::mem::take(&mut devices.power),
+        wifi_identities: core::mem::take(&mut devices.wifi_identities),
     })
 }
 
@@ -2756,6 +2757,15 @@ pub struct Opened {
     pub usb_disks: alloc::vec::Vec<Box<dyn BlockDevice>>,
     /// Every disk taken above, for its shutdown notice.
     pub disks: HostDisks,
+    /// What the probe read of each RTL8852B before power-on, for the Wi-Fi
+    /// check (`probe::Devices::wifi_identities`).
+    pub wifi_identities: alloc::vec::Vec<(
+        Address,
+        core::result::Result<
+            stela_drivers::net::wifi::realtek::identity::Unpowered,
+            stela_drivers::probe::Error,
+        >,
+    )>,
 }
 
 /// The host's input devices and the loader root their registers and DMA

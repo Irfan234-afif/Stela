@@ -43,7 +43,11 @@ fn restore(options: &System) -> Result<(), Error> {
 }
 
 fn wifi(options: &System) -> Result<(), Error> {
-    if options.ssid.is_none() && (options.wifi_key.is_some() || options.wifi_country.is_some()) {
+    // The probe touches a Wi-Fi function only given a network, so the
+    // Wi-Fi check needs one too.
+    if options.ssid.is_none()
+        && (options.wifi_key.is_some() || options.wifi_country.is_some() || options.wifi_check)
+    {
         return Err(Error::Constraint(Constraint::WifiDependency));
     }
     Ok(())

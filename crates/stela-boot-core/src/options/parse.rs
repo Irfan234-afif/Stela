@@ -217,6 +217,7 @@ impl ParseState<'_> {
             "--restart-at-stop" => {
                 flag(&mut options.restart_at_stop, Error::DuplicateRestartAtStop)?;
             }
+            "--wifi-check" => flag(&mut options.wifi_check, Error::DuplicateWifiCheck)?,
             "--native-pci-own-ioapic" => {
                 flag(
                     &mut options.native_pci_own_ioapic,

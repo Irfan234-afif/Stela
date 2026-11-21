@@ -133,6 +133,7 @@ pub mod usb_legacy;
 pub mod vfct;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
+pub mod wifi_check;
 pub mod work_status;
 pub mod worker_bindings;
 pub mod writeback_placement;

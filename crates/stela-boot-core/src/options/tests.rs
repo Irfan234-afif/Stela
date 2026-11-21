@@ -41,9 +41,31 @@ fn diagnostic_options_are_typed() {
         ),
         ("--system --gpu-check", "--gpu-check"),
         ("--system --restart-at-stop", "--restart-at-stop"),
+        ("--system --wifi home --wifi-check", "--wifi-check"),
     ] {
         assert_eq!(System::parse(text).unwrap().diagnostic_option(), Some(flag));
     }
+}
+
+#[test]
+fn the_wifi_check_needs_a_network_round_trips_and_is_given_once() {
+    for text in [
+        "--system --wifi home --wifi-check",
+        "--system --wifi Home%20Net --wifi-country ID --wifi-check --restart-at-stop",
+    ] {
+        let options = System::parse(text).unwrap();
+        assert!(options.wifi_check, "{text}");
+        assert_eq!(System::parse(&options.to_string()), Ok(options), "{text}");
+    }
+    assert!(!System::default().wifi_check);
+    assert_eq!(
+        System::parse("--system --wifi home --wifi-check --wifi-check").unwrap_err(),
+        Error::DuplicateWifiCheck
+    );
+    assert_eq!(
+        System::parse("--system --wifi-check").unwrap_err(),
+        Error::Constraint(Constraint::WifiDependency)
+    );
 }
 
 #[test]
