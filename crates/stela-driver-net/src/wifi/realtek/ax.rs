@@ -6,9 +6,11 @@
 //! modules beside this one serve RTL8822C alone; nothing here shares their
 //! register map, firmware interface or DMA layout.
 //!
-//! Register access ([`io`]) and RTL8852B's RF calibration tables
-//! ([`rtw8852b::rfk`]) are the first slices. They power nothing and prove
-//! nothing about the chip's state.
+//! Register access ([`io`]), RTL8852B's RF calibration tables
+//! ([`rtw8852b::rfk`]) and its power sequence ([`power`]) are the first
+//! slices. Powering the chip on proves its polled bits answered, nothing
+//! about its firmware or radio.
 pub mod io;
+pub mod power;
 pub mod registers;
 pub mod rtw8852b;

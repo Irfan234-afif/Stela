@@ -2443,6 +2443,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "power_on_and_off_register_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/power/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_POWER_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw8852b power C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",

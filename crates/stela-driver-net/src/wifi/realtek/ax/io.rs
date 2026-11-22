@@ -136,6 +136,15 @@ pub trait Registers: Io {
         let value = self.read32(register)?;
         self.write32(register, value & !bits)
     }
+    /// `rtw89_write16_mask`: the mask's low 16 bits, a read, then the write.
+    fn write16_mask(&mut self, register: u32, mask: u32, data: u16) -> Result<(), Error> {
+        let mask = mask & 0xffff;
+        let original = self.read16(register)?;
+        self.write16(
+            register,
+            (original & !(mask as u16)) | prep(u32::from(data), mask) as u16,
+        )
+    }
     /// `rtw89_write16_set`.
     fn write16_set(&mut self, register: u32, bits: u16) -> Result<(), Error> {
         let value = self.read16(register)?;
