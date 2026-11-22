@@ -17,6 +17,7 @@ use super::{
 pub mod channel;
 pub mod efuse;
 pub mod rfk;
+pub mod txpower;
 
 /// `RTL8852B_RFE_05_SPS_ANA`: what `rtw8852b_pwr_sps_ana` writes to
 /// `R_AX_SPS_ANA_ON_CTRL2` on a board of RFE type 5.

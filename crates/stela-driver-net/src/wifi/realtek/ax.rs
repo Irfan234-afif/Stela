@@ -45,6 +45,8 @@ pub mod mac;
 mod model;
 pub mod pci;
 pub mod power;
+pub mod regd;
 pub mod registers;
 pub mod rtw8852b;
+pub mod txpower;
 pub mod txwd;

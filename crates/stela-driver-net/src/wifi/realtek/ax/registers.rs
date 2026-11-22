@@ -1299,3 +1299,26 @@ pub const SB_DRV_MASK: u32 = 0x00ff_ffff;
 pub const SB_BTGS1_NOTIFY: u32 = 1 << 0;
 pub const SB_NOTIFY_TP_MAJOR: u32 = 0x81;
 pub const SB_NOTIFY_PWR_MAJOR: u32 = 0x80;
+/// `R_AX_PWR_RATE_CTRL` and its `B_AX_PWR_REF`.
+pub const PWR_RATE_CTRL: u32 = 0xd200;
+pub const PWR_REF: u32 = 0x0fff_fc00;
+/// `R_AX_PWR_RATE_OFST_CTRL`.
+pub const PWR_RATE_OFST_CTRL: u32 = 0xd204;
+/// `R_AX_PWR_BY_RATE`, `R_AX_PWR_LMT` and `R_AX_PWR_RU_LMT`: the first
+/// words of the by-rate, limit and RU limit pages.
+pub const PWR_BY_RATE: u32 = 0xd2c0;
+pub const PWR_LMT: u32 = 0xd2ec;
+pub const PWR_RU_LMT: u32 = 0xd33c;
+/// `CMAC1_START_ADDR_AX` and `CMAC1_END_ADDR_AX`.
+pub const CMAC1_START_ADDR: u32 = 0xe000;
+pub const CMAC1_END_ADDR: u32 = 0xffff;
+/// BB: `R_TXFIR0`, the first of the 2.4 GHz TX shape's eight DFIR words.
+pub const TXFIR0: u32 = 0x2300;
+/// BB: `R_DCFO_OPT` and its `B_TXSHAPE_TRIANGULAR_CFG`.
+pub const DCFO_OPT: u32 = 0x4494;
+pub const TXSHAPE_TRIANGULAR_CFG: u32 = 0x0300_0000;
+/// BB: `B_DPD_TSSI_CW`, `B_DPD_PWR_CW` and `B_DPD_REF` of each path's TX
+/// power reference.
+pub const DPD_TSSI_CW: u32 = 0x07fc_0000;
+pub const DPD_PWR_CW: u32 = 0x0003_fe00;
+pub const DPD_REF: u32 = 0x0000_01ff;
