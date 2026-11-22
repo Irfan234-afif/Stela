@@ -60,6 +60,25 @@ every one-shot failing. After the state's records, rtwdev->iqk follows (20:
 fail count and flags, times, version; 21 to 24 per path: channel, flags and
 table, the narrowband CFIRs, the TX and RX results, the enable and syn1to2;
 25 and 26 per table and path: MCC channel and LOK codes).
+
+tssi_dpk_trace.bin holds TSSI_DPK_ORDER's cases, in the same form,
+over patterned memory with dpk_gs 0x5b, cut CBV, the efuse's TSSI values,
+thermal values 0x20 and 0x21 and a TX power tracking element patterned as
+TRK_ROWS, bitmap 0xfff0. They run rtw8852b_tssi(PHY 0, hwtx_en),
+rtw8852b_dpk(PHY 0), rtw8852b_rfk_channel, rtw8852b_rfk_band_changed
+(rtw8852b_tssi_scan) and rtw8852b_rfk_scan (rtw8852b_wifi_scan_notify),
+unchanged, with rtw8852b_mcc_get_ch_info, rtw89_rfk_chan_lookup,
+rtw89_fw_h2c_rf_ntfy_mcc and the rtw8852b_common.c BB helpers TSSI's
+alignment reaches through rtw8852bx_info. The model adds: R_RPT_COM's low
+word reads 0x8000 while R_KIP_RPT1 selects report 3 (the DPK one-shot's),
+unless the case keeps it clear, and otherwise reads the case's script of
+words in turn, cycling, or memory without one; the TSSI CW reports at 0x1c18
+and 0x3c18 read their ready bit unless the case keeps it clear. Each H2C is
+two records: 30 (cat, class and func; type, rack, dack and length) and 31
+per payload word. After the state's and IQK's records come rfk_mcc (40),
+the DPK flags (43), per path and table the DPK result (41) and sync (42),
+per path, band and word the TSSI alignment (44), and per path, channel
+index and word the alignment kept by channel (45), for the channels kept.
 """
 import hashlib
 import json
@@ -69,6 +88,22 @@ import subprocess
 import sys
 
 COMMIT = 'a804c5742bff224d4cb4d25dd383554d598be32b'
+TSSI_DPK_ORDER = (
+    'rtw8852b_tssi(PHY 0, true) on 2 GHz 20 MHz channel 1, 2 GHz 40 MHz channel 6, 5 GHz 20 MHz '
+    'channel 36, 5 GHz 40 MHz channel 149, 5 GHz 80 MHz channels 36, 149 and 42, 5 GHz 20 MHz '
+    'channel 100; channel 36 with thermal values 0xff; channel 1 with the CW reports never '
+    'ready; channel 6 with valid efuse gains; channel 1 twice on one state; '
+    'rtw8852b_dpk(PHY 0) on the six channels of the IQK cases with the passing script; '
+    'channel 1 with the sync failing; channels 36 and 36 at 80 MHz with the digital gain low; '
+    'channel 6 with gain loss 9; channel 149 with gain loss 0 and the PA samples over and not '
+    'over 8/5; channel 1 with both paths in TSSI mode; channels 36 and 1 with a 5 GHz '
+    'external PA; channel 36 with dpk_gs 0x7f on cut CAV; channel 6 with the KIP report and '
+    'one-shot 3 never ready; channel 1 with no script; rtw8852b_rfk_channel on channel 1, on '
+    'channel 149 at 80 MHz, on channel 6 then 36, and on channel 36 with MCC table 1 already '
+    'holding it; rtw8852b_rfk_band_changed on channel 36, alone and after rtw8852b_tssi; '
+    'rtw8852b_rfk_scan start on channel 1; rtw8852b_tssi then scan start and end on channel 1')
+TRK_ROWS = ('row r, delta i: (r * 13 + i * 7) % 61 - 30; types 4 to 7 at rows 0, 3, 6 and 9, '
+            '8 to 15 at 12 to 19')
 
 
 def main(argv):
@@ -243,6 +278,100 @@ def main(argv):
         'rtw8852b_iqk'])
     rfk_init = functions('rtw8852b.c', ['rtw8852b_rfk_init'])
 
+    # TSSI, DPK, rtw8852b_rfk_channel and RF_NTFY_MCC.
+    defines38 = '\n'.join([
+        defines('core.h', ['MASKBYTE2', 'MASKBYTE3', 'MASKHWORD', 'DELTA_SWINGIDX_SIZE',
+                           'RTW89_DPK_RF_PATH', 'RTW89_DPK_BKUP_NUM']),
+        block('core.h', '#define TSSI_TRIM_CH_GROUP_NUM ', 'TSSI_ALIMK_VALUE_NUM'),
+        defines('phy.h', ['phy_div']),
+        defines('rtw8852b_common.h', ['BB_PATH_NUM_8852BX']),
+        defines('fw.h', ['FWCMD_TYPE_H2C', 'H2C_CAT_OUTSRC', 'H2C_CL_OUTSRC_RF_FW_NOTIFY',
+                         'H2C_FUNC_OUTSRC_RF_GET_MCCCH'])])
+    declarations38 = '\n\n'.join(
+        [declaration('core.h', 'enum', name) for name in [
+            'rtw89_cv', 'rtw89_subband', 'rtw89_gain_offset', 'rtw89_tssi_alimk_band',
+            'rtw89_core_chip_id']]
+        + [declaration('core.h', 'struct', name) for name in [
+            'rtw89_dpk_bkup_para', 'rtw89_dpk_info', 'rtw89_fem_info', 'rtw89_tssi_info',
+            'rtw89_phy_efuse_gain']]
+        + [declaration('fw.h', 'enum', 'rtw89_fw_txpwr_trk_type')]
+        + [declaration('fw.h', 'struct', name) for name in [
+            'rtw89_fw_txpwr_track_cfg', 'rtw89_fw_h2c_rf_get_mccch',
+            'rtw89_fw_h2c_rf_get_mccch_v0']]
+        + [declaration('phy.h', 'struct', 'rtw89_rfk_chan_desc'),
+           declaration('rtw8852b_common.h', 'enum', 'rtw8852bx_pmac_mode')]
+        + [declaration('rtw8852b_common.h', 'struct', name) for name in [
+            'rtw8852bx_bb_pmac_info', 'rtw8852bx_bb_tssi_bak']])
+    phy_h38 = functions('phy.h', ['rtw89_raw_phy_write32', 'rtw89_phy_write32',
+                                  'rtw89_subband_to_gain_offset_band_of_ofdm'])
+    phy38 = '\n\n'.join([
+        functions('phy.c', ['rtw89_phy_write32_idx', 'rtw89_phy_read32_idx']),
+        lines_from('phy.c', 'static bool rfk_chan_validate_desc', 'rtw89_rfk_chan_lookup')])
+    chan38 = functions('chan.c', ['rtw89_get_subband_type'])
+    common_h38 = functions('rtw8852b_common.h', [
+        'rtw8852bx_bb_cfg_tx_path', 'rtw8852bx_bb_ctrl_rx_path', 'rtw8852bx_bb_set_plcp_tx',
+        'rtw8852bx_bb_set_power', 'rtw8852bx_bb_set_pmac_pkt_tx', 'rtw8852bx_bb_backup_tssi',
+        'rtw8852bx_bb_restore_tssi', 'rtw8852bx_bb_tx_mode_switch', 'rtw8852bx_ctrl_btg_bt_rx'])
+    common38 = '\n\n'.join([
+        span('rtw8852b_common.c',
+             'static const struct rtw89_reg3_def rtw8852bx_pmac_ht20_mcs7_tbl[]',
+             'static const struct rtw89_reg3_def rtw8852bx_pmac_ht20_mcs7_tbl[]'),
+        functions('rtw8852b_common.c', [
+            'rtw8852bx_set_gain_offset', '__rtw8852bx_bb_set_plcp_tx', 'rtw8852bx_stop_pmac_tx',
+            'rtw8852bx_start_pmac_tx', 'rtw8852bx_bb_set_pmac_tx',
+            '__rtw8852bx_bb_set_pmac_pkt_tx', '__rtw8852bx_bb_set_power',
+            '__rtw8852bx_bb_cfg_tx_path', '__rtw8852bx_bb_tx_mode_switch',
+            '__rtw8852bx_bb_backup_tssi', '__rtw8852bx_bb_restore_tssi',
+            '__rtw8852bx_ctrl_btg_bt_rx', '__rtw8852bx_bb_ctrl_rx_path'])])
+    extra_group = block('rtw8852b_rfk.c', '#define TSSI_EXTRA_GROUP_BIT',
+                        'TSSI_EXTRA_GET_GROUP_IDX2')
+    rfk38 = functions('rtw8852b_rfk.c', [
+        '_rfk_rf_direct_cntrl', '_rfk_drf_direct_cntrl', '_tmac_tx_pause',
+        '_dpk_bkup_kip', '_dpk_reload_kip', '_dpk_order_convert', '_dpk_onoff', '_dpk_one_shot',
+        '_dpk_rx_dck', '_dpk_information', '_dpk_bb_afe_setting', '_dpk_bb_afe_restore',
+        '_dpk_tssi_pause', '_dpk_kip_restore', '_dpk_lbk_rxiqk', '_dpk_get_thermal',
+        '_dpk_rf_setting', '_dpk_bypass_rxcfir', '_dpk_tpg_sel', '_dpk_table_select',
+        '_dpk_sync_check', '_dpk_sync', '_dpk_dgain_read', '_dpk_dgain_mapping',
+        '_dpk_gainloss_read', '_dpk_gainloss', '_dpk_kip_preset', '_dpk_kip_pwr_clk_on',
+        '_dpk_kip_set_txagc', '_dpk_kip_set_rxagc', '_dpk_set_offset', '_dpk_pas_read',
+        '_dpk_agc', '_dpk_set_mdpd_para', '_dpk_idl_mpa', '_dpk_fill_result',
+        '_dpk_reload_check', '_dpk_main', '_dpk_cal_select', '_dpk_bypass_check',
+        '_dpk_force_bypass', '_dpk', '_tssi_rf_setting', '_tssi_set_sys',
+        '_tssi_ini_txpwr_ctrl_bb', '_tssi_ini_txpwr_ctrl_bb_he_tb', '_tssi_set_dck',
+        '_tssi_set_tmeter_tbl', '_tssi_set_dac_gain_tbl', '_tssi_slope_cal_org',
+        '_tssi_alignment_default', '_tssi_set_tssi_slope', '_tssi_set_tssi_track',
+        '_tssi_set_txagc_offset_mv_avg', '_tssi_enable', '_tssi_disable',
+        '_tssi_get_cck_group', '_tssi_get_ofdm_group', '_tssi_get_trim_group',
+        '_tssi_get_ofdm_de', '_tssi_get_ofdm_trim_de', '_tssi_set_efuse_to_de',
+        '_tssi_alimentk_dump_result', '_tssi_alimentk_done', '_tssi_hw_tx',
+        '_tssi_backup_bb_registers', '_tssi_reload_bb_registers', '_tssi_ch_to_idx',
+        '_tssi_get_cw_report', '_tssi_alimentk', 'rtw8852b_dpk', 'rtw8852b_tssi',
+        'rtw8852b_tssi_scan', 'rtw8852b_tssi_default_txagc', 'rtw8852b_wifi_scan_notify',
+        'rtw8852b_mcc_get_ch_info'])
+    fw38 = functions('fw.c', ['rtw89_fw_h2c_rf_ntfy_mcc'])
+    chip38 = functions('rtw8852b.c', ['rtw8852b_rfk_channel', 'rtw8852b_rfk_band_changed',
+                                      'rtw8852b_rfk_scan'])
+    chip_ops38 = members('rtw8852b.c', 'static const struct rtw89_chip_ops rtw8852b_chip_ops',
+                         ['rfk_channel', 'rfk_band_changed', 'rfk_scan'])
+    if chip_ops38 != {'rfk_channel': 'rtw8852b_rfk_channel',
+                      'rfk_band_changed': 'rtw8852b_rfk_band_changed',
+                      'rfk_scan': 'rtw8852b_rfk_scan'}:
+        raise ValueError(f'rtw8852b_chip_ops is {chip_ops38}')
+    bx_names = ['bb_cfg_tx_path', 'bb_ctrl_rx_path', 'bb_set_plcp_tx', 'bb_set_power',
+                'bb_set_pmac_pkt_tx', 'bb_backup_tssi', 'bb_restore_tssi', 'bb_tx_mode_switch',
+                'ctrl_btg_bt_rx']
+    bx = members('rtw8852b_common.c', 'const struct rtw8852bx_info rtw8852bx_info', bx_names)
+    if bx != {name: '__rtw8852bx_' + name for name in bx_names}:
+        raise ValueError(f'rtw8852bx_info is {bx}')
+    chip_id = members('rtw8852b.c', 'const struct rtw89_chip_info rtw8852b_chip_info',
+                      ['chip_id'])
+    if chip_id != {'chip_id': 'RTL8852B'}:
+        raise ValueError(f'rtw8852b_chip_info is {chip_id}')
+    fw_c = source('fw.c')
+    if fw_c.count('RFK_NTFY_MCC_V0') != 2 or \
+            '\t__CFG_FW_FEAT(RTL8852C, ge, 0, 0, 0, 0, RFK_NTFY_MCC_V0),\n' not in fw_c:
+        raise ValueError('fw.c: RFK_NTFY_MCC_V0 is no longer RTL8852C\'s alone')
+
     chip_ops = members('rtw8852b.c', 'static const struct rtw89_chip_ops rtw8852b_chip_ops',
                        ['read_rf', 'write_rf', 'rfk_init', 'stop_sch_tx', 'resume_sch_tx'])
     if chip_ops != {'read_rf': 'rtw89_phy_read_rf_v1', 'write_rf': 'rtw89_phy_write_rf_v1',
@@ -274,6 +403,9 @@ def main(argv):
 #include <string.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int32_t s32;
+typedef int8_t s8; typedef int16_t s16; typedef int64_t s64;
+typedef u32 __le32;
+#define __packed __attribute__((packed))
 #define BIT(n) (1U << (n))
 #define GENMASK(h, l) ((~0U >> (31 - (h))) & (~0U << (l)))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -288,7 +420,7 @@ typedef int32_t s32;
 /* rtw89's log helpers are calls in the kernel: their arguments, register
  * reads among them, are evaluated whatever is printed. */
 static void sink(const char *format, ...) { (void)format; }
-enum { RTW89_DBG_RFK = 1 };
+enum { RTW89_DBG_RFK = 1, RTW89_DBG_TSSI = 2 };
 #define rtw89_err(d, ...) ((void)(d), sink(__VA_ARGS__))
 #define rtw89_debug(d, m, ...) ((void)(d), (void)(m), sink(__VA_ARGS__))
 static void model_delay(u64 us);
@@ -314,15 +446,24 @@ static void model_delay(u64 us);
 struct rtw89_dev;
 struct rtw89_phy_gen_def { u32 cr_base; };
 struct rtw89_chip_info {
+	enum rtw89_core_chip_id chip_id;
 	const struct rtw89_phy_gen_def *phy_def;
 	u32 rf_base_addr[2];
 	u8 rf_path_num;
 };
-struct rtw89_hal { u8 cv; };
-struct rtw89_dpk_info { u8 dpk_gs[RTW89_PHY_NUM]; };
-struct rtw89_chan { u8 channel; enum rtw89_band band_type; enum rtw89_bandwidth band_width; };
+struct rtw89_hal { u8 cv; u8 antenna_rx; };
+struct rtw89_chan {
+	u8 channel;
+	enum rtw89_band band_type;
+	enum rtw89_bandwidth band_width;
+	enum rtw89_subband subband_type;
+};
+struct rtw89_fw_elm_info { const struct rtw89_fw_txpwr_track_cfg *txpwr_trk; };
+struct rtw89_fw_info { struct rtw89_fw_elm_info elm_info; };
+struct rtw89_io_ops { void (*phy_write32)(struct rtw89_dev *rtwdev, u32 addr, u32 data); };
 struct rtw89_dev {
 	const struct rtw89_chip_info *chip;
+	const struct rtw89_io_ops *io;
 	bool dbcc_en;
 	struct rtw89_hal hal;
 	struct rtw89_dack_info dack;
@@ -332,6 +473,10 @@ struct rtw89_dev {
 	unsigned long flags[(NUM_OF_RTW89_FLAGS + 63) / 64];
 	struct rtw89_iqk_info iqk;
 	struct rtw89_chan chan;
+	struct rtw89_tssi_info tssi;
+	struct rtw89_fem_info fem;
+	struct rtw89_phy_efuse_gain efuse_gain;
+	struct rtw89_fw_info fw;
 };
 static const struct rtw89_chan *rtw89_chan_get(struct rtw89_dev *d, enum rtw89_chanctx_idx i)
 {
@@ -353,9 +498,14 @@ static struct {
 	int lok_fail;
 	u64 nctl_fail;
 	u32 nctl_stuck;
+	int kip_stuck, cwrpt_stuck;
+	const u32 *rpt;
+	u32 rpt_len;
 } fault;
 /* The NCTL one-shots started: writes to R_NCTL_CFG. */
 static u32 oneshots;
+/* The reads of R_RPT_COM's script so far. */
+static u32 rpt_reads;
 static u8 *segment;
 static size_t segment_bytes, segment_capacity;
 static void word(u32 v)
@@ -427,6 +577,13 @@ static u32 view(u32 w)
 	case R_NCTL_RPT:
 		return forced(v, B_NCTL_RPT_FLG,
 			      !oneshots || oneshots > 64 || !((fault.nctl_fail >> (oneshots - 1)) & 1));
+	case R_RPT_COM:
+		if (FIELD_GET(B_KIP_RPT1_SEL, get(CR_BASE + R_KIP_RPT1, 4)) == 3)
+			return (v & 0xffff0000u) | (fault.kip_stuck ? 0 : 0x8000);
+		return fault.rpt_len ? fault.rpt[rpt_reads++ % fault.rpt_len] : v;
+	case 0x1c18:
+	case 0x3c18:
+		return forced(v, B_TSSI_CWRPT_RDY, fault.cwrpt_stuck);
 	}
 	return v;
 }
@@ -505,9 +662,117 @@ static void rtw89_write_rf(struct rtw89_dev *rtwdev, enum rtw89_rf_path rf_path,
         'static const struct rtw89_phy_gen_def phy_gen_ax = {\n'
         f"\t.cr_base = {phy_gen['cr_base']},\n}};\n"
         'static const struct rtw89_chip_info chip_info = {\n'
+        f"\t.chip_id = {chip_id['chip_id']},\n"
         '\t.phy_def = &phy_gen_ax,\n'
         f"\t.rf_base_addr = {info['rf_base_addr']},\n"
         f"\t.rf_path_num = {info['rf_path_num']},\n}};\n")
+    harness38 = r'''
+/* The coex notifications rtw8852b_rfk_channel adds are no-ops too. */
+#define rtw89_btc_ntfy_conn_rfk(d, state) ((void)(d))
+#define rtw89_btc_ntfy_preserve_bt_time(d, ms) ((void)(d))
+#define str_on_off(v) ((v) ? "on" : "off")
+#define str_enable_disable(v) ((v) ? "enable" : "disable")
+#define S8_MIN (-128)
+#define S8_MAX 127
+#define clamp_t(t, v, lo, hi) ({ t __v = (v), __lo = (lo), __hi = (hi); \
+	__v < __lo ? __lo : __v > __hi ? __hi : __v; })
+static inline s32 sign_extend32(u32 value, int index)
+{
+	u8 shift = 31 - index;
+	return (s32)(value << shift) >> shift;
+}
+/* The alignment's time account is not modeled. */
+typedef s64 ktime_t;
+static ktime_t ktime_get(void) { return 0; }
+#define ktime_us_delta(a, b) ((s64)((a) - (b)))
+/* RTL8852B's firmware has no RFK_NTFY_MCC_V0, which fw.c gives RTL8852C alone. */
+#define RTW89_CHK_FW_FEATURE(feat, fw) ((void)(fw), false)
+#define U8_MAX 0xff
+#define cpu_to_le32(v) ((u32)(v))
+/* The H2C path: the header's fields and the payload are what is recorded. */
+struct sk_buff { u8 *data; u32 len; u8 buf[64]; };
+static struct sk_buff h2c_skb;
+static struct sk_buff *rtw89_fw_h2c_alloc_skb_with_hdr(struct rtw89_dev *d, u32 len)
+{
+	(void)d;
+	if (len > sizeof(h2c_skb.buf))
+		abort();
+	memset(&h2c_skb, 0, sizeof(h2c_skb));
+	h2c_skb.data = h2c_skb.buf;
+	return &h2c_skb;
+}
+static void *skb_put(struct sk_buff *skb, u32 len)
+{
+	void *tail = skb->data + skb->len;
+	skb->len += len;
+	return tail;
+}
+static void rtw89_h2c_pkt_set_hdr(struct rtw89_dev *d, struct sk_buff *skb, u8 type, u8 cat,
+				  u8 class, u8 func, bool rack, bool dack, u32 len)
+{
+	(void)d;
+	(void)skb;
+	record(30, cat | (u32)class << 8 | (u32)func << 16,
+	       type | (u32)rack << 8 | (u32)dack << 9 | len << 16);
+}
+static u32 get_unaligned_le32(const u8 *p)
+{
+	return p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+static int rtw89_h2c_tx(struct rtw89_dev *d, struct sk_buff *skb, bool fwdl)
+{
+	(void)d;
+	(void)fwdl;
+	for (u32 i = 0; i < skb->len / 4; i++)
+		record(31, i, get_unaligned_le32(skb->data + 4 * i));
+	return 0;
+}
+static void dev_kfree_skb_any(struct sk_buff *skb) { (void)skb; }
+struct rtw89_vif_link { enum rtw89_chanctx_idx chanctx_idx; enum rtw89_phy_idx phy_idx; };
+/* One channel context: the entity's channel is the case's. */
+struct rtw89_entity_conf { const struct rtw89_chan *chans[NUM_OF_RTW89_CHANCTX]; };
+static void rtw89_entity_get_conf(struct rtw89_dev *d, struct rtw89_entity_conf *conf)
+{
+	memset(conf, 0, sizeof(*conf));
+	conf->chans[0] = &d->chan;
+}
+static int rtw89_iterate_entity_chan(struct rtw89_dev *d,
+				     int (*iterator)(const struct rtw89_chan *chan, void *data),
+				     void *data)
+{
+	return iterator(&d->chan, data);
+}
+/* Reached only with DBCC or on an RTL8852BT: neither is. */
+static u32 rtw89_phy0_phy1_offset(struct rtw89_dev *d, u32 a) { (void)d; (void)a; abort(); }
+static void rtw8852bt_ext_loss_avg_update(struct rtw89_dev *d, s8 a, s8 b)
+{ (void)d; (void)a; (void)b; abort(); }
+/* Every case gives the TX power tracking element, as an RTL8852B's firmware must. */
+static const struct rtw89_fw_txpwr_track_cfg rtw89_8852b_trk_cfg;
+struct rtw8852bx_info {
+	void (*bb_cfg_tx_path)(struct rtw89_dev *rtwdev, u8 tx_path);
+	void (*bb_ctrl_rx_path)(struct rtw89_dev *rtwdev, enum rtw89_rf_path_bit rx_path,
+				const struct rtw89_chan *chan);
+	void (*bb_set_plcp_tx)(struct rtw89_dev *rtwdev);
+	void (*bb_set_power)(struct rtw89_dev *rtwdev, s16 pwr_dbm, enum rtw89_phy_idx idx);
+	void (*bb_set_pmac_pkt_tx)(struct rtw89_dev *rtwdev, u8 enable, u16 tx_cnt, u16 period,
+				   u16 tx_time, enum rtw89_phy_idx idx,
+				   const struct rtw89_chan *chan);
+	void (*bb_backup_tssi)(struct rtw89_dev *rtwdev, enum rtw89_phy_idx idx,
+			       struct rtw8852bx_bb_tssi_bak *bak);
+	void (*bb_restore_tssi)(struct rtw89_dev *rtwdev, enum rtw89_phy_idx idx,
+				const struct rtw8852bx_bb_tssi_bak *bak);
+	void (*bb_tx_mode_switch)(struct rtw89_dev *rtwdev, enum rtw89_phy_idx idx, u8 mode);
+	void (*ctrl_btg_bt_rx)(struct rtw89_dev *rtwdev, bool en, enum rtw89_phy_idx phy_idx);
+};
+static const struct rtw8852bx_info rtw8852bx_info;
+'''
+    raw_io38 = members('fw.c', 'static const struct rtw89_io_ops rtw89_raw_io', ['phy_write32'])
+    if raw_io38 != {'phy_write32': 'rtw89_raw_phy_write32'}:
+        raise ValueError(f'rtw89_raw_io is {raw_io38}')
+    io_table = ('static const struct rtw89_io_ops rtw89_raw_io = {\n'
+                f"\t.phy_write32 = {raw_io38['phy_write32']},\n}};\n")
+    bx_table = ('static const struct rtw8852bx_info rtw8852bx_info = {\n'
+                + ''.join(f'\t.{name} = {value},\n' for name, value in bx.items()) + '};\n')
     main_c = r'''
 static void flush(FILE *out)
 {
@@ -572,7 +837,69 @@ static void fill(enum fill f)
 				   f == ONES ? RFREG_MASK : 0;
 	memset(&fault, 0, sizeof(fault));
 	oneshots = 0;
+	rpt_reads = 0;
 }
+static void record_tssi_dpk(const struct rtw89_dev *dev)
+{
+	const struct rtw89_rfk_mcc_info_data *m = &dev->rfk_mcc.data[0];
+	const struct rtw89_dpk_info *d = &dev->dpk;
+	const struct rtw89_tssi_info *t = &dev->tssi;
+
+	record(40, m->ch[0] | (u32)m->ch[1] << 8 | (u32)m->ch[2] << 16,
+	       m->band[0] | (u32)m->band[1] << 8 | (u32)m->band[2] << 16);
+	record(43, (u32)d->is_dpk_enable | (u32)d->is_dpk_reload_en << 1 |
+		   (u32)d->cur_idx[0] << 8 | (u32)d->cur_idx[1] << 16, 0);
+	for (u32 p = 0; p < RTW89_DPK_RF_PATH; p++)
+		for (u32 k = 0; k < RTW89_DPK_BKUP_NUM; k++) {
+			const struct rtw89_dpk_bkup_para *b = &d->bp[p][k];
+
+			record(41, p << 8 | k | (u32)b->band << 16 | (u32)b->bw << 20 |
+				   (u32)b->ch << 24,
+			       (u32)b->path_ok | (u32)b->txagc_dpk << 8 | (u32)b->ther_dpk << 16 |
+			       (u32)b->gs << 24);
+			record(42, b->pwsf | (u32)d->corr_val[p][k] << 16 | (u32)d->corr_idx[p][k] << 24,
+			       d->dc_i[p][k] | (u32)d->dc_q[p][k] << 16);
+		}
+	for (u32 p = 0; p < RF_PATH_NUM_8852B; p++) {
+		for (u32 b = 0; b < TSSI_ALIMK_MAX; b++)
+			for (u32 v = 0; v < 4; v++)
+				record(44, p << 16 | b << 8 | v | (u32)t->alignment_done[p][b] << 24,
+				       t->alignment_value[p][b][v]);
+		for (u32 c = 0; c < TSSI_MAX_CH_NUM; c++)
+			if (t->check_backup_aligmk[p][c])
+				for (u32 v = 0; v < 4; v++)
+					record(45, p << 16 | c << 8 | v,
+					       t->alignment_backup_by_ch[p][c][v]);
+	}
+}
+/* The TX power tracking element's rows, bitmap 0xfff0: types 4 to 7 three rows
+ * each, types 8 to 15 one. */
+static s8 trk_rows[20][DELTA_SWINGIDX_SIZE];
+static struct rtw89_fw_txpwr_track_cfg trk;
+static void fill_trk(void)
+{
+	for (u32 r = 0; r < 20; r++)
+		for (u32 i = 0; i < DELTA_SWINGIDX_SIZE; i++)
+			trk_rows[r][i] = (s8)((int)((r * 13 + i * 7) % 61) - 30);
+	for (u32 type = 4; type < 16; type++)
+		trk.delta[type] = (const s8 (*)[DELTA_SWINGIDX_SIZE])
+				  &trk_rows[type < 8 ? (type - 4) * 3 : type + 4];
+}
+enum op { OP_TSSI, OP_DPK, OP_CHANNEL, OP_BAND_CHANGED, OP_SCAN_START, OP_SCAN_END };
+static const u32 rpt_ok[] = {0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b,
+			     0x05000000, 0x00000030};
+static const u32 rpt_sync_fail[] = {0x00000005, 0x00000012, 0x00006400, 0x000a0000,
+				    0x0000000b, 0x05000000, 0x00000030};
+static const u32 rpt_dgain_low[] = {0x00000005, 0x00000012, 0x0000c800, 0x000a0000,
+				    0x0000000b, 0x01000000, 0x00000030};
+static const u32 rpt_gl_high[] = {0x00000005, 0x00000012, 0x0000c800, 0x000a0000,
+				  0x0000000b, 0x05000000, 0x00000090};
+static const u32 rpt_gl_pas[] = {0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b,
+				 0x05000000, 0x00000000, 0x04000400, 0x04000400, 0x00100010,
+				 0x00100010};
+static const u32 rpt_gl_lt[] = {0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b,
+				0x05000000, 0x00000000, 0x04000400, 0x04000400, 0x04000400,
+				0x04000400};
 static FILE *open_trace(const char *path)
 {
 	FILE *out = fopen(path, "wb");
@@ -636,7 +963,58 @@ int main(int argc, char **argv)
 		{&a149, .nbiqk = 1},
 		{&a149, .nbiqk = 1, .nctl_fail = ~0ULL},
 	};
-	if (argc != 3)
+	static const struct chan a42_80 = {RTW89_BAND_5G, RTW89_CHANNEL_WIDTH_80, 42};
+	static const struct chan a100 = {RTW89_BAND_5G, RTW89_CHANNEL_WIDTH_20, 100};
+	struct top { enum op op; const struct chan *chan; };
+#define RPT(a) .rpt = a, .rpt_len = ARRAY_SIZE(a)
+	static const struct {
+		int n;
+		struct top ops[3];
+		int thermal_ff, cwrpt_stuck, kip_stuck, gain, tssi_mode, epa_5g, gs7f, cav, mcc1;
+		u32 nctl_stuck;
+		const u32 *rpt;
+		u32 rpt_len;
+	} tcases[] = {
+		{1, {{OP_TSSI, &g1}}},
+		{1, {{OP_TSSI, &g6}}},
+		{1, {{OP_TSSI, &a36}}},
+		{1, {{OP_TSSI, &a149}}},
+		{1, {{OP_TSSI, &a36_80}}},
+		{1, {{OP_TSSI, &a149_80}}},
+		{1, {{OP_TSSI, &a42_80}}},
+		{1, {{OP_TSSI, &a100}}},
+		{1, {{OP_TSSI, &a36}}, .thermal_ff = 1},
+		{1, {{OP_TSSI, &g1}}, .cwrpt_stuck = 1},
+		{1, {{OP_TSSI, &g6}}, .gain = 1},
+		{2, {{OP_TSSI, &g1}, {OP_TSSI, &g1}}},
+		{1, {{OP_DPK, &g1}}, RPT(rpt_ok)},
+		{1, {{OP_DPK, &g6}}, RPT(rpt_ok)},
+		{1, {{OP_DPK, &a36}}, RPT(rpt_ok)},
+		{1, {{OP_DPK, &a149}}, RPT(rpt_ok)},
+		{1, {{OP_DPK, &a36_80}}, RPT(rpt_ok)},
+		{1, {{OP_DPK, &a149_80}}, RPT(rpt_ok)},
+		{1, {{OP_DPK, &g1}}, RPT(rpt_sync_fail)},
+		{1, {{OP_DPK, &a36}}, RPT(rpt_dgain_low)},
+		{1, {{OP_DPK, &a36_80}}, RPT(rpt_dgain_low)},
+		{1, {{OP_DPK, &g6}}, RPT(rpt_gl_high)},
+		{1, {{OP_DPK, &a149}}, RPT(rpt_gl_pas)},
+		{1, {{OP_DPK, &a149}}, RPT(rpt_gl_lt)},
+		{1, {{OP_DPK, &g1}}, .tssi_mode = 1, RPT(rpt_ok)},
+		{1, {{OP_DPK, &a36}}, .epa_5g = 1, RPT(rpt_ok)},
+		{1, {{OP_DPK, &g1}}, .epa_5g = 1, RPT(rpt_ok)},
+		{1, {{OP_DPK, &a36}}, .gs7f = 1, .cav = 1, RPT(rpt_ok)},
+		{1, {{OP_DPK, &g6}}, .kip_stuck = 1, .nctl_stuck = 3, RPT(rpt_ok)},
+		{1, {{OP_DPK, &g1}}},
+		{1, {{OP_CHANNEL, &g1}}, RPT(rpt_ok)},
+		{1, {{OP_CHANNEL, &a149_80}}, RPT(rpt_ok)},
+		{2, {{OP_CHANNEL, &g6}, {OP_CHANNEL, &a36}}, RPT(rpt_ok)},
+		{1, {{OP_CHANNEL, &a36}}, .mcc1 = 1, RPT(rpt_ok)},
+		{1, {{OP_BAND_CHANGED, &a36}}},
+		{2, {{OP_TSSI, &a36}, {OP_BAND_CHANGED, &a36}}},
+		{1, {{OP_SCAN_START, &g1}}},
+		{3, {{OP_TSSI, &g1}, {OP_SCAN_START, &g1}, {OP_SCAN_END, &g1}}},
+	};
+	if (argc != 4)
 		return 2;
 	FILE *out = open_trace(argv[1]);
 	for (size_t c = 0; c < ARRAY_SIZE(cases); c++) {
@@ -689,38 +1067,123 @@ int main(int argc, char **argv)
 		flush(out);
 	}
 	close_trace(out);
+	out = open_trace(argv[3]);
+	fill_trk();
+	for (size_t c = 0; c < ARRAY_SIZE(tcases); c++) {
+		static struct rtw89_dev dev;
+		struct rtw89_vif_link link = {RTW89_CHANCTX_0, RTW89_PHY_0};
+		memset(&dev, 0, sizeof(dev));
+		dev.chip = &chip_info;
+		fill(PATTERN);
+		fault.cwrpt_stuck = tcases[c].cwrpt_stuck;
+		fault.kip_stuck = tcases[c].kip_stuck;
+		fault.nctl_stuck = tcases[c].nctl_stuck;
+		fault.rpt = tcases[c].rpt;
+		fault.rpt_len = tcases[c].rpt_len;
+		dev.dpk.dpk_gs[RTW89_PHY_0] = tcases[c].gs7f ? 0x7f : 0x5b;
+		dev.hal.cv = tcases[c].cav ? CHIP_CAV : CHIP_CBV;
+		dev.fw.elm_info.txpwr_trk = &trk;
+		dev.io = &rtw89_raw_io;
+		dev.fem.epa_5g = tcases[c].epa_5g;
+		for (u32 p = 0; p < RF_PATH_NUM_8852B; p++) {
+			dev.tssi.thermal[p] = tcases[c].thermal_ff ? 0xff : 0x20 + p;
+			for (u32 g = 0; g < TSSI_TRIM_CH_GROUP_NUM; g++)
+				dev.tssi.tssi_trim[p][g] = (s8)((int)((p * 7 + g * 3) % 9) - 4);
+			for (u32 g = 0; g < TSSI_CCK_CH_GROUP_NUM; g++)
+				dev.tssi.tssi_cck[p][g] = (s8)(0x10 + p * 3 + g);
+			for (u32 g = 0; g < TSSI_MCS_CH_GROUP_NUM; g++)
+				dev.tssi.tssi_mcs[p][g] = (s8)((int)((p * 5 + g * 11) % 31) - 15);
+			if (tcases[c].gain) {
+				for (u32 k = 0; k < 5; k++)
+					dev.efuse_gain.offset[p][k] = (s8)((int)((p * 3 + k * 5) % 13) - 6);
+				for (u32 s = 0; s < 5; s++)
+					dev.efuse_gain.comp[p][s] = (s8)((int)((p * 7 + s * 2) % 11) - 5);
+			}
+		}
+		if (tcases[c].gain) {
+			dev.efuse_gain.offset_valid = true;
+			dev.efuse_gain.comp_valid = true;
+			dev.efuse_gain.offset_base[RTW89_PHY_0] = 3;
+			dev.efuse_gain.rssi_base[RTW89_PHY_0] = -2;
+		}
+		if (tcases[c].tssi_mode) {
+			dev.is_tssi_mode[RF_PATH_A] = true;
+			dev.is_tssi_mode[RF_PATH_B] = true;
+		}
+		if (tcases[c].mcc1) {
+			dev.rfk_mcc.data[0].ch[1] = tcases[c].ops[0].chan->ch;
+			dev.rfk_mcc.data[0].band[1] = tcases[c].ops[0].chan->band;
+		}
+		for (int i = 0; i < tcases[c].n; i++) {
+			const struct chan *ch = tcases[c].ops[i].chan;
+
+			dev.chan.channel = ch->ch;
+			dev.chan.band_type = ch->band;
+			dev.chan.band_width = ch->bw;
+			dev.chan.subband_type = rtw89_get_subband_type(ch->band, ch->ch);
+			switch (tcases[c].ops[i].op) {
+			case OP_TSSI:
+				rtw8852b_tssi(&dev, RTW89_PHY_0, true, RTW89_CHANCTX_0);
+				break;
+			case OP_DPK:
+				rtw8852b_dpk(&dev, RTW89_PHY_0, RTW89_CHANCTX_0);
+				break;
+			case OP_CHANNEL:
+				rtw8852b_rfk_channel(&dev, &link);
+				break;
+			case OP_BAND_CHANGED:
+				rtw8852b_rfk_band_changed(&dev, RTW89_PHY_0, &dev.chan);
+				break;
+			case OP_SCAN_START:
+			case OP_SCAN_END:
+				rtw8852b_rfk_scan(&dev, &link, tcases[c].ops[i].op == OP_SCAN_START);
+				break;
+			}
+		}
+		record_state(&dev);
+		record_iqk(&dev);
+		record_tssi_dpk(&dev);
+		flush(out);
+	}
+	close_trace(out);
 	free(segment);
-	printf("%zu %zu\n", ARRAY_SIZE(cases), ARRAY_SIZE(iqk_cases));
+	printf("%zu %zu %zu\n", ARRAY_SIZE(cases), ARRAY_SIZE(iqk_cases), ARRAY_SIZE(tcases));
 	return 0;
 }
 '''
     program = '\n\n'.join([
-        preamble, reg_h, core_defines, phy_defines, chip_defines, declarations, rfk_macros,
-        by_cond, harness, core_helpers, phy_helpers, rf_access, dispatch, parser, tables, chip,
-        rfk_head, rfk, rfk_init, main_c])
+        preamble, reg_h, core_defines, defines38, phy_defines, chip_defines, declarations,
+        declarations38, rfk_macros, by_cond, harness, harness38, core_helpers, phy_helpers,
+        phy_h38, io_table, rf_access, phy38, dispatch, parser, tables, chip, chan38,
+        common_h38, common38, bx_table, rfk_head, rfk, extra_group, rfk38, rfk_init, fw38, chip38, main_c])
     generated = out / 'rfk_oracle.c'
     generated.write_text(program, newline='\n')
     exe = out / 'rfk_oracle'
+    # RTW8852B_TSSI_GET_VAL shifts a promoted u8 into int's sign bit, which the
+    # kernel's -fno-strict-overflow leaves defined; the shift base check is off.
     subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-fsanitize=address,undefined',
-                    '-fno-sanitize-recover=all', '-Wno-unused-function',
-                    '-Wno-unused-const-variable', '-Wno-unused-variable',
-                    '-Wno-unused-but-set-variable', '-Wno-c23-extensions',
-                    str(generated), '-o', str(exe)], check=True)
+                    '-fno-sanitize-recover=all', '-fno-sanitize=shift-base', '-fwrapv',
+                    '-Wno-unused-function', '-Wno-unused-const-variable',
+                    '-Wno-unused-variable', '-Wno-unused-but-set-variable',
+                    '-Wno-c23-extensions', str(generated), '-o', str(exe)], check=True)
     trace = out / 'rfk_trace.bin'
     iqk_trace = out / 'iqk_trace.bin'
-    run = subprocess.run([str(exe), str(trace), str(iqk_trace)], check=True,
-                         capture_output=True, text=True)
-    cases, iqk_cases = map(int, run.stdout.split())
+    tssi_dpk_trace = out / 'tssi_dpk_trace.bin'
+    run = subprocess.run([str(exe), str(trace), str(iqk_trace), str(tssi_dpk_trace)],
+                         check=True, capture_output=True, text=True)
+    cases, iqk_cases, tssi_dpk_cases = map(int, run.stdout.split())
     data = trace.read_bytes()
     iqk_data = iqk_trace.read_bytes()
+    tssi_dpk_data = tssi_dpk_trace.read_bytes()
     receipt = dict(
         linux_commit=COMMIT, symbols=manifest, cases=cases,
         case_order='rtw8852b_rfk_init over patterned memory with R_DPD_BF 0x00000000 and '
                    '0x0001f07f, over all-ones and zeroed memory, with RCK, DRCK, ADDCK, S0 '
                    'DACK and S1 DACK never done, and with RR_MOD reading TX mode; '
                    'rtw8852b_rx_dck(PHY 0) with both paths in TSSI mode',
-        dispatch=dict(rtw8852b_chip_ops=chip_ops, rtw8852b_chip_info=info,
-                      rtw89_phy_gen_ax=phy_gen, rtw89_raw_io=raw_io),
+        dispatch=dict(rtw8852b_chip_ops=dict(chip_ops, **chip_ops38),
+                      rtw8852b_chip_info=dict(info, **chip_id), rtw8852bx_info=bx,
+                      rtw89_phy_gen_ax=phy_gen, rtw89_raw_io=dict(raw_io, **raw_io38)),
         trace_bytes=len(data), trace_sha256=hashlib.sha256(data).hexdigest(),
         iqk_cases=iqk_cases,
         iqk_case_order='rtw8852b_iqk(PHY 0) on 2 GHz 20 MHz channel 1, 2 GHz 40 MHz channel 6, '
@@ -732,6 +1195,9 @@ int main(int argc, char **argv)
                        '5 GHz 40 MHz channel 149 narrowband, passing and with every one-shot '
                        'failing',
         iqk_trace_bytes=len(iqk_data), iqk_trace_sha256=hashlib.sha256(iqk_data).hexdigest(),
+        tssi_dpk_cases=tssi_dpk_cases, tssi_dpk_case_order=TSSI_DPK_ORDER, trk_rows=TRK_ROWS,
+        tssi_dpk_trace_bytes=len(tssi_dpk_data),
+        tssi_dpk_trace_sha256=hashlib.sha256(tssi_dpk_data).hexdigest(),
         generated_source_sha256=hashlib.sha256(generated.read_bytes()).hexdigest(),
         oracle_limit=[
             'MMIO, delays and the chip answers are a model derived from the code; no Linux '
@@ -746,11 +1212,24 @@ int main(int argc, char **argv)
             'the narrowband IQK cases set is_iqk_init and is_nbiqk beforehand, which nothing '
             'in rtw89 does',
             'register reads go straight to the model, below rtw89_pci_ops\' CMAC read retry',
+            'the TSSI and DPK cases\' report words are scripted from the code, not measured; '
+            'R_RPT_COM reads them in turn whatever the report selected',
+            'rtw89_btc_ntfy_conn_rfk and rtw89_btc_ntfy_preserve_bt_time are no-ops',
+            'one channel context: rtw89_entity_get_conf and rtw89_iterate_entity_chan give the '
+            'case\'s channel alone',
+            'the H2C is recorded as rtw89_h2c_pkt_set_hdr\'s arguments and the payload; the '
+            'header bytes, sequence and forced ack are the H2C oracle\'s',
+            'RTW89_CHK_FW_FEATURE(RFK_NTFY_MCC_V0) is false, as fw.c\'s table has it for '
+            'RTL8852C alone',
+            'ktime_get is 0: the alignment\'s time account is not modeled',
+            'RTW8852B_TSSI_GET_VAL\'s shifts into int\'s sign bit are compiled -fwrapv with '
+            'the shift base check off, as the kernel\'s -fno-strict-overflow leaves them',
         ])
     (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n', newline='\n')
     print(json.dumps({k: receipt[k] for k in [
         'cases', 'trace_bytes', 'trace_sha256', 'iqk_cases', 'iqk_trace_bytes',
-        'iqk_trace_sha256']}))
+        'iqk_trace_sha256', 'tssi_dpk_cases', 'tssi_dpk_trace_bytes',
+        'tssi_dpk_trace_sha256']}))
     return 0
 
 

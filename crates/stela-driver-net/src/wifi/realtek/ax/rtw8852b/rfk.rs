@@ -9,8 +9,11 @@
 //! The calibrations rtw8852b.c's `rtw8852b_rfk_init` runs once the BB and RF
 //! tables are loaded, from pinned rtw89/rtw8852b_rfk.c line by line: DPK
 //! init ([`dpk_init`]), RCK ([`rck`]), DACK ([`dack`]) and RX DCK
-//! ([`rx_dck`]), composed by [`init`]; and the IQ calibration of the channel
-//! it joins ([`iqk`]). What rtw89 keeps between them in
+//! ([`rx_dck`]), composed by [`init`]; and what rtw8852b.c's
+//! `rtw8852b_rfk_channel` runs on the channel it joins, composed by
+//! [`channel()`]: the MCC table ([`ntfy::mcc_get_ch_info`]), RX DCK, the IQ
+//! calibration ([`iqk`]), TSSI ([`tssi`]) and DPK ([`dpk`]), then the
+//! RF_NTFY_MCC H2C ([`ntfy`]). What rtw89 keeps between them in
 //! `rtwdev` is [`State`], which the caller carries from one calibration to
 //! the next. rtw89 runs each with PHY 0 and DBCC off, where `_kpath` gives
 //! both paths; so do these. The coex notifications rtw89 sends around a
@@ -21,6 +24,8 @@
 //! and go on. A calibration that returns proves that its polls were
 //! answered, not that the radio is calibrated.
 use crate::wifi::realtek::ax::{
+    coex::Commands,
+    h2c,
     h2creg::Mailbox,
     io::{Error, Io, Registers},
     mac::{self, SchTxSel},
@@ -29,11 +34,15 @@ use crate::wifi::realtek::ax::{
 use reg::*;
 
 pub mod dack;
+pub mod dpk;
 pub mod iqk;
+pub mod ntfy;
+pub mod pmac;
 pub mod rck;
 pub mod reg;
 pub mod rx_dck;
 pub mod table;
+pub mod tssi;
 
 /// `RF_PATH_NUM_8852B`.
 pub const RF_PATH_NUM: u8 = 2;
@@ -65,12 +74,25 @@ pub struct State {
     pub is_tssi_mode: [bool; RF_PATH_NUM as usize],
     /// `rtwdev->iqk`.
     pub iqk: iqk::IqkInfo,
+    /// `rtwdev->dpk` but its `dpk_gs`.
+    pub dpk: dpk::DpkInfo,
+    /// `rtwdev->tssi` but what the efuse gives.
+    pub tssi: tssi::TssiInfo,
 }
 
-/// `struct rtw89_rfk_mcc_info_data`, as far as the calibrations here read
-/// it: the table rtw8852b_mcc_get_ch_info chose for the channel.
+/// `RTW89_RFK_CHS_NR`.
+pub const RFK_CHS_NR: usize = 3;
+
+/// `struct rtw89_rfk_mcc_info_data`, as far as an RTL8852B reads it: the
+/// channel and band each MCC table was calibrated on, and the table
+/// [`ntfy::mcc_get_ch_info`] chose for the channel. `bw` and `rf18`, which
+/// RTL8852B leaves alone, are left out.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RfkMcc {
+    /// `ch`: 0 for a table never used.
+    pub ch: [u8; RFK_CHS_NR],
+    /// `band`: `enum rtw89_band`.
+    pub band: [u8; RFK_CHS_NR],
     /// `table_idx`: 0 or 1.
     pub table_idx: u8,
 }
@@ -98,7 +120,8 @@ pub enum Bandwidth {
 }
 
 /// What the calibrations read of `struct rtw89_chan`, the channel context's
-/// channel: its band, width and number.
+/// channel: its band, width and number. The number is `chan->channel`, the
+/// center channel (42 for an 80 MHz channel from 36 to 48).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Channel {
     pub band: Band,
@@ -283,6 +306,84 @@ pub fn init<I: Io + ?Sized, S: Scheduler<I> + ?Sized>(
     rck::rck(io)?;
     dack::dack(io, &mut state.dack)?;
     rx_dck::rx_dck(io, scheduler, state.is_tssi_mode)
+}
+
+/// What [`channel()`] reads besides the channel and its state.
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelInputs<'a> {
+    pub tssi: tssi::Inputs<'a>,
+    pub dpk: dpk::Inputs,
+}
+
+/// What rtw89 ignores of [`channel()`]: each calibration's scheduler
+/// refusal and what sending RF_NTFY_MCC returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Calibrated {
+    pub rx_dck: Option<mac::Cause>,
+    pub iqk: Option<mac::Cause>,
+    pub tssi: Option<mac::Cause>,
+    pub dpk: Option<mac::Cause>,
+    pub ntfy_mcc: Result<(), h2c::Error>,
+}
+
+/// `rtw8852b_rfk_channel` on PHY 0 after a switch to `channel`: the MCC
+/// table chosen, then RX DCK, IQK, TSSI with its alignment and DPK, each
+/// with the scheduler stopped around it, and RF_NTFY_MCC to `commands`. The
+/// coex notifications around them (`rtw89_btc_ntfy_conn_rfk` and
+/// `rtw89_btc_ntfy_preserve_bt_time`) are no-ops here. A refused access
+/// ends it; the refusals and the H2C's result rtw89 ignores are returned.
+pub fn channel<I, S, C>(
+    io: &mut I,
+    scheduler: &mut S,
+    commands: &mut C,
+    state: &mut State,
+    channel: Channel,
+    inputs: &ChannelInputs<'_>,
+) -> Result<Calibrated, Error>
+where
+    I: Io + ?Sized,
+    S: Scheduler<I> + ?Sized,
+    C: Commands<I> + ?Sized,
+{
+    ntfy::mcc_get_ch_info(&mut state.rfk_mcc, channel);
+
+    let rx_dck = rx_dck::rx_dck(io, scheduler, state.is_tssi_mode)?;
+    let iqk = iqk::iqk(io, scheduler, state, channel)?;
+    let tssi = tssi::tssi(io, scheduler, state, channel, true, &inputs.tssi)?;
+    let dpk = dpk::dpk(io, scheduler, state, channel, inputs.dpk)?;
+
+    let ntfy_mcc = ntfy::rf_ntfy_mcc(io, commands, &state.rfk_mcc);
+    Ok(Calibrated {
+        rx_dck,
+        iqk,
+        tssi,
+        dpk,
+        ntfy_mcc,
+    })
+}
+
+/// `rtw8852b_rfk_band_changed`: [`tssi::tssi_scan`] on `channel`, which a
+/// switch to another band runs before the switch is done.
+pub fn band_changed<I: Io + ?Sized>(
+    io: &mut I,
+    state: &mut State,
+    channel: Channel,
+    inputs: &tssi::Inputs<'_>,
+) -> Result<(), Error> {
+    tssi::tssi_scan(io, state, channel, inputs)
+}
+
+/// `rtw8852b_rfk_scan`: [`tssi::wifi_scan_notify`] as a scan starts
+/// (`start`) or ends on `channel`.
+pub fn scan<I: Io + ?Sized, S: Scheduler<I> + ?Sized>(
+    io: &mut I,
+    scheduler: &mut S,
+    state: &mut State,
+    start: bool,
+    channel: Channel,
+    inputs: &tssi::Inputs<'_>,
+) -> Result<Option<mac::Cause>, Error> {
+    tssi::wifi_scan_notify(io, scheduler, state, start, channel, inputs)
 }
 
 /// `rtw89_rfk_parser_by_cond`: `if_true` when `condition` holds, otherwise

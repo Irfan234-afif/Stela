@@ -2,11 +2,14 @@ extern crate std;
 
 use super::*;
 use crate::wifi::realtek::ax::{
+    efuse,
+    elements::TxpwrTrk,
     io::{CR_BASE, RF_BASE, field, prep},
     registers::{
-        PHYREG_SET, RFREG_MASK, SWSI_BIT_MASK_V1, SWSI_DATA_ADDR_V1, SWSI_DATA_BIT_MASK_EN_V1,
-        SWSI_DATA_PATH_V1, SWSI_DATA_V1, SWSI_DATA_VAL_V1, SWSI_R_BUSY_V1, SWSI_R_DATA_DONE_V1,
-        SWSI_READ_ADDR_ADDR_V1, SWSI_READ_ADDR_PATH_V1, SWSI_READ_ADDR_V1, SWSI_V1, SWSI_W_BUSY_V1,
+        CHIP_CAV, CHIP_CBV, PHYREG_SET, RFREG_MASK, SWSI_BIT_MASK_V1, SWSI_DATA_ADDR_V1,
+        SWSI_DATA_BIT_MASK_EN_V1, SWSI_DATA_PATH_V1, SWSI_DATA_V1, SWSI_DATA_VAL_V1,
+        SWSI_R_BUSY_V1, SWSI_R_DATA_DONE_V1, SWSI_READ_ADDR_ADDR_V1, SWSI_READ_ADDR_PATH_V1,
+        SWSI_READ_ADDR_V1, SWSI_V1, SWSI_W_BUSY_V1,
     },
 };
 use alloc::{vec, vec::Vec};
@@ -47,6 +50,14 @@ struct Faults {
     nctl_fail: u64,
     /// The NCTL one-shot, counted from 1, whose 0xbff8 never reads 0x55.
     nctl_stuck: u32,
+    /// R_RPT_COM's low word stays clear while R_KIP_RPT1 selects the DPK
+    /// one-shot's report (3); otherwise it reads 0x8000.
+    kip_stuck: bool,
+    /// The TSSI CW reports' ready bits stay clear.
+    cwrpt_stuck: bool,
+    /// The words R_RPT_COM reads in turn, cycling, while another report is
+    /// selected; memory when empty.
+    rpt: &'static [u32],
 }
 
 /// The C oracle's register model: BAR2 as little-endian bytes behaving per
@@ -68,6 +79,8 @@ struct Model {
     refuse: Option<u32>,
     /// The NCTL one-shots started: writes to R_NCTL_CFG.
     oneshots: u32,
+    /// The reads of [`Faults::rpt`] so far.
+    rpt_reads: usize,
 }
 
 impl Model {
@@ -96,6 +109,7 @@ impl Model {
             log: Vec::new(),
             refuse: None,
             oneshots: 0,
+            rpt_reads: 0,
         }
     }
     fn get(&self, register: u32, width: u32) -> u32 {
@@ -153,6 +167,7 @@ impl Model {
                     && (f.nctl_fail >> (self.oneshots - 1)) & 1 != 0;
                 forced(value, B_NCTL_RPT_FLG, !fail)
             }
+            0x1c18 | 0x3c18 => forced(value, B_TSSI_CWRPT_RDY, f.cwrpt_stuck),
             _ => value,
         }
     }
@@ -165,7 +180,13 @@ impl Model {
     }
     fn read(&mut self, register: u32, width: u32) -> Result<u32, Error> {
         self.check(register, width)?;
-        let mut value = self.view(register & !3) >> ((register & 3) * 8);
+        let word = register & !3;
+        let viewed = if word == CR + R_RPT_COM {
+            self.rpt_view(word)
+        } else {
+            self.view(word)
+        };
+        let mut value = viewed >> ((register & 3) * 8);
         if width < 4 {
             value &= (1 << (8 * width)) - 1;
         }
@@ -200,6 +221,21 @@ impl Model {
             }
         }
         Ok(())
+    }
+    /// What R_RPT_COM reads as: the DPK one-shot's done word while report 3
+    /// is selected, else the next scripted word, else memory.
+    fn rpt_view(&mut self, word: u32) -> u32 {
+        let value = self.get(word, 4);
+        if field(self.get(CR + R_KIP_RPT1, 4), B_KIP_RPT1_SEL) == 3 {
+            return (value & 0xffff_0000) | if self.faults.kip_stuck { 0 } else { 0x8000 };
+        }
+        let rpt = self.faults.rpt;
+        if rpt.is_empty() {
+            return value;
+        }
+        let scripted = rpt[self.rpt_reads % rpt.len()];
+        self.rpt_reads += 1;
+        scripted
     }
     /// Reads logged of `register`.
     fn reads(&self, register: u32) -> usize {
@@ -351,6 +387,9 @@ const NONE: Faults = Faults {
     lok_fail: false,
     nctl_fail: 0,
     nctl_stuck: 0,
+    kip_stuck: false,
+    cwrpt_stuck: false,
+    rpt: &[],
 };
 
 /// The oracle's cases, in its order.
@@ -917,4 +956,717 @@ fn iqk_init_resets_once_and_every_run_counts() {
     });
     assert_eq!(state.iqk.iqk_mcc_ch, [[0, 0]; 2]);
     assert_eq!(state.iqk.lok_idac, [[0, 0]; 2]);
+}
+
+/// The TSSI, DPK and MCC records the oracle makes after the IQK's.
+fn push_tssi_dpk(trace: &mut Vec<u8>, state: &State) {
+    let m = &state.rfk_mcc;
+    push(
+        trace,
+        40,
+        u32::from(m.ch[0]) | u32::from(m.ch[1]) << 8 | u32::from(m.ch[2]) << 16,
+        u32::from(m.band[0]) | u32::from(m.band[1]) << 8 | u32::from(m.band[2]) << 16,
+    );
+    let d = &state.dpk;
+    push(
+        trace,
+        43,
+        u32::from(d.is_dpk_enable)
+            | u32::from(d.is_dpk_reload_en) << 1
+            | u32::from(d.cur_idx[0]) << 8
+            | u32::from(d.cur_idx[1]) << 16,
+        0,
+    );
+    for p in 0..dpk::DPK_RF_PATH {
+        for k in 0..dpk::DPK_BKUP_NUM {
+            let b = &d.bp[p][k];
+            push(
+                trace,
+                41,
+                (p as u32) << 8
+                    | k as u32
+                    | u32::from(b.band) << 16
+                    | u32::from(b.bw) << 20
+                    | u32::from(b.ch) << 24,
+                u32::from(b.path_ok)
+                    | u32::from(b.txagc_dpk) << 8
+                    | u32::from(b.ther_dpk) << 16
+                    | u32::from(b.gs) << 24,
+            );
+            push(
+                trace,
+                42,
+                u32::from(b.pwsf)
+                    | u32::from(d.corr_val[p][k]) << 16
+                    | u32::from(d.corr_idx[p][k]) << 24,
+                u32::from(d.dc_i[p][k]) | u32::from(d.dc_q[p][k]) << 16,
+            );
+        }
+    }
+    let t = &state.tssi;
+    for p in 0..2 {
+        for b in 0..tssi::TSSI_ALIMK_MAX {
+            for v in 0..4 {
+                push(
+                    trace,
+                    44,
+                    (p << 16 | b << 8 | v) as u32 | u32::from(t.alignment_done[p][b]) << 24,
+                    t.alignment_value[p][b][v],
+                );
+            }
+        }
+        for c in 0..tssi::TSSI_MAX_CH_NUM {
+            if t.check_backup_aligmk[p][c] {
+                for v in 0..4 {
+                    push(
+                        trace,
+                        45,
+                        (p << 16 | c << 8 | v) as u32,
+                        t.alignment_backup_by_ch[p][c][v],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The oracle's H2C stub: `rtw89_h2c_pkt_set_hdr`'s arguments (30) and
+/// each payload word (31).
+struct Fw;
+
+impl crate::wifi::realtek::ax::coex::Commands<Model> for Fw {
+    fn send(
+        &mut self,
+        io: &mut Model,
+        class: u8,
+        func: u8,
+        rack: bool,
+        dack: bool,
+        payload: &[u8],
+    ) -> Result<(), h2c::Error> {
+        io.mark(
+            30,
+            u32::from(h2c::H2C_CAT_OUTSRC) | u32::from(class) << 8 | u32::from(func) << 16,
+            u32::from(h2c::FWCMD_TYPE_H2C)
+                | u32::from(rack) << 8
+                | u32::from(dack) << 9
+                | (payload.len() as u32) << 16,
+        );
+        for (i, word) in payload.chunks(4).enumerate() {
+            io.mark(31, i as u32, u32::from_le_bytes(word.try_into().unwrap()));
+        }
+        Ok(())
+    }
+}
+
+/// The oracle's TX power tracking element: 20 rows, bitmap 0xfff0.
+fn trk_contents() -> Vec<u8> {
+    (0..20)
+        .flat_map(|r: i32| (0..30).map(move |i| ((r * 13 + i * 7) % 61 - 30) as i8 as u8))
+        .collect()
+}
+
+fn trk_delta_rows() -> [Option<usize>; 16] {
+    let mut delta = [None; 16];
+    for (ty, row) in delta.iter_mut().enumerate().skip(4) {
+        *row = Some(if ty < 8 { (ty - 4) * 3 } else { ty + 4 });
+    }
+    delta
+}
+
+fn trk_deltas() -> tssi::TrkDeltas {
+    let contents = trk_contents();
+    let trk = TxpwrTrk {
+        contents: &contents,
+        offset: 0,
+        delta: trk_delta_rows(),
+    };
+    tssi::TrkDeltas::from_elements(&trk).unwrap()
+}
+
+/// The oracle's efuse TSSI values.
+fn efuse_tssi(thermal_ff: bool) -> efuse::Tssi {
+    let mut t = efuse::Tssi::default();
+    for p in 0..2 {
+        t.thermal[p] = if thermal_ff { 0xff } else { 0x20 + p as u8 };
+        for (g, trim) in t.tssi_trim[p].iter_mut().enumerate() {
+            *trim = (((p * 7 + g * 3) % 9) as i32 - 4) as i8;
+        }
+        for (g, cck) in t.tssi_cck[p].iter_mut().enumerate() {
+            *cck = (0x10 + p * 3 + g) as i8;
+        }
+        for (g, mcs) in t.tssi_mcs[p].iter_mut().enumerate() {
+            *mcs = (((p * 5 + g * 11) % 31) as i32 - 15) as i8;
+        }
+    }
+    t
+}
+
+/// The oracle's RX gain offsets: none, or valid and patterned.
+fn gain_inputs(valid: bool) -> super::super::channel::Inputs {
+    let mut inputs = super::super::channel::Inputs::default();
+    if valid {
+        let e = &mut inputs.efuse_gain;
+        e.offset_valid = true;
+        e.comp_valid = true;
+        for p in 0..2 {
+            for (k, offset) in e.offset[p].iter_mut().enumerate() {
+                *offset = (((p * 3 + k * 5) % 13) as i32 - 6) as i8;
+            }
+            for (s, comp) in e.comp[p].iter_mut().enumerate() {
+                *comp = (((p * 7 + s * 2) % 11) as i32 - 5) as i8;
+            }
+        }
+        inputs.offset_base = 3;
+        inputs.rssi_base = -2;
+    }
+    inputs
+}
+
+const A42_80: Channel = channel(Band::Ghz5, Bandwidth::Mhz80, 42);
+const A100: Channel = channel(Band::Ghz5, Bandwidth::Mhz20, 100);
+
+/// The oracle's R_RPT_COM scripts: the RX BB, sync correlation index and
+/// value, DC I and Q, digital gain and gain loss reads of one path, then
+/// the PA samples where there are any.
+const RPT_OK: [u32; 7] = [
+    0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b, 0x05000000, 0x00000030,
+];
+const RPT_SYNC_FAIL: [u32; 7] = [
+    0x00000005, 0x00000012, 0x00006400, 0x000a0000, 0x0000000b, 0x05000000, 0x00000030,
+];
+const RPT_DGAIN_LOW: [u32; 7] = [
+    0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b, 0x01000000, 0x00000030,
+];
+const RPT_GL_HIGH: [u32; 7] = [
+    0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b, 0x05000000, 0x00000090,
+];
+const RPT_GL_PAS: [u32; 11] = [
+    0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b, 0x05000000, 0x00000000, 0x04000400,
+    0x04000400, 0x00100010, 0x00100010,
+];
+const RPT_GL_LT: [u32; 11] = [
+    0x00000005, 0x00000012, 0x0000c800, 0x000a0000, 0x0000000b, 0x05000000, 0x00000000, 0x04000400,
+    0x04000400, 0x04000400, 0x04000400,
+];
+
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Tssi,
+    Dpk,
+    Channel,
+    BandChanged,
+    ScanStart,
+    ScanEnd,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TssiDpkCase {
+    ops: &'static [(Op, Channel)],
+    thermal_ff: bool,
+    cwrpt_stuck: bool,
+    kip_stuck: bool,
+    gain: bool,
+    tssi_mode: bool,
+    epa_5g: bool,
+    gs7f: bool,
+    cav: bool,
+    mcc1: bool,
+    nctl_stuck: u32,
+    rpt: &'static [u32],
+}
+
+const fn tcase(ops: &'static [(Op, Channel)]) -> TssiDpkCase {
+    TssiDpkCase {
+        ops,
+        thermal_ff: false,
+        cwrpt_stuck: false,
+        kip_stuck: false,
+        gain: false,
+        tssi_mode: false,
+        epa_5g: false,
+        gs7f: false,
+        cav: false,
+        mcc1: false,
+        nctl_stuck: 0,
+        rpt: &[],
+    }
+}
+
+const fn scripted(ops: &'static [(Op, Channel)], rpt: &'static [u32]) -> TssiDpkCase {
+    TssiDpkCase { rpt, ..tcase(ops) }
+}
+
+/// The oracle's TSSI and DPK cases, in its order.
+fn tssi_dpk_cases() -> Vec<TssiDpkCase> {
+    use Op::*;
+    vec![
+        tcase(&[(Tssi, G1)]),
+        tcase(&[(Tssi, G6)]),
+        tcase(&[(Tssi, A36)]),
+        tcase(&[(Tssi, A149)]),
+        tcase(&[(Tssi, A36_80)]),
+        tcase(&[(Tssi, A149_80)]),
+        tcase(&[(Tssi, A42_80)]),
+        tcase(&[(Tssi, A100)]),
+        TssiDpkCase {
+            thermal_ff: true,
+            ..tcase(&[(Tssi, A36)])
+        },
+        TssiDpkCase {
+            cwrpt_stuck: true,
+            ..tcase(&[(Tssi, G1)])
+        },
+        TssiDpkCase {
+            gain: true,
+            ..tcase(&[(Tssi, G6)])
+        },
+        tcase(&[(Tssi, G1), (Tssi, G1)]),
+        scripted(&[(Dpk, G1)], &RPT_OK),
+        scripted(&[(Dpk, G6)], &RPT_OK),
+        scripted(&[(Dpk, A36)], &RPT_OK),
+        scripted(&[(Dpk, A149)], &RPT_OK),
+        scripted(&[(Dpk, A36_80)], &RPT_OK),
+        scripted(&[(Dpk, A149_80)], &RPT_OK),
+        scripted(&[(Dpk, G1)], &RPT_SYNC_FAIL),
+        scripted(&[(Dpk, A36)], &RPT_DGAIN_LOW),
+        scripted(&[(Dpk, A36_80)], &RPT_DGAIN_LOW),
+        scripted(&[(Dpk, G6)], &RPT_GL_HIGH),
+        scripted(&[(Dpk, A149)], &RPT_GL_PAS),
+        scripted(&[(Dpk, A149)], &RPT_GL_LT),
+        TssiDpkCase {
+            tssi_mode: true,
+            ..scripted(&[(Dpk, G1)], &RPT_OK)
+        },
+        TssiDpkCase {
+            epa_5g: true,
+            ..scripted(&[(Dpk, A36)], &RPT_OK)
+        },
+        TssiDpkCase {
+            epa_5g: true,
+            ..scripted(&[(Dpk, G1)], &RPT_OK)
+        },
+        TssiDpkCase {
+            gs7f: true,
+            cav: true,
+            ..scripted(&[(Dpk, A36)], &RPT_OK)
+        },
+        TssiDpkCase {
+            kip_stuck: true,
+            nctl_stuck: 3,
+            ..scripted(&[(Dpk, G6)], &RPT_OK)
+        },
+        tcase(&[(Dpk, G1)]),
+        scripted(&[(Channel, G1)], &RPT_OK),
+        scripted(&[(Channel, A149_80)], &RPT_OK),
+        scripted(&[(Channel, G6), (Channel, A36)], &RPT_OK),
+        TssiDpkCase {
+            mcc1: true,
+            ..scripted(&[(Channel, A36)], &RPT_OK)
+        },
+        tcase(&[(BandChanged, A36)]),
+        tcase(&[(Tssi, A36), (BandChanged, A36)]),
+        tcase(&[(ScanStart, G1)]),
+        tcase(&[(Tssi, G1), (ScanStart, G1), (ScanEnd, G1)]),
+    ]
+}
+
+/// One TSSI or DPK case as the Rust side runs it.
+fn run_tssi_dpk(case: &TssiDpkCase) -> (Model, State) {
+    let mut io = Model::new(
+        Fill::Pattern,
+        Faults {
+            cwrpt_stuck: case.cwrpt_stuck,
+            kip_stuck: case.kip_stuck,
+            nctl_stuck: case.nctl_stuck,
+            rpt: case.rpt,
+            ..NONE
+        },
+    );
+    let mut state = State::default();
+    state.dpk_gs[0] = if case.gs7f { 0x7f } else { 0x5b };
+    let efuse = efuse_tssi(case.thermal_ff);
+    let deltas = trk_deltas();
+    let gain = gain_inputs(case.gain);
+    let tssi_inputs = tssi::Inputs {
+        efuse: &efuse,
+        deltas: &deltas,
+        gain: &gain,
+    };
+    let dpk_inputs = dpk::Inputs {
+        epa_2g: false,
+        epa_5g: case.epa_5g,
+        cv: if case.cav { CHIP_CAV } else { CHIP_CBV },
+    };
+    if case.tssi_mode {
+        state.is_tssi_mode = [true; 2];
+    }
+    if case.mcc1 {
+        let (_, first) = case.ops[0];
+        state.rfk_mcc.ch[1] = first.number;
+        state.rfk_mcc.band[1] = first.band as u8;
+    }
+    for &(op, channel) in case.ops {
+        let mut stub = Stub::default();
+        match op {
+            Op::Tssi => assert_eq!(
+                tssi::tssi(&mut io, &mut stub, &mut state, channel, true, &tssi_inputs),
+                Ok(None)
+            ),
+            Op::Dpk => assert_eq!(
+                dpk::dpk(&mut io, &mut stub, &mut state, channel, dpk_inputs),
+                Ok(None)
+            ),
+            Op::Channel => {
+                let inputs = ChannelInputs {
+                    tssi: tssi_inputs,
+                    dpk: dpk_inputs,
+                };
+                let done =
+                    super::channel(&mut io, &mut stub, &mut Fw, &mut state, channel, &inputs);
+                assert_eq!(
+                    done,
+                    Ok(Calibrated {
+                        rx_dck: None,
+                        iqk: None,
+                        tssi: None,
+                        dpk: None,
+                        ntfy_mcc: Ok(()),
+                    })
+                );
+            }
+            Op::BandChanged => band_changed(&mut io, &mut state, channel, &tssi_inputs).unwrap(),
+            Op::ScanStart | Op::ScanEnd => assert_eq!(
+                scan(
+                    &mut io,
+                    &mut stub,
+                    &mut state,
+                    matches!(op, Op::ScanStart),
+                    channel,
+                    &tssi_inputs
+                ),
+                Ok(None)
+            ),
+        }
+    }
+    (io, state)
+}
+
+fn replay_tssi_dpk(case: &TssiDpkCase) -> Vec<u8> {
+    let (io, state) = run_tssi_dpk(case);
+    let mut trace = io.encode();
+    push_state(&mut trace, &state);
+    push_iqk(&mut trace, &state.iqk);
+    push_tssi_dpk(&mut trace, &state);
+    trace
+}
+
+#[test]
+#[ignore = "oracle: STELA_RTW89_RFK_ORACLE"]
+fn tssi_dpk_traces_match_unchanged_c() {
+    let directory = std::path::PathBuf::from(std::env::var("STELA_RTW89_RFK_ORACLE").unwrap());
+    let trace = std::fs::read(directory.join("tssi_dpk_trace.bin")).unwrap();
+    let mut offset = 0;
+    let cases = tssi_dpk_cases();
+    assert_eq!(cases.len(), 38);
+    for (index, case) in cases.iter().enumerate() {
+        let expected = segment(&trace, &mut offset);
+        let replayed = replay_tssi_dpk(case);
+        if expected != replayed {
+            let first = expected
+                .chunks(12)
+                .zip(replayed.chunks(12))
+                .position(|(a, b)| a != b);
+            panic!(
+                "case {index} {case:?}: {} bytes against {}, first record apart {first:?}",
+                expected.len(),
+                replayed.len()
+            );
+        }
+    }
+    assert_eq!(offset, trace.len());
+}
+
+/// Writes logged of `register` and the reads among them, as `(tag, value)`.
+fn accesses(io: &Model, register: u32) -> Vec<(u32, u32)> {
+    io.log
+        .iter()
+        .filter(|[tag, r, _]| *tag <= 8 && *r == register)
+        .map(|[tag, _, value]| (*tag, *value))
+        .collect()
+}
+
+#[test]
+fn tssi_aligns_each_path_then_turns_both_to_tssi_mode() {
+    let (io, state) = run_tssi_dpk(&tcase(&[(Op::Tssi, G1)]));
+    assert_eq!(state.is_tssi_mode, [true, true]);
+    for p in 0..2 {
+        assert!(state.tssi.alignment_done[p][tssi::TSSI_ALIMK_2G]);
+        assert!(!state.tssi.alignment_done[p][tssi::TSSI_ALIMK_5GL]);
+        // Channel 1 is index 0.
+        assert!(state.tssi.check_backup_aligmk[p][0]);
+        assert_eq!(
+            state.tssi.alignment_backup_by_ch[p][0][..4],
+            state.tssi.alignment_value[p][0][..4]
+        );
+    }
+    // The scheduler is stopped around each path's alignment.
+    let marks: Vec<_> = io.log.iter().filter(|r| r[0] == 12 || r[0] == 13).collect();
+    assert_eq!(marks.len(), 4);
+    // TSSI goes off first and on last.
+    let en = |io: &Model| -> Vec<u32> {
+        accesses(io, CR + R_P0_TSSI_AVG)
+            .into_iter()
+            .filter(|(tag, _)| *tag == 8)
+            .map(|(_, value)| field(value, B_P0_TSSI_EN))
+            .collect()
+    };
+    let enables = en(&io);
+    assert_eq!(enables.first(), Some(&0));
+    assert_eq!(enables.last(), Some(&1));
+}
+
+#[test]
+fn a_cw_report_that_never_comes_leaves_the_alignment_undone_after_100_looks() {
+    let case = TssiDpkCase {
+        cwrpt_stuck: true,
+        ..tcase(&[(Op::Tssi, G1)])
+    };
+    let (io, state) = run_tssi_dpk(&case);
+    assert_eq!(io.reads(CR + 0x1c18), 100);
+    assert_eq!(io.reads(CR + 0x3c18), 100);
+    assert_eq!(io.log.iter().filter(|r| **r == [9, 0, 30]).count(), 200);
+    assert_eq!(
+        state.tssi.alignment_done,
+        [[false; tssi::TSSI_ALIMK_MAX]; 2]
+    );
+    assert!(!state.tssi.check_backup_aligmk[0].contains(&true));
+    // TSSI is still turned on.
+    assert_eq!(state.is_tssi_mode, [true, true]);
+
+    // A second TSSI on the channel puts back the alignment it kept,
+    // without sending a packet.
+    let (once, _) = run_tssi_dpk(&tcase(&[(Op::Tssi, G1)]));
+    let (twice, _) = run_tssi_dpk(&tcase(&[(Op::Tssi, G1), (Op::Tssi, G1)]));
+    assert_eq!(twice.reads(CR + 0x1c18), once.reads(CR + 0x1c18));
+}
+
+#[test]
+fn tssi_writes_the_thermal_offsets_around_the_efuse_value_or_none() {
+    let (io, _) = run_tssi_dpk(&tcase(&[(Op::Tssi, A36)]));
+    let deltas = trk_deltas();
+    // Path A on 5 GHz band 1: offsets 0..31 are the down deltas negated,
+    // 63 down to 32 the up deltas from index 1.
+    let first = io.get(CR + R_P0_TSSI_BASE, 4).to_le_bytes();
+    let down = deltas.down[0][1];
+    for (k, byte) in first.iter().enumerate() {
+        assert_eq!(*byte as i8, down[k].wrapping_neg());
+    }
+    let last = io.get(CR + R_P0_TSSI_BASE + 60, 4).to_le_bytes();
+    let up = deltas.up[0][1];
+    assert_eq!(last[3] as i8, up[1]);
+    assert_eq!(last[0] as i8, up[4]);
+    assert_eq!(field(io.get(CR + R_P0_TMETER, 4), B_P0_TMETER), 0x20);
+
+    let (io, _) = run_tssi_dpk(&TssiDpkCase {
+        thermal_ff: true,
+        ..tcase(&[(Op::Tssi, A36)])
+    });
+    for i in (0..64).step_by(4) {
+        assert_eq!(io.get(CR + R_P0_TSSI_BASE + i, 4), 0);
+        assert_eq!(io.get(CR + R_TSSI_THOF + i, 4), 0);
+    }
+    assert_eq!(field(io.get(CR + R_P1_TMETER, 4), B_P1_TMETER), 32);
+}
+
+#[test]
+fn trk_deltas_need_every_2ghz_and_5ghz_type() {
+    let contents = trk_contents();
+    let mut delta = trk_delta_rows();
+    let trk = TxpwrTrk {
+        contents: &contents,
+        offset: 0,
+        delta,
+    };
+    let deltas = tssi::TrkDeltas::from_elements(&trk).unwrap();
+    // 2GA_P is type 11 at row 15; 5GB_N subband 2 is type 4's third row.
+    assert_eq!(deltas.up[0][0][3], contents[15 * 30 + 3] as i8);
+    assert_eq!(deltas.down[1][3][0], contents[2 * 30] as i8);
+    delta[9] = None;
+    let trk = TxpwrTrk {
+        contents: &contents,
+        offset: 0,
+        delta,
+    };
+    assert_eq!(tssi::TrkDeltas::from_elements(&trk), None);
+}
+
+#[test]
+fn dpk_passes_both_paths_and_switches_dpd_on() {
+    let (io, state) = run_tssi_dpk(&scripted(&[(Op::Dpk, G1)], &RPT_OK));
+    for p in 0..2 {
+        let bp = &state.dpk.bp[p][0];
+        assert!(bp.path_ok, "path {p}");
+        // The loop's gain loss 3 takes the TX AGC from 0x38 to 0x35.
+        assert_eq!(bp.txagc_dpk, 0x35);
+        assert_eq!(bp.pwsf, 0x78);
+        assert_eq!(bp.gs, 0x5b);
+        assert_eq!((bp.band, bp.bw, bp.ch), (0, 0, 1));
+        assert_eq!(state.dpk.corr_val[p][0], 200);
+        assert_eq!((state.dpk.dc_i[p][0], state.dpk.dc_q[p][0]), (10, 11));
+        // DPD's enable is the last byte-3 write of the path's DPD register.
+        let dpd: Vec<_> = accesses(&io, CR + R_DPD_CH0A + ((p as u32) << 8))
+            .into_iter()
+            .filter(|(tag, _)| *tag == 8)
+            .collect();
+        assert_eq!(dpd.last().map(|(_, value)| value >> 24 & 1), Some(1));
+    }
+    assert!(state.dpk.is_dpk_enable);
+    assert_eq!(state.dpk.oneshot_timeouts, 0);
+    // The scheduler is stopped once, around both paths.
+    let marks: Vec<_> = io.log.iter().filter(|r| r[0] == 12 || r[0] == 13).collect();
+    assert_eq!(marks.len(), 2);
+}
+
+#[test]
+fn a_failed_sync_fails_its_path_and_leaves_dpd_off() {
+    let (io, state) = run_tssi_dpk(&scripted(&[(Op::Dpk, G1)], &RPT_SYNC_FAIL));
+    let bp = &state.dpk.bp[0][0];
+    assert!(!bp.path_ok);
+    assert_eq!(bp.txagc_dpk, 0);
+    assert_eq!(state.dpk.corr_val[0][0], 100);
+    let dpd: Vec<_> = accesses(&io, CR + R_DPD_CH0A)
+        .into_iter()
+        .filter(|(tag, _)| *tag == 8)
+        .collect();
+    assert_eq!(dpd.last().map(|(_, value)| value >> 24 & 1), Some(0));
+}
+
+#[test]
+fn a_dpk_one_shot_that_never_reports_is_counted_and_dpk_goes_on() {
+    let case = TssiDpkCase {
+        kip_stuck: true,
+        nctl_stuck: 3,
+        ..scripted(&[(Op::Dpk, G6)], &RPT_OK)
+    };
+    let (io, state) = run_tssi_dpk(&case);
+    // One-shot 3's 0xbff8: every 1 us for 20 ms, 20001 looks.
+    assert!(io.reads(CR + 0xbff8) > 20001);
+    // Every one-shot's KIP report: 2001 looks each.
+    let oneshots = io.oneshots;
+    assert_eq!(state.dpk.oneshot_timeouts, oneshots + 1);
+    // The 1 us waits: one-shot 3's 20000, each one-shot's 2000 and the one
+    // between its polls, and the 1 us after each direct RF write: the TX AGC
+    // twice and RR_BBDC once per path, and RR_BBDC's restore per path.
+    assert_eq!(
+        io.log.iter().filter(|r| **r == [9, 0, 1]).count() as u32,
+        20000 + oneshots * 2001 + 2 * 4
+    );
+}
+
+#[test]
+fn an_external_pa_skips_dpk_and_forces_dpd_off() {
+    let (io, state) = run_tssi_dpk(&TssiDpkCase {
+        epa_5g: true,
+        ..scripted(&[(Op::Dpk, A36)], &RPT_OK)
+    });
+    assert_eq!(io.oneshots, 0);
+    assert_eq!(state.dpk.bp[0][0].ch, 0);
+    for p in 0..2u32 {
+        let dpd = accesses(&io, CR + R_DPD_CH0A + (p << 8));
+        assert_eq!(
+            dpd.last().map(|(tag, value)| (*tag, value >> 24 & 1)),
+            Some((8, 0))
+        );
+    }
+    // 2 GHz has no external PA.
+    let (io, _) = run_tssi_dpk(&TssiDpkCase {
+        epa_5g: true,
+        ..scripted(&[(Op::Dpk, G1)], &RPT_OK)
+    });
+    assert!(io.oneshots > 0);
+}
+
+#[test]
+fn rfk_channel_runs_rx_dck_iqk_tssi_and_dpk_then_tells_the_firmware() {
+    let (io, state) = run_tssi_dpk(&scripted(&[(Op::Channel, G1)], &RPT_OK));
+    // RX DCK, IQK, TSSI's two paths and DPK each stop the scheduler.
+    let stops = io.log.iter().filter(|r| r[0] == 12).count();
+    assert_eq!(stops, 5);
+    // RF_NTFY_MCC goes last: OUTSRC, class 0xa, function 2, no ack, 20
+    // bytes, channel 1 in table 0.
+    let h2c: Vec<_> = io.log.iter().filter(|r| r[0] == 30 || r[0] == 31).collect();
+    assert_eq!(h2c[0], &[30, 2 | 0xa << 8 | 2 << 16, 20 << 16]);
+    let words: Vec<_> = h2c[1..].iter().map(|r| r[2]).collect();
+    assert_eq!(words, [1, 1, 0, 0, 1]);
+    assert_eq!(io.log.last().unwrap()[0], 31);
+    assert_eq!(state.rfk_mcc.table_idx, 0);
+    assert_eq!(state.rfk_mcc.ch, [1, 0, 0]);
+    assert_eq!(state.is_tssi_mode, [true, true]);
+    assert!(state.dpk.bp[0][0].path_ok && state.dpk.bp[1][0].path_ok);
+    assert_eq!(state.iqk.iqk_ch, [1, 1]);
+}
+
+#[test]
+fn the_mcc_table_holding_the_channel_is_taken_else_the_first() {
+    let mut mcc = RfkMcc::default();
+    ntfy::mcc_get_ch_info(&mut mcc, G6);
+    assert_eq!((mcc.table_idx, mcc.ch, mcc.band), (0, [6, 0, 0], [0, 0, 0]));
+    ntfy::mcc_get_ch_info(&mut mcc, A36);
+    assert_eq!(
+        (mcc.table_idx, mcc.ch, mcc.band),
+        (0, [36, 0, 0], [1, 0, 0])
+    );
+    mcc.ch[1] = 149;
+    mcc.band[1] = 1;
+    ntfy::mcc_get_ch_info(&mut mcc, A149);
+    assert_eq!((mcc.table_idx, mcc.ch), (1, [36, 149, 0]));
+    // The same number on another band is another channel.
+    mcc.ch[1] = 1;
+    ntfy::mcc_get_ch_info(&mut mcc, G1);
+    assert_eq!((mcc.table_idx, mcc.ch, mcc.band), (0, [1, 1, 0], [0, 1, 0]));
+    let payload = ntfy::rf_get_mccch(&RfkMcc {
+        ch: [36, 149, 0],
+        band: [1, 1, 0],
+        table_idx: 1,
+    });
+    assert_eq!(
+        payload,
+        [
+            36, 0, 0, 0, 36, 0, 0, 0, 149, 0, 0, 0, 149, 0, 0, 0, 149, 0, 0, 0
+        ]
+    );
+}
+
+#[test]
+fn a_scan_start_in_tssi_mode_and_a_refused_access_are_left_alone() {
+    let efuse = efuse_tssi(false);
+    let deltas = trk_deltas();
+    let gain = gain_inputs(false);
+    let inputs = tssi::Inputs {
+        efuse: &efuse,
+        deltas: &deltas,
+        gain: &gain,
+    };
+    let mut io = Model::new(Fill::Pattern, NONE);
+    let mut state = State {
+        is_tssi_mode: [true, false],
+        ..State::default()
+    };
+    assert_eq!(
+        scan(&mut io, &mut Stub::default(), &mut state, true, G1, &inputs),
+        Ok(None)
+    );
+    assert!(io.log.is_empty());
+
+    let mut io = Model::new(Fill::Pattern, NONE);
+    io.refuse = Some(CR + R_P1_TSSI_AVG);
+    let mut state = State::default();
+    assert_eq!(
+        tssi::tssi(&mut io, &mut Stub::default(), &mut state, G1, true, &inputs),
+        Err(Error::Register {
+            register: CR + R_P1_TSSI_AVG
+        })
+    );
+    assert!(!io.log.iter().any(|r| r[0] == 12));
 }

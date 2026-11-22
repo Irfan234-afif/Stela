@@ -675,7 +675,7 @@ fn clamp8(value: i32) -> u32 {
 
 /// `rtw8852bx_set_gain_offset(rtwdev, subband, RTW89_PHY_0)` for an
 /// RTL8852B, which takes no external loss average.
-fn set_gain_offset<I: Io + ?Sized>(
+pub(crate) fn set_gain_offset<I: Io + ?Sized>(
     io: &mut I,
     inputs: &Inputs,
     subband: u8,
