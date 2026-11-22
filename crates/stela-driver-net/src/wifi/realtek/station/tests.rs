@@ -2,6 +2,12 @@
 // Copyright (C) 2026 Stela contributors
 //! The station against a model of the chip, which plays the AP over the frames
 //! it is handed.
+use super::super::{
+    commands::{self, Report},
+    descriptor::{Aggregate, Packet, SECURITY_CCMP},
+    rtw88::{CAM_AES, CAM_TKIP, CamKey, Incoming, MAC_ID, Rtw88, rate_info},
+    templates,
+};
 use super::*;
 use crate::wifi::connection::security::Security;
 use crate::wifi::intel::policy::tests::regdb;
@@ -149,7 +155,7 @@ impl Air {
 #[derive(Clone)]
 struct Model(Rc<RefCell<Air>>);
 
-impl Device for Model {
+impl Rtw88 for Model {
     fn tune(
         &mut self,
         definition: &ChannelDefinition,
@@ -358,7 +364,7 @@ fn wifi(rules: &[(u32, u32, u8, u16)], channel: u16) -> (Wifi<Model>, Model) {
         secret: Secret::Psk(Zeroizing::new([0; 32])),
         country: None,
     };
-    let radio = Rtl8822c::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
+    let radio = Realtek::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
     (
         radio.keep(network, Arc::new(FixedEntropy::default())),
         model,

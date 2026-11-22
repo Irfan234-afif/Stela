@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
 // Copyright(c) 2019-2020 Realtek Corporation
-//! Native Realtek PCIe Wi-Fi: RTL8822C stations by rtw88, and RTL8852B's
+//! Native Realtek PCIe Wi-Fi: RTL8822C stations by rtw88 ([`rtw88`]) on the
+//! softMAC station any Realtek chip may run ([`station`]), and RTL8852B's
 //! firmware layout and register access from rtw89 ([`ax`]), no station yet.
 //! Pinned rtw88/rtw89 are hardware references, not a Linux kernel interface.
 pub mod attach;
@@ -34,6 +35,7 @@ pub mod receive;
 pub mod regd;
 pub mod registers;
 pub mod rf;
+pub mod rtw88;
 pub mod station;
 pub mod templates;
 pub mod transmit;

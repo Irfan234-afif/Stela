@@ -10,7 +10,7 @@ use super::{
     features::Report as Features,
     io::{self, Io},
     rf::{self, Path},
-    station::MAC_ID,
+    rtw88::MAC_ID,
 };
 use crate::{Mac, wifi::Band};
 

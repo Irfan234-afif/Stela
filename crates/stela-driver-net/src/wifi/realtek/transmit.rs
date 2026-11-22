@@ -8,6 +8,7 @@ use super::{
     identity::{Chip, Profile},
     io::Bar,
     registers::*,
+    station,
 };
 use crate::bus::dma::{
     mapping::{Direction, DmaDomain},
@@ -58,6 +59,18 @@ pub enum Queue {
     Management,
     High,
     H2c,
+}
+/// `rtw_tx_ac_to_hwq` of the station's access categories, and its management.
+impl From<station::Queue> for Queue {
+    fn from(queue: station::Queue) -> Self {
+        match queue {
+            station::Queue::Background => Self::Background,
+            station::Queue::BestEffort => Self::BestEffort,
+            station::Queue::Video => Self::Video,
+            station::Queue::Voice => Self::Voice,
+            station::Queue::Management => Self::Management,
+        }
+    }
 }
 const QUEUES: [Queue; 7] = [
     Queue::Background,

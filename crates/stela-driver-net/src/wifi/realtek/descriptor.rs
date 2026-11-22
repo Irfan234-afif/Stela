@@ -2,6 +2,7 @@
 // Copyright(c) 2018-2019 Realtek Corporation
 //! The 48-byte packet descriptor ahead of every RTL8822C frame, from pinned
 //! rtw88 `tx.c` and `tx.h`.
+use super::station::Descriptor;
 
 /// `RTW_RATEID_B_20M` and `RTW_RATEID_G`, for what goes at a basic rate.
 pub const RATE_ID_B: u8 = 8;
@@ -58,6 +59,25 @@ impl Aggregate {
             factor: (4 << (parameters & 3)) - 1,
             density: (parameters >> 2) & 7,
         }
+    }
+}
+
+/// A data frame selects its TID, and its key type says whether it is sealed.
+impl Descriptor for Packet {
+    fn tid(&self) -> u8 {
+        self.queue
+    }
+    fn aggregated(&self) -> bool {
+        self.aggregate.is_some()
+    }
+    fn stop_aggregating(&mut self) {
+        self.aggregate = None;
+    }
+    fn protected(&self) -> bool {
+        self.security != 0
+    }
+    fn resize(&mut self, size: usize) {
+        self.size = size as u16;
     }
 }
 

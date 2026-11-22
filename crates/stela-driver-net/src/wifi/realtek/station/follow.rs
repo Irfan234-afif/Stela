@@ -91,7 +91,7 @@ impl Following {
     }
 }
 
-impl<D: Device> Rtl8822c<D> {
+impl<D: Device> Realtek<D> {
     /// `ieee80211_rx_mgmt_beacon`.
     pub(super) fn beacon_heard(&mut self, frame: &Mpdu, now: u64) -> Result<(), Error> {
         let (Some(context), Some(following)) = (self.context.clone(), &mut self.following) else {
@@ -269,8 +269,10 @@ impl<D: Device> Rtl8822c<D> {
         let eirp_mbm = self.eirp_mbm(definition.control.frequency_mhz);
         Self::hardware(self.device.tune(&definition, false, eirp_mbm))?;
         self.tuned = Some(definition.control);
-        let info = rate_info(context, definition.width, true, 0);
-        Self::hardware(self.device.command(commands::ra_info(info)))
+        Self::hardware(
+            self.device
+                .refresh_rates(context, definition.width, 0, true),
+        )
     }
 
     /// `ieee80211_send_nullfunc`, with its TX report asked for.
@@ -281,25 +283,21 @@ impl<D: Device> Rtl8822c<D> {
             return;
         };
         following.probing = Some(report);
-        let info = rate_info(context, following.width(), false, 0);
+        let width = following.width();
         let mut bytes = alloc::vec![0; 24];
         bytes[..2].copy_from_slice(&[0x48, 1]);
         bytes[4..10].copy_from_slice(&context.bssid().0);
         bytes[10..16].copy_from_slice(&self.address.0);
         bytes[16..22].copy_from_slice(&context.bssid().0);
-        let packet = Packet {
-            size: bytes.len() as u16,
-            mac_id: MAC_ID,
-            queue: 7,
-            rate_id: info.rate_id,
-            rate: highest_rate(context),
-            width: info.width,
-            ldpc: info.ldpc,
-            stbc: u8::from(peer_stbc(context)),
-            report: Some(report),
-            device_sequence: true,
-            ..Packet::default()
+        let null = Data {
+            mpdu: &bytes,
+            context,
+            width,
+            tid: None,
+            protected: false,
+            aggregate: false,
         };
+        let packet = self.device.null(&null, report);
         self.held.push_back((Queue::Voice, packet, bytes));
     }
 }

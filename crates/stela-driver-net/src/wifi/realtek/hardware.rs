@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! An RTL8822C's registers and rings beneath its [`Rtl8822c`] station: what
+//! An RTL8822C's registers and rings beneath its [`Realtek`] station: what
 //! rtw88's `mac80211.c`, `pci.c`, `sec.c` and `rtw_set_channel` do for
 //! mac80211. Each step takes the radio's only worker, so nothing here locks.
 //!
-//! [`Rtl8822c`]: super::station::Rtl8822c
+//! [`Realtek`]: super::station::Realtek
 use super::{
     bootstrap::{Native, Up},
     calibrate::Calibration,
@@ -26,9 +26,10 @@ use super::{
     receive::{self, Ring},
     regd,
     registers::{REG_BCN_CTRL, REG_CR},
-    station::{CamKey, Device, Incoming, MAC_ID, PORT, Received, Watched},
+    rtw88::{CamKey, Incoming, MAC_ID, PORT, Rtw88},
+    station::{self, Received, Watched},
     templates::{self, Templates},
-    transmit::{self, Queue, Rings},
+    transmit::{self, Rings},
 };
 use crate::{
     Mac,
@@ -601,7 +602,7 @@ fn incoming(
     Some((Incoming::Frame(frame), signal))
 }
 
-impl Device for Hardware {
+impl Rtw88 for Hardware {
     /// `rtw_set_channel`, and `rtw_phy_set_tx_power_level` under `eirp_mbm`.
     fn tune(
         &mut self,
@@ -671,13 +672,18 @@ impl Device for Hardware {
         self.calibration_power_save(true)
     }
 
-    fn transmit(&mut self, queue: Queue, packet: &Packet, mpdu: &[u8]) -> Result<bool, String> {
+    fn transmit(
+        &mut self,
+        queue: station::Queue,
+        packet: &Packet,
+        mpdu: &[u8],
+    ) -> Result<bool, String> {
         if !self.deep.transmit_wakes() {
             self.rouse()?;
         }
         match self
             .transmit
-            .frame(queue, self.pages, &packet.encode(), mpdu)
+            .frame(queue.into(), self.pages, &packet.encode(), mpdu)
         {
             Ok(()) => {
                 self.dynamic.sent(mpdu);

@@ -6,7 +6,7 @@ use super::{
     bootstrap::{self, Claim},
     hardware::Hardware,
     identity::Observed,
-    station::{self, Rtl8822c, Wifi},
+    station::{self, Realtek, Wifi},
 };
 use crate::{
     Clock,
@@ -108,6 +108,6 @@ pub unsafe fn attach(
     let hardware = unsafe { Hardware::new(up, alpha2, dfs_region, inputs.vector) }
         .map_err(AttachError::Hardware)?;
     let radio =
-        Rtl8822c::new(hardware, address, country, inputs.clock).map_err(AttachError::Station)?;
+        Realtek::new(hardware, address, country, inputs.clock).map_err(AttachError::Station)?;
     Ok(radio.keep(inputs.network, inputs.entropy))
 }
