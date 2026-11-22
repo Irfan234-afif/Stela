@@ -23,11 +23,11 @@ use crate::{
         station::{
             AssociationContext,
             operations::ChannelDefinition,
-            phy::{AccessCategory, Width},
+            phy::{AccessCategory, McsMaps, Width},
         },
     },
 };
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 
 /// rtw88's sole station shares its interface's MAC ID, the first it acquires.
 pub const MAC_ID: u8 = 0;
@@ -36,6 +36,11 @@ pub const PORT: u8 = 0;
 /// `RTW_CAM_TKIP` and `RTW_CAM_AES`.
 pub const CAM_TKIP: u8 = 2;
 pub const CAM_AES: u8 = 4;
+/// `rtw_channeltable_5g`.
+const CHANNELS_5GHZ: [u16; 25] = [
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165,
+];
 
 /// What an rtw88 chip gives the host.
 pub type Incoming = station::Incoming<Report>;
@@ -113,6 +118,39 @@ pub trait Rtw88 {
     fn limitation(&mut self) -> Option<&'static str> {
         None
     }
+}
+
+/// `rtw_init_ht_cap` and `rtw_init_vht_cap` of a two-stream 80 MHz RTL8822C, as
+/// the elements an association request carries.
+fn capability_elements(band: Band) -> Vec<u8> {
+    // SGI 20, max A-MSDU 7935, one RX STBC stream, LDPC, TX STBC, 40 MHz,
+    // DSSS/CCK in 40 MHz, SGI 40, and SM power save off.
+    let ht: u16 =
+        (1 << 5) | (1 << 11) | (1 << 8) | 1 | (1 << 7) | (1 << 1) | (1 << 12) | (1 << 6) | (3 << 2);
+    let mut elements = alloc::vec![45, 26];
+    elements.extend_from_slice(&ht.to_le_bytes());
+    // IEEE80211_HT_MAX_AMPDU_64K and IEEE80211_HT_MPDU_DENSITY_2.
+    elements.push(3 | (4 << 2));
+    elements.extend_from_slice(&[0xff, 0xff, 0, 0, 1, 0, 0, 0, 0, 0]);
+    elements.extend_from_slice(&300u16.to_le_bytes());
+    // IEEE80211_HT_MCS_TX_DEFINED.
+    elements.extend_from_slice(&[1, 0, 0, 0]);
+    elements.extend_from_slice(&[0; 7]);
+    // mac80211's `ext_capa`: operating mode notifications.
+    elements.extend_from_slice(&[127, 8, 0, 0, 0, 0, 0, 0, 0, 0x40]);
+    if band == Band::Ghz5 {
+        // MPDU 11454, SGI 80, RX LDPC, TX STBC, one RX STBC stream, HTC-VHT,
+        // the largest A-MPDU.
+        let vht: u32 = 2 | (1 << 5) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 22) | (7 << 23);
+        elements.extend_from_slice(&[191, 12]);
+        elements.extend_from_slice(&vht.to_le_bytes());
+        for _ in 0..2 {
+            // MCS 0-9 on two streams, and 780 Mb/s.
+            elements.extend_from_slice(&0xfffau16.to_le_bytes());
+            elements.extend_from_slice(&780u16.to_le_bytes());
+        }
+    }
+    elements
 }
 
 /// `enum rtw_bandwidth`.
@@ -225,6 +263,20 @@ impl<T: Rtw88> Device for T {
     type Descriptor = Packet;
     type Report = Report;
     const MAX_FRAME: usize = transmit::MAX_FRAME;
+    const DRIVER: &'static str = "rtw88";
+    const CHIP: &'static str = "RTL8822C";
+    const CHANNELS_5GHZ: &'static [u16] = &CHANNELS_5GHZ;
+    /// `RTW_CAM_TKIP`, Michael left to mac80211.
+    const TKIP_GROUP: bool = true;
+
+    /// No HE: its maps name no stream.
+    fn advertisement(&self, band: Band) -> (Vec<u8>, [McsMaps; 3]) {
+        let unsupported = McsMaps {
+            rx: 0xffff,
+            tx: 0xffff,
+        };
+        (capability_elements(band), [unsupported; 3])
+    }
 
     /// `rtw_tx_mgmt_pkt_info_update`.
     fn management(&self, frame: &Management<'_>) -> Packet {

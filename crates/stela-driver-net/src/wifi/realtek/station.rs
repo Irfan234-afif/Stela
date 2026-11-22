@@ -194,7 +194,21 @@ pub trait Device {
     type Report;
     /// The longest MPDU, an A-MSDU's subframes and all, the rings take.
     const MAX_FRAME: usize;
+    /// The driver the keeper's reports name, its `Radio::NAME`.
+    const DRIVER: &'static str;
+    /// The chip an error names.
+    const CHIP: &'static str;
+    /// The 5 GHz channels the driver registers with mac80211.
+    const CHANNELS_5GHZ: &'static [u16];
+    /// Whether the key table takes a TKIP group key, Michael left to the host.
+    /// The keeper refuses a TKIP group network before it joins when not.
+    const TKIP_GROUP: bool;
 
+    /// The capability elements a probe and an association request carry on
+    /// `band` behind the rates, HT's, VHT's, HE's and the extended
+    /// capabilities among them, and the HE MCS maps the station's own HE
+    /// capabilities come from.
+    fn advertisement(&self, band: Band) -> (Vec<u8>, [McsMaps; 3]);
     /// The descriptor of a management frame, at the BSS's lowest basic rate.
     fn management(&self, frame: &Management<'_>) -> Self::Descriptor;
     /// The descriptor of a data frame to the AP.
@@ -297,13 +311,21 @@ pub enum Error {
     Scan(scan::Error),
     Refused(&'static str),
     Unsupported(&'static str),
+    /// What `chip` does not do.
+    Lacks {
+        what: &'static str,
+        chip: &'static str,
+    },
     /// Frames must drain before this can go on.
     Pending,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Lacks { what, chip } => write!(f, "Unsupported(\"{what} on an {chip}\")"),
+            error => write!(f, "{error:?}"),
+        }
     }
 }
 
@@ -380,40 +402,8 @@ fn management(local: Mac, ap: Mac, subtype: u16, protected: bool, body: &[u8]) -
     bytes
 }
 
-/// `rtw_init_ht_cap` and `rtw_init_vht_cap` of a two-stream 80 MHz RTL8822C, as
-/// the elements an association request carries.
-fn capability_elements(band: Band) -> Vec<u8> {
-    // SGI 20, max A-MSDU 7935, one RX STBC stream, LDPC, TX STBC, 40 MHz,
-    // DSSS/CCK in 40 MHz, SGI 40, and SM power save off.
-    let ht: u16 =
-        (1 << 5) | (1 << 11) | (1 << 8) | 1 | (1 << 7) | (1 << 1) | (1 << 12) | (1 << 6) | (3 << 2);
-    let mut elements = alloc::vec![45, 26];
-    elements.extend_from_slice(&ht.to_le_bytes());
-    // IEEE80211_HT_MAX_AMPDU_64K and IEEE80211_HT_MPDU_DENSITY_2.
-    elements.push(3 | (4 << 2));
-    elements.extend_from_slice(&[0xff, 0xff, 0, 0, 1, 0, 0, 0, 0, 0]);
-    elements.extend_from_slice(&300u16.to_le_bytes());
-    // IEEE80211_HT_MCS_TX_DEFINED.
-    elements.extend_from_slice(&[1, 0, 0, 0]);
-    elements.extend_from_slice(&[0; 7]);
-    // mac80211's `ext_capa`: operating mode notifications.
-    elements.extend_from_slice(&[127, 8, 0, 0, 0, 0, 0, 0, 0, 0x40]);
-    if band == Band::Ghz5 {
-        // MPDU 11454, SGI 80, RX LDPC, TX STBC, one RX STBC stream, HTC-VHT,
-        // the largest A-MPDU.
-        let vht: u32 = 2 | (1 << 5) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 22) | (7 << 23);
-        elements.extend_from_slice(&[191, 12]);
-        elements.extend_from_slice(&vht.to_le_bytes());
-        for _ in 0..2 {
-            // MCS 0-9 on two streams, and 780 Mb/s.
-            elements.extend_from_slice(&0xfffau16.to_le_bytes());
-            elements.extend_from_slice(&780u16.to_le_bytes());
-        }
-    }
-    elements
-}
-
-/// The rates of `rtw_band_2ghz` and `rtw_band_5ghz`.
+/// The rates of rtw88's `rtw_band_2ghz` and `rtw_band_5ghz`, which rtw89's
+/// `rtw89_sband_2ghz` and `rtw89_sband_5ghz` share.
 fn rate_elements(band: Band) -> &'static [u8] {
     match band {
         Band::Ghz2 => &[1, 8, 2, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108],
@@ -421,8 +411,15 @@ fn rate_elements(band: Band) -> &'static [u8] {
     }
 }
 
-/// `ieee80211_probereq_get`: the elements of a scan's probe on `band`.
-fn probe_request(local: Mac, ssid: &[u8], band: Band, extra: &[u8]) -> Vec<u8> {
+/// `ieee80211_probereq_get`: the elements of a scan's probe on `band`, the
+/// device's `capabilities` behind its rates.
+fn probe_request(
+    local: Mac,
+    ssid: &[u8],
+    band: Band,
+    capabilities: &[u8],
+    extra: &[u8],
+) -> Vec<u8> {
     let mut bytes = alloc::vec![0; 24];
     bytes[..2].copy_from_slice(&0x40u16.to_le_bytes());
     bytes[4..10].fill(0xff);
@@ -431,7 +428,7 @@ fn probe_request(local: Mac, ssid: &[u8], band: Band, extra: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&[0, ssid.len() as u8]);
     bytes.extend_from_slice(ssid);
     bytes.extend_from_slice(rate_elements(band));
-    bytes.extend_from_slice(&capability_elements(band));
+    bytes.extend_from_slice(capabilities);
     bytes.extend_from_slice(extra);
     bytes
 }
@@ -574,7 +571,7 @@ pub struct Realtek<D: Device> {
 impl<D: Device> Realtek<D> {
     /// `device`, running at `address` under `country`, as a keeper's radio.
     pub fn new(device: D, address: Mac, country: Country, clock: Clock) -> Result<Self, Error> {
-        let channels = channels(&country);
+        let channels = channels(&country, D::CHANNELS_5GHZ);
         let watchdog_at = clock.now_us() + WATCHDOG_US;
         Ok(Self {
             device,
@@ -756,7 +753,10 @@ impl<D: Device> Realtek<D> {
         let active = request.active() && self.probes(channel);
         let probes: Vec<Vec<u8>> = if active {
             let extra = request.extra_elements();
-            let probe = |ssid: &Vec<u8>| probe_request(self.address, ssid, channel.band, extra);
+            let (capabilities, _) = self.device.advertisement(channel.band);
+            let probe = |ssid: &Vec<u8>| {
+                probe_request(self.address, ssid, channel.band, &capabilities, extra)
+            };
             request.ssids().iter().map(probe).collect()
         } else {
             Vec::new()
@@ -1756,8 +1756,9 @@ impl<D: Device> Realtek<D> {
     }
 }
 
-/// The channels mac80211 registers, as `country` leaves them.
-fn channels(country: &Country) -> Vec<(Channel, u32)> {
+/// The channels mac80211 registers, 5 GHz's those of `channels_5ghz`, as
+/// `country` leaves them.
+fn channels(country: &Country, channels_5ghz: &[u16]) -> Vec<(Channel, u32)> {
     let mut out = Vec::new();
     let mut band = |band: Band, numbers: &[u16], frequency: fn(u16) -> u16| {
         let centers: Vec<u16> = numbers.iter().map(|&number| frequency(number)).collect();
@@ -1788,15 +1789,10 @@ fn channels(country: &Country) -> Vec<(Channel, u32)> {
             }
         },
     );
-    band(Band::Ghz5, &CHANNELS_5GHZ, |number| 5000 + 5 * number);
+    band(Band::Ghz5, channels_5ghz, |number| 5000 + 5 * number);
     out
 }
 
-/// `rtw_channeltable_5g`.
-const CHANNELS_5GHZ: [u16; 25] = [
-    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-    149, 153, 157, 161, 165,
-];
 const SUPPORTED_2GHZ: [u8; 2] = [1, 14];
 const SUPPORTED_5GHZ: [u8; 4] = [36, 28, 149, 9];
 
@@ -1844,9 +1840,10 @@ impl<D: Device> Radio for Realtek<D> {
     type Management = Arc<ManagementKey>;
     type Error = Error;
 
-    const NAME: &'static str = "rtw88";
-    /// rtw88 leaves `max_listen_interval` at mac80211's default.
+    const NAME: &'static str = D::DRIVER;
+    /// rtw88 and rtw89 leave `max_listen_interval` at mac80211's default.
     const LISTEN_INTERVAL: u16 = 5;
+    const TKIP_GROUP: bool = D::TKIP_GROUP;
 
     fn deferred(error: &Error) -> bool {
         matches!(error, Error::Pending)
@@ -1905,18 +1902,16 @@ impl<D: Device> Radio for Realtek<D> {
     }
 
     fn advertisement(&self, band: Band) -> Result<Advertisement, Error> {
+        let (capability_elements, he_source_maps) = self.device.advertisement(band);
         let mut elements = rate_elements(band).to_vec();
-        elements.extend_from_slice(&capability_elements(band));
+        elements.extend_from_slice(&capability_elements);
         elements.extend_from_slice(&WMM_ELEMENT);
         let capabilities = Capabilities::parse(band, Role::Station, &elements)
             .map_err(|_| Error::Refused("advertisement"))?;
         Ok(Advertisement {
             capabilities,
             elements,
-            he_source_maps: [McsMaps {
-                rx: 0xffff,
-                tx: 0xffff,
-            }; 3],
+            he_source_maps,
             multi_link: Some(false),
         })
     }
@@ -2033,7 +2028,10 @@ impl<D: Device> Radio for Realtek<D> {
         _: Option<Affiliation>,
         _: u64,
     ) -> Result<Arc<external::Session>, Error> {
-        Err(Error::Unsupported("6 GHz on an RTL8822C"))
+        Err(Error::Lacks {
+            what: "6 GHz",
+            chip: D::CHIP,
+        })
     }
 
     fn transmit_external_authentication(
@@ -2109,7 +2107,8 @@ impl<D: Device> Radio for Realtek<D> {
         self.send(ethernet, class)
     }
 
-    /// `rtw_ops_set_key`: the CAM takes CCMP-128 alone of what a station uses.
+    /// `set_key`: the key table takes CCMP-128 alone of what a station uses,
+    /// and a TKIP group key where the device says so.
     fn install_key(
         &mut self,
         pairwise: bool,
@@ -2121,12 +2120,17 @@ impl<D: Device> Radio for Realtek<D> {
         // mac80211.
         let cipher = if material.len() == Cipher::Ccmp128.key_length() {
             Cipher::Ccmp128
-        } else if !pairwise && material.len() == Cipher::Tkip.key_length() {
+        } else if D::TKIP_GROUP && !pairwise && material.len() == Cipher::Tkip.key_length() {
             Cipher::Tkip
         } else {
-            return Err(Error::Unsupported(
-                "a key other than CCMP-128 or a TKIP group key on an RTL8822C",
-            ));
+            return Err(Error::Lacks {
+                what: if D::TKIP_GROUP {
+                    "a key other than CCMP-128 or a TKIP group key"
+                } else {
+                    "a key other than CCMP-128"
+                },
+                chip: D::CHIP,
+            });
         };
         let temporal = material
             .first_chunk::<16>()
@@ -2176,7 +2180,10 @@ impl<D: Device> Radio for Realtek<D> {
     }
 
     fn install_link_key(&mut self, _: u8, _: u8, _: &[u8], _: ReplaySeed) -> Result<(), Error> {
-        Err(Error::Unsupported("MLO on an RTL8822C"))
+        Err(Error::Lacks {
+            what: "MLO",
+            chip: D::CHIP,
+        })
     }
 
     /// The IGTK stays in the host, where mac80211 runs BIP for rtw88.

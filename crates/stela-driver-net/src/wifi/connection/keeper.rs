@@ -22,7 +22,7 @@ use crate::{
         regulatory::PowerType,
         sae::{self, Derivation, Exchange},
         scan::{self, result::Bss},
-        security::{KeyIdentity, PacketNumber, ReplaySeed},
+        security::{Cipher, KeyIdentity, PacketNumber, ReplaySeed},
         station::{
             Join, NativeBssObservation, PortPolicy, Station,
             external::{self, Received},
@@ -114,6 +114,9 @@ pub trait Radio: Link {
     const NAME: &'static str;
     /// mac80211's `hw.conf.listen_interval` for this driver.
     const LISTEN_INTERVAL: u16;
+    /// Whether the radio decrypts a network's TKIP group traffic. A radio
+    /// that leaves it to software is refused such a network before it joins.
+    const TKIP_GROUP: bool = true;
 
     /// Whether `error` only asks to try again once queued frames drain.
     fn deferred(error: &Self::Error) -> bool;
@@ -728,6 +731,12 @@ impl<R: Radio> Keeper<R> {
                 continue;
             }
             match Security::select_on(bss.channel.band, &bss.elements, passphrase) {
+                Ok(security) if !R::TKIP_GROUP && security.group == Cipher::Tkip => {
+                    refusal = Some(format!(
+                        "offers only a TKIP group cipher, which {} leaves to software",
+                        R::NAME
+                    ));
+                }
                 Ok(security) => {
                     let signal = |bss: &Bss| bss.signal_dbm.unwrap_or(i8::MIN);
                     if best
