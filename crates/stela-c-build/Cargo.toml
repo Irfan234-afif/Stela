@@ -17,7 +17,9 @@ linux = ["native"]
 linux-registry = ["linux", "dep:libc", "dep:object", "dep:sha2"]
 
 [dependencies]
-cc = { version = "1", optional = true }
+# `parallel` compiles a build's C sources on the jobs Cargo gives its build
+# script: amdgpu, nouveau, xe and Linux are hundreds of files each.
+cc = { version = "1", optional = true, features = ["parallel"] }
 libc = { version = "0.2", optional = true }
 object = { version = "0.37", default-features = false, features = ["read"], optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
