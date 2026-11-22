@@ -2647,6 +2647,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "capabilities_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/capabilities/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RA_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 HT, VHT and HE capability init C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",

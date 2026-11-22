@@ -28,7 +28,10 @@ The program runs, unchanged, with every rtw89 callee it reaches:
   misses;
 - __rtw89_phy_c2h_ra_rpt_iter with rtw89_legacy_rate_to_bitrate,
   rtw89_hw_to_rate_info_bw and get_max_amsdu_len over legacy, HT, VHT and
-  HE reports and a report for another MAC ID.
+  HE reports and a report for another MAC ID;
+- rtw89_init_ht_cap, rtw89_init_vht_cap and rtw89_init_he_cap (station)
+  over RTL8852B's chip info for two streams on 5 and 2.4 GHz at cuts B and
+  A (A gives no NG16), one stream, and one TX stream of two.
 
 The changed pieces are the seams: rtw89_h2c_tx records the skb;
 cfg80211_calculate_bitrate is a stub returning each case's bit rate (the
@@ -46,6 +49,11 @@ the BA operation count, then per operation five input words, the return,
 whether an H2C went, the map and entries' TIDs, and 16 H2C bytes (zero
 when none); the report count, then per report five input words and
 thirteen output words. Every H2C takes the next sequence number from 0.
+capabilities.bin holds the case count, then per case four input words
+(rx_nss, tx_nss, cut, band: 0 for 2.4 GHz, 1 for 5) and 64 bytes: the HT
+cap, A-MPDU factor and density, struct ieee80211_mcs_info, the VHT cap,
+struct ieee80211_vht_mcs_info, the HE MAC and PHY bytes, struct
+ieee80211_he_mcs_nss_supp, the HT/VHT/HE supported bits and he_6ghz_capa.
 """
 import hashlib
 import json
@@ -158,7 +166,8 @@ def main(argv):
         """Every #define whose name starts with one of `prefixes`, with its
         continuation lines, in file order."""
         text = source(file)
-        pattern = r'^#define (?:' + '|'.join(map(re.escape, prefixes)) + r')\w*\b(?:[^\n]*\\\n)*[^\n]*$'
+        pattern = (r'^#define[ \t]+(?:' + '|'.join(map(re.escape, prefixes))
+                   + r')\w*\b(?:[^\n]*\\\n)*[^\n]*$')
         found = [m.group(0) for m in re.finditer(pattern, text, re.M)]
         if not found:
             raise ValueError(f'{file}: no #define starting {prefixes}')
@@ -211,7 +220,8 @@ def main(argv):
            declaration(eht_h, 'struct', 'ieee80211_eht_mcs_nss_supp_bw'),
            declaration(eht_h, 'struct', 'ieee80211_eht_cap_elem_fixed')])
 
-    core_defines = defines('core.h', ['MAX_RSSI', 'RSSI_FACTOR', 'RTW89_MAX_BA_CAM_NUM'])
+    core_defines = defines('core.h', ['MAX_RSSI', 'RSSI_FACTOR', 'RF_PATH_MAX',
+                                      'RTW89_MAX_BA_CAM_NUM'])
     phy_defines = prefixed('phy.h', ['RA_MASK_'])
     phy_c_defines = defines('phy.c', ['RA_FLOOR_TABLE_SIZE', 'RA_FLOOR_UP_GAP'])
     fw_defines = '\n\n'.join([
@@ -240,6 +250,8 @@ def main(argv):
     core = functions('core.c', [
         'rtw89_legacy_rate_to_bitrate', 'rtw89_core_acquire_bit_map', 'rtw89_core_release_bit_map',
         'rtw89_core_acquire_sta_ba_entry', 'rtw89_core_release_sta_ba_entry'])
+    core_caps = functions('core.c', ['rtw89_init_ht_cap', 'rtw89_init_vht_cap',
+                                     'rtw89_init_he_cap'])
     fw = functions('fw.c', [
         'rtw89_fw_h2c_alloc_skb', 'rtw89_fw_h2c_alloc_skb_with_hdr', 'rtw89_h2c_pkt_set_hdr',
         'rtw89_fw_h2c_ba_cam', 'rtw89_fw_h2c_ra'])
@@ -258,7 +270,8 @@ def main(argv):
 
     info = fields('rtw8852b.c', 'const struct rtw89_chip_info rtw8852b_chip_info',
                   ['chip_id', 'chip_gen', 'max_amsdu_limit', 'bacam_num', 'bacam_dynamic_num',
-                   'bacam_ver', 'tx_nss', 'rx_nss', 'ops'])
+                   'bacam_ver', 'tx_nss', 'rx_nss', 'support_bandwidths',
+                   'max_vht_mpdu_cap', 'ops'])
     if info['ops'] != '&rtw8852b_chip_ops':
         raise ValueError(f'rtw8852b_chip_info.ops is {info["ops"]}')
     ops = fields('rtw8852b.c', 'static const struct rtw89_chip_ops rtw8852b_chip_ops',
@@ -436,7 +449,8 @@ struct rtw89_cam_info { DECLARE_BITMAP(ba_cam_map, RTW89_MAX_BA_CAM_NUM);
 	struct rtw89_ba_cam_entry ba_cam_entry[RTW89_MAX_BA_CAM_NUM]; };
 struct rtw89_chip_info { enum rtw89_core_chip_id chip_id; enum rtw89_chip_gen chip_gen;
 	u16 max_amsdu_limit; u8 bacam_num; u8 bacam_dynamic_num;
-	enum rtw89_bacam_ver bacam_ver; u8 tx_nss, rx_nss; u32 h2c_desc_size; };
+	enum rtw89_bacam_ver bacam_ver; u8 tx_nss, rx_nss; u32 h2c_desc_size;
+	u32 support_bandwidths; u32 max_vht_mpdu_cap; };
 struct rtw89_hal { u8 tx_nss, rx_nss; bool no_mcs_12_13; u8 cv; };
 struct rtw89_dev { const struct rtw89_chip_info *chip; struct rtw89_hal hal;
 	struct { u8 h2c_seq; } fw; struct rtw89_cam_info cam_info; struct ieee80211_hw *hw; };
@@ -538,6 +552,8 @@ static const struct rtw89_chip_info chip_info = {{
 	.tx_nss = {info["tx_nss"]},
 	.rx_nss = {info["rx_nss"]},
 	.h2c_desc_size = 24,
+	.support_bandwidths = {info["support_bandwidths"]},
+	.max_vht_mpdu_cap = {info["max_vht_mpdu_cap"]},
 }};
 '''
     main_c = r'''
@@ -622,7 +638,7 @@ static const struct rpt_case rpt_cases[] = {
 
 int main(int argc, char **argv)
 {
-	if (argc != 2)
+	if (argc != 3)
 		return 2;
 	static struct rtw89_dev dev;
 	static struct ieee80211_hw hw;
@@ -753,13 +769,55 @@ int main(int argc, char **argv)
 	FILE *f = fopen(argv[1], "wb");
 	if (!f || fwrite(trace, 1, trace_len, f) != trace_len || fclose(f))
 		abort();
-	printf("%zu %zu %zu\n", ARRAY_SIZE(ra_cases), ARRAY_SIZE(ba_cases), ARRAY_SIZE(rpt_cases));
+
+	static const u8 cap_cases[][4] = {
+		{2, 2, CHIP_CBV, 1}, {2, 2, CHIP_CBV, 0}, {2, 2, CHIP_CAV, 1}, {2, 2, CHIP_CAV, 0},
+		{1, 1, CHIP_CBV, 1}, {2, 1, CHIP_CCV, 1},
+	};
+	trace_len = 0;
+	word(ARRAY_SIZE(cap_cases));
+	for (size_t i = 0; i < ARRAY_SIZE(cap_cases); i++) {
+		const u8 *c = cap_cases[i];
+		struct ieee80211_sta_ht_cap ht;
+		struct ieee80211_sta_vht_cap vht;
+		struct ieee80211_sband_iftype_data data;
+		memset(&ht, 0, sizeof(ht));
+		memset(&vht, 0, sizeof(vht));
+		memset(&data, 0, sizeof(data));
+		dev.hal.rx_nss = c[0];
+		dev.hal.tx_nss = c[1];
+		dev.hal.cv = c[2];
+		rtw89_init_ht_cap(&dev, &ht);
+		rtw89_init_vht_cap(&dev, &vht);
+		rtw89_init_he_cap(&dev, c[3] ? NL80211_BAND_5GHZ : NL80211_BAND_2GHZ,
+				  NL80211_IFTYPE_STATION, &data);
+		for (int k = 0; k < 4; k++)
+			word(c[k]);
+		u8 blob[64] = {0};
+		memcpy(blob, &ht.cap, 2);
+		blob[2] = ht.ampdu_factor;
+		blob[3] = ht.ampdu_density;
+		memcpy(blob + 4, &ht.mcs, 16);
+		memcpy(blob + 20, &vht.cap, 4);
+		memcpy(blob + 24, &vht.vht_mcs, 8);
+		memcpy(blob + 32, data.he_cap.he_cap_elem.mac_cap_info, 6);
+		memcpy(blob + 38, data.he_cap.he_cap_elem.phy_cap_info, 11);
+		memcpy(blob + 49, &data.he_cap.he_mcs_nss_supp, 12);
+		blob[61] = ht.ht_supported | vht.vht_supported << 1 | data.he_cap.has_he << 2;
+		memcpy(blob + 62, &data.he_6ghz_capa, 2);
+		put(blob, 64);
+	}
+	f = fopen(argv[2], "wb");
+	if (!f || fwrite(trace, 1, trace_len, f) != trace_len || fclose(f))
+		abort();
+	printf("%zu %zu %zu %zu\n", ARRAY_SIZE(ra_cases), ARRAY_SIZE(ba_cases),
+	       ARRAY_SIZE(rpt_cases), ARRAY_SIZE(cap_cases));
 	return 0;
 }
 '''
     program = '\n\n'.join([
         preamble, ieee, harness_types, core_defines, phy_defines, phy_c_defines, fw_defines,
-        declarations, harness, chip, core_inlines, bitrates, core, fw, phy_tables, phy_iter,
+        declarations, harness, chip, core_inlines, bitrates, core, core_caps, fw, phy_tables, phy_iter,
         phy_first, phy_second, phy_report, main_c])
     generated = out / 'oracle.c'
     generated.write_text(program, newline='\n')
@@ -769,15 +827,20 @@ int main(int argc, char **argv)
                     '-Wno-address-of-packed-member', str(generated), '-o', str(exe)],
                    check=True)
     trace = out / 'trace.bin'
-    run = subprocess.run([str(exe), str(trace)], check=True, capture_output=True, text=True)
-    ra_count, ba_count, rpt_count = map(int, run.stdout.split())
+    capabilities = out / 'capabilities.bin'
+    run = subprocess.run([str(exe), str(trace), str(capabilities)], check=True,
+                         capture_output=True, text=True)
+    ra_count, ba_count, rpt_count, cap_count = map(int, run.stdout.split())
     data = trace.read_bytes()
+    caps = capabilities.read_bytes()
     receipt = dict(
         linux_commit=COMMIT, symbols=manifest,
-        cases=dict(ra=ra_count, ba_cam=ba_count, ra_report=rpt_count),
+        headers={name: sha for name, sha in HEADERS.items()},
+        cases=dict(ra=ra_count, ba_cam=ba_count, ra_report=rpt_count, capabilities=cap_count),
         dispatch=dict(rtw8852b_chip_info=info, rtw8852b_chip_ops=ops,
                       old_ht_ra_format=feats),
         trace_bytes=len(data), trace_sha256=hashlib.sha256(data).hexdigest(),
+        capabilities_bytes=len(caps), capabilities_sha256=hashlib.sha256(caps).hexdigest(),
         generated_source_sha256=hashlib.sha256(generated.read_bytes()).hexdigest(),
         oracle_limit=[
             'the peers are the harness\'s ieee80211_link_sta, not mac80211\'s parse of an AP',
@@ -786,7 +849,8 @@ int main(int argc, char **argv)
             'rtw89_h2c_tx is a stub recording the skb; the CH12 path is the H2C oracle\'s',
         ])
     (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n', newline='\n')
-    print(json.dumps({k: receipt[k] for k in ['cases', 'trace_bytes', 'trace_sha256']}))
+    print(json.dumps({k: receipt[k] for k in ['cases', 'trace_bytes', 'trace_sha256',
+                                              'capabilities_bytes', 'capabilities_sha256']}))
     return 0
 
 
