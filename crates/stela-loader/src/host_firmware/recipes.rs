@@ -2113,8 +2113,8 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
 /// its driver takes when the USB has none for the observed adapter:
 /// - a MediaTek chip's two images under the chip's binding
 ///   (`stela_drivers::net::wifi::mediatek::identity::Chip::target`);
-/// - an RTL8822C's image under the chip's binding
-///   (`stela_drivers::net::wifi::realtek::identity::Profile::chip_target`);
+/// - an RTL8822C's image, or an RTL8852B's rtw89 container, under the chip's
+///   binding (`stela_drivers::net::wifi::realtek::identity::Profile::chip_target`);
 /// - every image and PNVM an Intel device can select by its MAC, radio and
 ///   steps, which only a boot reads, under the device's binding
 ///   (`stela_drivers::net::wifi::intel::identity::device_images`, which this
@@ -2150,6 +2150,12 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
         ),
         // `rtw_8822ce_id_table`.
         (0x10ec, 0xc822 | 0xc82f) => ("realtek-wifi", "pci:10ec:c822", &["rtw88/rtw8822c_fw.bin"]),
+        // `rtw89_8852be_id_table`; rtw89 picks the suit inside the container.
+        (0x10ec, 0xb852 | 0xb85b) => (
+            "realtek-wifi",
+            "pci:10ec:b852",
+            &["rtw89/rtw8852b_fw-2.bin"],
+        ),
         (0x8086, _) if !intel_wifi_images(device).is_empty() => {
             intel = format!("pci:8086:{device:04x}");
             ("wifi-intel", &intel, intel_wifi_images(device))
@@ -2322,16 +2328,21 @@ fn select_realtek_bluetooth(request: &Request) -> Option<&'static Recipe> {
 /// Bind each original PCI/SYS_CFG1 request to its own chip's pinned image.
 /// Provisioning preserves observations; it grants no native radio admission.
 fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
-    // The RTL8822C chip's binding, which setup writes from PCI IDs alone
-    // (`identity::Profile::chip_target`).
-    if request.target.hardware == "pci:10ec:c822" && request.target.revision == "linux-firmware" {
-        return REALTEK_WIFI.iter().find(|recipe| {
-            recipe.image.member == request.name
-                && matches!(
-                    request.name.as_str(),
-                    "rtw88/rtw8822c_fw.bin" | "rtw88/rtw8822c_wow_fw.bin"
-                )
-        });
+    // The RTL8822C's and RTL8852B's chip bindings, which setup writes from
+    // PCI IDs alone (`identity::Profile::chip_target`). Each holds its own
+    // chip's files alone; no observed binding has this revision.
+    if request.target.revision == "linux-firmware" {
+        let chip_matches = match request.target.hardware.as_str() {
+            "pci:10ec:c822" => matches!(
+                request.name.as_str(),
+                "rtw88/rtw8822c_fw.bin" | "rtw88/rtw8822c_wow_fw.bin"
+            ),
+            "pci:10ec:b852" => request.name == "rtw89/rtw8852b_fw-2.bin",
+            _ => false,
+        };
+        return REALTEK_WIFI
+            .iter()
+            .find(|recipe| chip_matches && recipe.image.member == request.name);
     }
     let pci: Vec<_> = request.target.hardware.split(':').collect();
     if pci.len() != 8

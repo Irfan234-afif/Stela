@@ -200,8 +200,7 @@ fn a_wifi_network_requires_the_database_and_a_mediatek_chips_two_images() {
             assert_eq!(selection.recipe.image.member, selection.request.name);
         }
     }
-    // Ethernet controllers, Wi-Fi chips no driver here runs, and RTL8852B,
-    // whose driver loads no image, have none.
+    // Ethernet controllers and Wi-Fi chips no driver here runs have none.
     let mut inventory = Inventory::default();
     for (vendor, device) in [
         (0x8086, 0x125c),
@@ -210,7 +209,6 @@ fn a_wifi_network_requires_the_database_and_a_mediatek_chips_two_images() {
         (0x14c3, 0x7663),
         (0x8086, 0x2526),
         (0x8086, 0x24fd),
-        (0x10ec, 0xb852),
         (0x10ec, 0xb822),
         (0x17cb, 0x1103),
     ] {
@@ -238,6 +236,38 @@ fn a_wifi_network_requires_an_rtl8822cs_image_under_the_chips_binding() {
         ("rtw89/rtw8852b_fw-2.bin", "pci:10ec:c822", "linux-firmware"),
         ("rtw88/rtw8822c_fw.bin", "pci:10ec:c822", "observed"),
         ("rtw88/rtw8822c_fw.bin", "pci:10ec:b852", "linux-firmware"),
+    ] {
+        assert!(select(&[request("realtek-wifi", name, hardware, revision)]).is_err());
+    }
+}
+
+#[test]
+fn a_wifi_network_requires_an_rtl8852bs_container_under_the_chips_binding() {
+    for device in [0xb852, 0xb85b] {
+        let mut inventory = Inventory::default();
+        assert!(require_wifi(&mut inventory, 0x10ec, device).unwrap());
+        let plan = Plan::select(&inventory).unwrap();
+        assert_eq!(plan.selections().len(), 1);
+        let selection = &plan.selections()[0];
+        assert_eq!(selection.request.name, "rtw89/rtw8852b_fw-2.bin");
+        assert_eq!(selection.request.target.driver, "realtek-wifi");
+        assert_eq!(selection.request.target.hardware, "pci:10ec:b852");
+        assert_eq!(selection.request.target.revision, "linux-firmware");
+        assert_eq!(selection.recipe.image.member, "rtw89/rtw8852b_fw-2.bin");
+        assert_eq!(selection.recipe.image.length, 1554594);
+        assert_eq!(selection.recipe.license, &REALTEK_WIFI_LICENSE);
+    }
+    // The chip binding holds the RTL8852B's container alone.
+    for (name, hardware, revision) in [
+        ("rtw89/rtw8852b_fw-1.bin", "pci:10ec:b852", "linux-firmware"),
+        ("rtw89/rtw8852b_fw.bin", "pci:10ec:b852", "linux-firmware"),
+        (
+            "rtw88/rtw8822c_wow_fw.bin",
+            "pci:10ec:b852",
+            "linux-firmware",
+        ),
+        ("rtw89/rtw8852b_fw-2.bin", "pci:10ec:b852", "observed"),
+        ("rtw89/rtw8852b_fw-2.bin", "pci:10ec:b85b", "linux-firmware"),
     ] {
         assert!(select(&[request("realtek-wifi", name, hardware, revision)]).is_err());
     }
