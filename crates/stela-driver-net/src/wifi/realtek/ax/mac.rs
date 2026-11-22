@@ -364,7 +364,7 @@ pub fn set_ofld_cfg<I: Io + ?Sized, C: Commands<I> + ?Sized>(
 }
 
 /// `__rtw8852bx_mac_enable_bb_rf` for an RTL8852B.
-fn enable_bb_rf<I: Io + ?Sized>(io: &mut I) -> Result<(), io::Error> {
+pub(super) fn enable_bb_rf<I: Io + ?Sized>(io: &mut I) -> Result<(), io::Error> {
     io.write8_set(SYS_FUNC_EN, (FEN_BBRSTB | FEN_BB_GLB_RSTN) as u8)?;
     io.write32_mask(SPS_DIG_ON_CTRL0, REG_ZCDC_H_MASK, 0x1)?;
     io.write32_set(WLRF_CTRL, AFC_AFEDIG)?;

@@ -2576,6 +2576,17 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "bb_and_rf_loads_match_unchanged_c_for_each_cut_and_rfe",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES",
+      "STELA_RTW89_PHY_ORACLE"
+    ],
+    "reason": "requires the pinned rtw8852b_fw-2.bin and the unchanged pinned rtw89 BB and RF table load C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",

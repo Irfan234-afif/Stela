@@ -401,6 +401,7 @@ impl Channel<'_> {
         }
     }
 }
+pub mod phy;
 
 #[cfg(test)]
 mod tests;

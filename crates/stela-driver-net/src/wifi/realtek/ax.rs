@@ -44,6 +44,7 @@ pub mod mac;
 #[cfg(test)]
 mod model;
 pub mod pci;
+pub mod phy;
 pub mod power;
 pub mod regd;
 pub mod registers;

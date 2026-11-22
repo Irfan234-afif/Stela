@@ -1322,3 +1322,50 @@ pub const TXSHAPE_TRIANGULAR_CFG: u32 = 0x0300_0000;
 pub const DPD_TSSI_CW: u32 = 0x07fc_0000;
 pub const DPD_PWR_CW: u32 = 0x0003_fe00;
 pub const DPD_REF: u32 = 0x0000_01ff;
+/// RTL8852B's BB reset (`rtw8852b_bb_reset`, `__rtw8852bx_bb_reset_all`):
+/// each path's TX power reset (`R_P0_TXPW_RSTB`, `B_P0_TXPW_RSTB_MANON`)
+/// and TSSI tracking (`R_P0_TSSI_TRK`, `B_P0_TSSI_TRK_EN`), the hardware SI
+/// triggers (`R_S0_HW_SI_DIS`, `B_S0_HW_SI_DIS_W_R_TRIG`) and the
+/// asynchronous reset (`R_RSTB_ASYNC`, `B_RSTB_ASYNC_ALL`), as BB offsets.
+pub const P0_TXPW_RSTB: u32 = 0x58dc;
+pub const P0_TXPW_RSTB_MANON: u32 = 1 << 30;
+pub const P0_TSSI_TRK: u32 = 0x5818;
+pub const P0_TSSI_TRK_EN: u32 = 1 << 30;
+pub const P1_TXPW_RSTB: u32 = 0x78dc;
+pub const P1_TXPW_RSTB_MANON: u32 = 1 << 30;
+pub const P1_TSSI_TRK: u32 = 0x7818;
+pub const P1_TSSI_TRK_EN: u32 = 1 << 30;
+pub const S0_HW_SI_DIS: u32 = 0x1200;
+pub const S0_HW_SI_DIS_W_R_TRIG: u32 = 0x7000_0000;
+pub const S1_HW_SI_DIS: u32 = 0x3200;
+pub const S1_HW_SI_DIS_W_R_TRIG: u32 = 0x7000_0000;
+pub const RSTB_ASYNC: u32 = 0x0704;
+pub const RSTB_ASYNC_ALL: u32 = 1 << 1;
+/// `rtw89_phy_preinit_rf_nctl_ax`'s BB offsets: `R_IOQ_IQK_DPK`,
+/// `R_GNT_BT_WGT_EN`, `R_P0_PATH_RST`, `R_P1_PATH_RST` and `R_NCTL_CFG`,
+/// and the NCTL report `rtw89_phy_nctl_poll` writes and reads, which rtw89
+/// names only as 0x8080.
+pub const IOQ_IQK_DPK: u32 = 0x0c60;
+pub const GNT_BT_WGT_EN: u32 = 0x0c6c;
+pub const P0_PATH_RST: u32 = 0x58ac;
+pub const P1_PATH_RST: u32 = 0x78ac;
+pub const NCTL_CFG: u32 = 0x8000;
+pub const NCTL_RPT: u32 = 0x8080;
+/// `XTAL_SI_RF00S_EN` and `XTAL_SI_RF10S_EN`: the RF path enables in
+/// `XTAL_SI_WL_RFC_S0` and `_S1` that `__rtw8852bx_mac_disable_bb_rf`
+/// clears.
+pub const XTAL_SI_RF00S_EN: u8 = 0x07;
+pub const XTAL_SI_RF10S_EN: u8 = 0x07;
+/// The TX power unit `__rtw8852bx_init_txpwr_unit` sets: `R_AX_PWR_COEXT_CTRL`,
+/// `R_AX_PWR_UL_CTRL0` and `R_AX_PWR_UL_CTRL2`, and the UL TB offset
+/// (`R_AX_PWR_UL_TB_CTRL` with `B_AX_PWR_UL_TB_CTRL_EN`, `R_AX_PWR_UL_TB_1T`
+/// and `R_AX_PWR_UL_TB_2T` with their 5-bit fields).
+pub const PWR_COEXT_CTRL: u32 = 0xd220;
+pub const PWR_UL_CTRL0: u32 = 0xd240;
+pub const PWR_UL_CTRL2: u32 = 0xd248;
+pub const PWR_UL_TB_CTRL: u32 = 0xd288;
+pub const PWR_UL_TB_CTRL_EN: u32 = 1 << 31;
+pub const PWR_UL_TB_1T: u32 = 0xd28c;
+pub const PWR_UL_TB_1T_MASK: u32 = 0x0000_001f;
+pub const PWR_UL_TB_2T: u32 = 0xd290;
+pub const PWR_UL_TB_2T_MASK: u32 = 0x0000_001f;
