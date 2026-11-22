@@ -28,9 +28,9 @@ use crate::{
 use alloc::{format, string::ToString, vec, vec::Vec};
 use sha2::{Digest, Sha256};
 
-const CUT: u8 = CHIP_CBV;
-const ACV: u8 = 0x2;
-const DEVICE: u16 = 0xb852;
+pub(crate) const CUT: u8 = CHIP_CBV;
+pub(crate) const ACV: u8 = 0x2;
+pub(crate) const DEVICE: u16 = 0xb852;
 
 /// The synthetic container's suits: cut, type, MP and version. For a CBV
 /// rtw89 picks the CE suit of cut 1: not the MP one, not the normal one,
@@ -44,11 +44,16 @@ const SUITS: [(u8, u8, u8, [u8; 4]); 5] = [
 ];
 const PICKED: usize = 2;
 
+/// [`container_of`] the synthetic suits.
+pub(crate) fn container() -> Vec<u8> {
+    container_of(&SUITS)
+}
+
 /// A container as `rtw89_mfw_recognize` reads it: the header, an entry per
 /// suit (cut, type, MP, then the offset and size), and each suit the
 /// download's synthetic image A with its own version and commit.
-fn container() -> Vec<u8> {
-    let images: Vec<Vec<u8>> = SUITS
+pub(crate) fn container_of(suits: &[(u8, u8, u8, [u8; 4])]) -> Vec<u8> {
+    let images: Vec<Vec<u8>> = suits
         .iter()
         .enumerate()
         .map(|(index, &(.., version))| {
@@ -57,11 +62,11 @@ fn container() -> Vec<u8> {
             image
         })
         .collect();
-    let mut bytes = vec![0; 16 + 16 * SUITS.len()];
+    let mut bytes = vec![0; 16 + 16 * suits.len()];
     bytes[0] = 0xff;
-    bytes[1] = SUITS.len() as u8;
+    bytes[1] = suits.len() as u8;
     let mut offset = bytes.len();
-    for (index, (&(cut, kind, mp, _), image)) in SUITS.iter().zip(&images).enumerate() {
+    for (index, (&(cut, kind, mp, _), image)) in suits.iter().zip(&images).enumerate() {
         let at = 16 + 16 * index;
         bytes[at..at + 3].copy_from_slice(&[cut, kind, mp]);
         bytes[at + 4..at + 8].copy_from_slice(&(offset as u32).to_le_bytes());
@@ -75,7 +80,7 @@ fn container() -> Vec<u8> {
 }
 
 /// A USB holding `bytes` as the RTL8852B's image, bound to the chip.
-fn catalog(bytes: Vec<u8>) -> Catalog {
+pub(crate) fn catalog(bytes: Vec<u8>) -> Catalog {
     let profile = Profile::select(observed(DEVICE, CUT)).unwrap();
     let expected_sha256 = Sha256::digest(&bytes).into();
     Catalog::from_handoff(vec![Resource {
@@ -97,7 +102,7 @@ fn catalog(bytes: Vec<u8>) -> Catalog {
 /// The efuse step's synthetic board (MAC 02:00:00:00:00:01, crystal cap
 /// 0x3c, power calibration programmed) with RFE type `rfe`, whose firmware
 /// answers the phycap request with [`PHYCAP_OK`].
-fn board(rfe: u8) -> Case {
+pub(crate) fn board(rfe: u8) -> Case {
     let mut case = Case::blank(CUT);
     let mut logical = synthetic_logical();
     logical[RFE_TYPE] = rfe;

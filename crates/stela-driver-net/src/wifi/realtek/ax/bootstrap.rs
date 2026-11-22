@@ -662,4 +662,4 @@ unsafe fn chip_info_setup<I: Io, C: ConfigSpace + ?Sized>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

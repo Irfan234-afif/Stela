@@ -73,6 +73,8 @@ pub(super) enum Kind {
     MediatekWifi,
     /// A Realtek Wi-Fi function; only RTL8822C attaches.
     RealtekWifi,
+    /// An RTL8852BE, whose stage 1 runs and leaves it cold; no station yet.
+    RealtekAxWifi,
     /// An Intel PCIe Bluetooth function, as `btintel_pcie_table` lists them.
     IntelBluetooth,
     /// A Broadcom PCIe Bluetooth function, as `bcm4377_devid_table` lists
@@ -112,6 +114,11 @@ impl Kind {
             && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
         {
             Some(Self::RealtekWifi)
+        } else if function.vendor == 0x10ec
+            && function.class[..2] == [2, 0x80]
+            && realtek_wifi::identity::RTL8852B_DEVICES.contains(&function.device)
+        {
+            Some(Self::RealtekAxWifi)
         } else if function.vendor == 0x8086 && intel_pcie::DEVICE_IDS.contains(&function.device) {
             Some(Self::IntelBluetooth)
         } else if function.vendor == 0x14e4
@@ -145,6 +152,7 @@ impl Kind {
             Self::IntelWifi => "iwlwifi Wi-Fi (with --wifi)",
             Self::MediatekWifi => "mt7925 Wi-Fi (with --wifi)",
             Self::RealtekWifi => "rtw88 Wi-Fi (with --wifi)",
+            Self::RealtekAxWifi => "rtw89 Wi-Fi (with --wifi)",
             Self::IntelBluetooth => "Intel PCIe Bluetooth",
             Self::Bcm4377 => "bcm4377 Bluetooth",
             Self::Hda => "HD Audio",
@@ -551,37 +559,137 @@ pub(super) unsafe fn mediatek_wifi(
     }
 }
 
-/// Read an RTL8852B's identity before any driver powers it, as
-/// `rtw89_pci_probe` maps BAR2 and `rtw89_chip_info_setup` then reads
-/// SYS_CFG1 in `rtw89_read_chip_ver` before `rtw89_mac_pwr_on`.
-///
-/// The function is claimed and stays unmastered: memory decoding is turned
-/// on, bus mastering, INTx and MSI stay off, and the one MMIO access is the
-/// read of SYS_CFG1. The returned owner keeps the function and its mapping
-/// for the rest of the boot; a failure hands back what it claimed.
-///
-/// # Safety
-/// [`NativeServices`]' contract holds for `services`.
+/// BAR2 of a Realtek Wi-Fi function, where rtw88 and rtw89 find its
+/// registers (`rtw_pci_io_mapping`, `rtw89_pci_setup_mapping`), mapped, with
+/// the identity's configuration words and the MSI capability read: nothing
+/// written.
+struct RealtekWindow {
+    registers: Mapping,
+    base: core::ptr::NonNull<u8>,
+    bytes: usize,
+    bar2_bytes: u64,
+    subsystem_vendor: u16,
+    subsystem_device: u16,
+    pci_revision: u8,
+    msi: Option<crate::bus::pci::Msi>,
+}
+
+/// Map BAR2 of the Realtek Wi-Fi function at `address`, whose BARs are
+/// `bars`, and read its identity. A failure hands back the mapping, when
+/// there is one, for the caller to keep with the function.
 #[expect(
     clippy::result_large_err,
-    reason = "a failed read hands back the owners that must outlive the claim"
+    reason = "a failed mapping or read hands back the mapping that must outlive the function's claim"
 )]
-pub(super) unsafe fn realtek_ax_identity(
+fn realtek_window(
     services: &dyn NativeServices,
     address: Address,
-) -> Result<(realtek_wifi::identity::Unpowered, Box<dyn Any>), Failure> {
-    let Claimed {
-        mut function,
-        domain,
-        bars,
-    } = claim(services, address)?;
+    function: &mut Function<OwnedConfig>,
+    bars: &[Option<Bar>; 6],
+) -> Result<RealtekWindow, (Error, Option<Mapping>)> {
     let bar2_bytes = match bars[2] {
         Some(Bar::Memory { size, .. }) => size,
         _ => 0,
     };
-    let registers = match map(services, address, &bars, 2) {
-        Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+    let registers =
+        map(services, address, bars, 2).map_err(|error| (Error::Native(error), None))?;
+    let (base, bytes) = match registers
+        .bytes()
+        .and_then(|bytes| Ok((registers.address(0, bytes)?, bytes)))
+    {
+        Ok(window) => window,
+        Err(error) => {
+            return Err((Error::Native(ServiceError::Mapping(error)), Some(registers)));
+        }
+    };
+    let read = (|| -> Result<_, Error> {
+        let config = function.config();
+        let identity = (
+            config.read16(0x2c)?,
+            config.read16(0x2e)?,
+            config.read8(0x08)?,
+        );
+        Ok((identity, function.interrupts()?.msi))
+    })();
+    match read {
+        Ok(((subsystem_vendor, subsystem_device, pci_revision), msi)) => Ok(RealtekWindow {
+            registers,
+            base,
+            bytes,
+            bar2_bytes,
+            subsystem_vendor,
+            subsystem_device,
+            pci_revision,
+            msi,
+        }),
+        Err(error) => Err((error, Some(registers))),
+    }
+}
+
+/// What a boot learned of an RTL8852BE: what it read before power-on and
+/// stage 1's outcome, with the owners the device may still reach.
+pub(super) struct RealtekAx {
+    pub(super) unpowered: realtek_wifi::identity::Unpowered,
+    pub(super) outcome: realtek_wifi::ax::attach::Outcome,
+    /// The function, its BAR2 mapping, its requester's preparation or DMA
+    /// attachment, and once stage 1 ran the register interface, rings and
+    /// channel: kept for the rest of the boot, whatever happened.
+    pub(super) kept: Box<dyn Any>,
+}
+
+/// Take an RTL8852BE through stage 1 and leave it cold
+/// (`realtek_wifi::ax::attach`), over its requester's cold preparation, as
+/// the drivers that bus-master do.
+///
+/// Its identity is read first, as `rtw89_pci_probe` maps BAR2 and
+/// `rtw89_chip_info_setup` reads SYS_CFG1 in `rtw89_read_chip_ver` before
+/// `rtw89_mac_pwr_on`: with memory decoding on and bus mastering (sealed),
+/// INTx and MSI off, the read of SYS_CFG1 the one MMIO access. A chip
+/// `attach::admit` refuses, a CAV among them, is left so. An admitted one is
+/// stopped (`attach::quiesce`: its WL MAC off), its quiescence acknowledged
+/// and its requester bound to a domain of its own, which lifts the seal;
+/// then bus mastering is turned on for the rings, stage 1 runs and the chip
+/// is powered off again. It stays polled: MSI is never enabled.
+///
+/// # Safety
+/// [`NativeServices`]' contract holds for `services`, nothing else reaches
+/// the function, and `inputs.pages` is the services' page source.
+#[expect(
+    clippy::result_large_err,
+    reason = "a failed preparation hands back the owners that must outlive it"
+)]
+pub(super) unsafe fn realtek_ax_wifi(
+    services: &dyn NativeServices,
+    address: Address,
+    inputs: realtek_wifi::ax::attach::Inputs<'static>,
+) -> Result<RealtekAx, Failure> {
+    use crate::bus::pci::requester::preparation::BoundRequester;
+    use realtek_wifi::{
+        ax::{
+            attach::{self, Outcome, Refusal},
+            io::NativeIo,
+        },
+        identity::{Observed, Unpowered},
+    };
+    let mut requester = services
+        .prepare_requester(address)
+        .map_err(|error| (Error::Native(error), None))?;
+    let bars = match requester.function_mut().bars() {
+        Ok(bars) => bars,
+        Err(error) => return Err(keep_error(error, requester)),
+    };
+    let RealtekWindow {
+        registers,
+        base,
+        bytes,
+        bar2_bytes,
+        subsystem_vendor,
+        subsystem_device,
+        pci_revision,
+        msi,
+    } = match realtek_window(services, address, requester.function_mut(), &bars) {
+        Ok(window) => window,
+        Err((error, mapping)) => return Err(keep_error(error, (requester, mapping))),
     };
     // The mapping refuses a BAR2 too small to hold SYS_CFG1 here, so the
     // read below cannot leave it.
@@ -590,26 +698,15 @@ pub(super) unsafe fn realtek_ax_identity(
         Err(error) => {
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
+                (requester, registers),
             ));
         }
     };
-    let configured = (|| -> Result<_, Error> {
-        let config = function.config();
-        let identity = (
-            config.read16(0x2c)?,
-            config.read16(0x2e)?,
-            config.read8(0x08)?,
-        );
-        let msi = function.interrupts()?.msi.is_some();
-        function.enable_polled_decode()?;
-        Ok((identity, msi))
-    })();
-    let ((subsystem_vendor, subsystem_device, pci_revision), msi) = match configured {
-        Ok(configured) => configured,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
-    };
-    let observed = realtek_wifi::identity::Observed {
+    if let Err(error) = requester.function_mut().enable_polled_decode() {
+        return Err(keep_error(error, (requester, registers)));
+    }
+    let function = requester.function_mut();
+    let observed = Observed {
         vendor: function.vendor,
         device: function.device,
         subsystem_vendor,
@@ -619,14 +716,76 @@ pub(super) unsafe fn realtek_ax_identity(
         // owned, uncached BAR2 mapping, and memory decoding is on.
         sys_cfg1: unsafe { crate::bus::mmio::Mmio::new(sys_cfg1.as_ptr() as u64, 4) }.read32(0),
     };
-    Ok((
-        realtek_wifi::identity::Unpowered {
-            observed,
-            bar2_bytes,
-            msi,
-        },
-        Box::new((function, domain, registers)),
-    ))
+    let unpowered = Unpowered {
+        observed,
+        bar2_bytes,
+        msi: msi.is_some(),
+    };
+    let refused = |refusal, kept: Box<dyn Any>| RealtekAx {
+        unpowered,
+        outcome: Outcome::Refused(refusal),
+        kept,
+    };
+    if let Err(refusal) = attach::admit(&unpowered, inputs.firmware) {
+        return Ok(refused(refusal, Box::new((requester, registers))));
+    }
+    let owner: Arc<dyn Any> = Arc::new(registers);
+    // SAFETY: `base` is this function's exclusive uncached BAR2 mapping of
+    // `bytes`, which `owner` keeps; nothing else programs the function, and
+    // the clock is the handoff's.
+    let mut io = match unsafe { NativeIo::new(base, bytes, owner.clone(), inputs.clock) } {
+        Ok(io) => io,
+        Err(error) => {
+            return Ok(refused(
+                Refusal::Window(error),
+                Box::new((requester, owner)),
+            ));
+        }
+    };
+    let found = match attach::quiesce(&mut io, observed_cut(&unpowered)) {
+        Ok(found) => found,
+        Err(refusal) => return Ok(refused(refusal, Box::new((requester, owner, io)))),
+    };
+    // SAFETY: the chip's WL MAC, which holds its DMAC and PCIe DMA, reads
+    // off, as `attach::quiesce` left it, and nothing powers it on again before
+    // the binding: no Stela submission, IRQ or worker exists, and bus
+    // mastering stayed off under the seal throughout. BAR2 stays kept.
+    let receipt = unsafe { requester.acknowledge_quiescence() };
+    let BoundRequester {
+        requester,
+        attachment,
+    } = match receipt.finalize() {
+        Ok(bound) => bound,
+        Err(failure) => {
+            return Err((
+                Error::Preparation(failure.error),
+                Some(Box::new((failure, owner, io))),
+            ));
+        }
+    };
+    let domain = attachment.domain();
+    let mut function = requester.into_function();
+    // Stage 1's rings need bus mastering, which the binding now allows.
+    if let Err(error) = function.enable_polled() {
+        return Err(keep_error(error, (function, attachment, owner, io)));
+    }
+    // SAFETY: the function is stopped and bound to its own domain, with
+    // memory decoding and bus mastering on and MSI and INTx off; `owner`
+    // keeps BAR2, and the function, attachment, rings and channel stay kept
+    // below for the rest of the boot.
+    let (outcome, kept) =
+        unsafe { attach::run(io, function.config(), domain, observed, found, &inputs) };
+    Ok(RealtekAx {
+        unpowered,
+        outcome,
+        kept: Box::new((function, attachment, owner, kept)),
+    })
+}
+
+/// The cut SYS_CFG1 named before power-on; [`attach::admit`] refused a read
+/// that named none.
+fn observed_cut(unpowered: &realtek_wifi::identity::Unpowered) -> u8 {
+    unpowered.cut().unwrap_or_default()
 }
 
 /// An RTL8822C station on its hardware.
@@ -651,46 +810,35 @@ pub(super) unsafe fn realtek_wifi(
         domain,
         bars,
     } = claim(services, address)?;
-    let registers = match map(services, address, &bars, 2) {
-        Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
-    };
-    let (base, bytes) = match registers
-        .bytes()
-        .and_then(|bytes| Ok((registers.address(0, bytes)?, bytes)))
-    {
+    let RealtekWindow {
+        registers,
+        base,
+        bytes,
+        subsystem_vendor,
+        subsystem_device,
+        pci_revision,
+        msi,
+        ..
+    } = match realtek_window(services, address, &mut function, &bars) {
         Ok(window) => window,
-        Err(error) => {
-            return Err(keep_error(
-                Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
-            ));
-        }
+        Err((error, mapping)) => return Err(keep_error(error, (function, domain, mapping))),
     };
     let configured = (|| -> Result<_, Error> {
         let link_control = crate::bus::pci::link_control_word(&function)?;
-        let config = function.config();
-        let identity = (
-            config.read16(0x2c)?,
-            config.read16(0x2e)?,
-            config.read8(0x08)?,
-        );
-        let interrupt = function.interrupts()?.msi;
         function.enable_polled()?;
-        let vector = match (completion, interrupt) {
+        let vector = match (completion, msi) {
             (Some(message), Some(msi)) => {
                 function.enable_msi(msi, message)?;
                 true
             }
             _ => false,
         };
-        Ok((link_control, identity, vector))
+        Ok((link_control, vector))
     })();
-    let (link_control, (subsystem_vendor, subsystem_device, pci_revision), vector) =
-        match configured {
-            Ok(configured) => configured,
-            Err(error) => return Err(keep_error(error, (function, domain, registers))),
-        };
+    let (link_control, vector) = match configured {
+        Ok(configured) => configured,
+        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+    };
     inputs.link_control = link_control;
     inputs.vector = vector;
     let observed = realtek_wifi::identity::Observed {

@@ -1,46 +1,36 @@
 //! The Wi-Fi check (`--wifi-check`), once the host's devices have started:
-//! a line for each RTL8852B the probe read (`stela_boot_core::wifi_check`),
-//! then the verdict, and the boot stops before the guest's storage is
-//! opened. The options that select the check also restart the PC at the
-//! stop (`stop::restart_at_stop`), so the log is stored and the PC returns
-//! to its own boot order.
+//! a line for each stage every RTL8852B reached in the probe
+//! (`stela_boot_core::wifi_check`), then the verdict, and the boot stops
+//! before the guest's storage is opened. The options that select the check
+//! also restart the PC at the stop (`stop::restart_at_stop`), so the log is
+//! stored and the PC returns to its own boot order.
 use crate::output;
-use alloc::{format, string::String, vec::Vec};
+use alloc::vec::Vec;
 use stela_boot_core::wifi_check::{self, Reached, Verdict};
-use stela_drivers::{bus::pci::Address, net::wifi::realtek::identity};
+use stela_drivers::{net::wifi::realtek::identity, probe::Rtl8852b};
 
-/// What the probe read of each RTL8852B before power-on, or why it did not.
-pub(super) type Identities = Vec<(
-    Address,
-    core::result::Result<identity::Unpowered, stela_drivers::probe::Error>,
-)>;
-
-/// Report `identities` and stop: passed when every function reached the
-/// stage this image drives, failed naming why otherwise.
-pub(super) fn check(identities: &Identities) -> ! {
-    let failures: Vec<String> = identities
+/// Report `chips` and stop: passed when every function reached the stage
+/// this image drives, failed naming why otherwise.
+pub(super) fn check(chips: &[Rtl8852b]) -> ! {
+    let summaries: Vec<_> = chips
         .iter()
-        .map(|(_, read)| match read {
-            Ok(_) => String::new(),
-            Err(error) => format!("{error}"),
-        })
+        .map(|chip| chip.outcome.as_ref().map(|outcome| outcome.summary()))
         .collect();
-    let report = wifi_check::report(identities.iter().zip(&failures).map(
-        |((address, read), failure)| {
-            let reached = match read {
-                Err(_) => Reached::NotRead(failure),
-                Ok(read) => match read.cut() {
-                    Some(cut) => Reached::Cut {
-                        sys_cfg1: read.observed.sys_cfg1,
-                        cut,
-                        name: identity::rtw89_cut_name(cut),
-                    },
-                    None => Reached::NotRead("the function did not answer the read of SYS_CFG1"),
+    let report = wifi_check::report(chips.iter().zip(&summaries).map(|(chip, summary)| {
+        let reached = match &chip.identity {
+            Err(why) => Reached::NotRead(why),
+            Ok(read) => match read.cut() {
+                Some(cut) => Reached::Cut {
+                    sys_cfg1: read.observed.sys_cfg1,
+                    cut,
+                    name: identity::rtw89_cut_name(cut),
+                    stage1: summary.as_ref(),
                 },
-            };
-            (address, reached)
-        },
-    ));
+                None => Reached::NotRead("the function did not answer the read of SYS_CFG1"),
+            },
+        };
+        (chip.address, reached)
+    }));
     for line in &report.lines {
         output::arguments(format_args!("{line}\n"));
     }

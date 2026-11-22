@@ -161,7 +161,7 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
     // storage is opened yet.
     #[cfg(feature = "diagnostics")]
     if options.wifi_check {
-        wifi_check::check(&host.devices.wifi_identities);
+        wifi_check::check(&host.devices.rtl8852b);
     }
     let storage = open_storage(handoff, &options, &mut host);
     // A single-user boot is a console, which draws through no GPU; without
@@ -3126,16 +3126,10 @@ struct HostDevices {
     guest_network: Option<network::GuestNetwork>,
     host_disks: storage::HostDisks,
     fdr: Option<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
-    /// What the probe read of each RTL8852B before power-on, which the
-    /// Wi-Fi check reports.
+    /// Each RTL8852B the probe took through stage 1, which the Wi-Fi check
+    /// reports.
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-    wifi_identities: Vec<(
-        stela_drivers::bus::pci::Address,
-        core::result::Result<
-            stela_drivers::net::wifi::realtek::identity::Unpowered,
-            stela_drivers::probe::Error,
-        >,
-    )>,
+    rtl8852b: Vec<stela_drivers::probe::Rtl8852b>,
 }
 
 /// Probe the host's devices once, with the native services when the
@@ -3160,7 +3154,7 @@ fn start_devices(
     let mut fdr_device = None;
     let mut host_usb = None;
     let mut host_bluetooth: Option<bluetooth::HostBluetooth> = None;
-    let mut wifi_identities = Vec::new();
+    let mut rtl8852b = Vec::new();
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -3313,7 +3307,7 @@ fn start_devices(
                 usb_disks,
                 disks,
                 power,
-                wifi_identities: identities,
+                rtl8852b: identities,
             } = opened
                 .unwrap_or_else(|error| output::fatal(error))
                 .unwrap_or_else(|refused| {
@@ -3329,7 +3323,7 @@ fn start_devices(
             if let Some(acpi) = host_acpi {
                 acpi.retain_power(power);
             }
-            wifi_identities = identities;
+            rtl8852b = identities;
             // The disks' step ends with what it found before the GPU's
             // begins, which would end it without.
             let count = |count: usize, one: &str, many: &str| {
@@ -3526,6 +3520,6 @@ fn start_devices(
         guest_network,
         host_disks,
         fdr: fdr_device,
-        wifi_identities,
+        rtl8852b,
     }
 }

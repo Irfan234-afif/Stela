@@ -32,7 +32,7 @@ pub const CR_BASE: u32 = 0x1_0000;
 /// `rtw8852b_chip_info.rf_base_addr`, one per RF path (`rf_path_num` is 2).
 pub const RF_BASE: [u32; 2] = [0xe000, 0xf000];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Error {
     /// A BAR mapping smaller than [`BAR_BYTES`] or not 4-byte aligned.
     Window { bytes: usize },
@@ -44,6 +44,25 @@ pub enum Error {
     Timeout { register: u32, mask: u32 },
     /// An RF path the chip does not have.
     RfPath(u8),
+}
+
+/// As derived, with registers, masks and sizes in hex, as rtw89 and the
+/// register map name them: every error that wraps this one prints it so.
+impl core::fmt::Debug for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Window { bytes } => write!(f, "Window {{ bytes: {bytes:#x} }}"),
+            Self::InvalidClock => f.write_str("InvalidClock"),
+            Self::Register { register } => write!(f, "Register {{ register: {register:#06x} }}"),
+            Self::Timeout { register, mask } => {
+                write!(
+                    f,
+                    "Timeout {{ register: {register:#06x}, mask: {mask:#010x} }}"
+                )
+            }
+            Self::RfPath(path) => write!(f, "RfPath({path})"),
+        }
+    }
 }
 
 /// Exact register access to one RTL8852B.

@@ -2150,14 +2150,22 @@ pub unsafe fn open(
             "HOST PCI bridge {address} had bus mastering off: turned on for the devices below it\n"
         ));
     }
-    for (address, read) in &devices.wifi_identities {
-        match read {
+    // Each RTL8852B: what was read before power-on, then how far stage 1
+    // took it, line by line (`ax::attach::Outcome::lines`).
+    for chip in &devices.rtl8852b {
+        let address = chip.address;
+        match &chip.identity {
             Ok(read) => {
                 output::arguments(format_args!("HOST WIFI IDENTITY pci={address} {read}\n"))
             }
             Err(error) => output::arguments(format_args!(
                 "HOST WIFI IDENTITY pci={address} not read: {error}\n"
             )),
+        }
+        if let Some(outcome) = &chip.outcome {
+            for line in outcome.lines() {
+                output::arguments(format_args!("HOST WIFI RTL8852B pci={address} {line}\n"));
+            }
         }
     }
     for (address, class, why) in &devices.unsupported {
@@ -2403,7 +2411,7 @@ pub unsafe fn open(
         usb_disks,
         disks: host_disks,
         power: core::mem::take(&mut devices.power),
-        wifi_identities: core::mem::take(&mut devices.wifi_identities),
+        rtl8852b: core::mem::take(&mut devices.rtl8852b),
     })
 }
 
@@ -2757,15 +2765,9 @@ pub struct Opened {
     pub usb_disks: alloc::vec::Vec<Box<dyn BlockDevice>>,
     /// Every disk taken above, for its shutdown notice.
     pub disks: HostDisks,
-    /// What the probe read of each RTL8852B before power-on, for the Wi-Fi
-    /// check (`probe::Devices::wifi_identities`).
-    pub wifi_identities: alloc::vec::Vec<(
-        Address,
-        core::result::Result<
-            stela_drivers::net::wifi::realtek::identity::Unpowered,
-            stela_drivers::probe::Error,
-        >,
-    )>,
+    /// Each RTL8852B the probe took through stage 1, for the Wi-Fi check
+    /// (`probe::Devices::rtl8852b`).
+    pub rtl8852b: alloc::vec::Vec<stela_drivers::probe::Rtl8852b>,
 }
 
 /// The host's input devices and the loader root their registers and DMA

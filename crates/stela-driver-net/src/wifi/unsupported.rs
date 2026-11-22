@@ -41,15 +41,13 @@ pub fn reason(vendor: u16, device: u16) -> Option<&'static str> {
         (0x14c3, 0x7603 | 0x7602 | 0x7612 | 0x7662 | 0x7610 | 0x7630 | 0x7650) => {
             "MediaTek MT76x0, MT76x2 or MT7603 (Linux mt76): no driver here"
         }
-        // rtw88 and rtw89. Only RTL8822C runs a station here.
+        // rtw88 and rtw89. Only RTL8822C runs a station here; RTL8852BE's
+        // stage 1 runs with --wifi (`realtek::ax::attach`).
         (0x10ec, 0xb822) => "Realtek RTL8822BE (Linux rtw88_8822be): no driver here",
         (0x10ec, 0xb821 | 0xc821) => "Realtek RTL8821CE (Linux rtw88_8821ce): no driver here",
         (0x10ec, 0xd723) => "Realtek RTL8723DE (Linux rtw88_8723de): no driver here",
         (0x10ec, 0x8813) => "Realtek RTL8814AE (Linux rtw88_8814ae): no driver here",
         (0x10ec, 0x8852 | 0xa85a) => "Realtek RTL8852AE (Linux rtw89_8852ae): no driver here",
-        (0x10ec, 0xb852 | 0xb85b) => {
-            "Realtek RTL8852BE (Linux rtw89_8852be): firmware is parsed but no station driver here"
-        }
         (0x10ec, 0xb520) => "Realtek RTL8852BE-VT (Linux rtw89_8852bte): no driver here",
         (0x10ec, 0xc852) => "Realtek RTL8852CE (Linux rtw89_8852ce): no driver here",
         (0x10ec, 0xb851) => "Realtek RTL8851BE (Linux rtw89_8851be): no driver here",
@@ -156,13 +154,16 @@ mod tests {
 
     #[test]
     fn chips_a_driver_here_runs_have_no_reason_and_others_name_the_linux_driver() {
-        // MT7925, RTL8822CE, and an Intel device the Intel driver lists,
-        // which reports its own radio and step.
+        // MT7925, RTL8822CE, RTL8852BE, whose stage 1 a driver here runs
+        // and reports, and an Intel device the Intel driver lists, which
+        // reports its own radio and step.
         for (vendor, device) in [
             (0x14c3, 0x7925),
             (0x14c3, 0x0717),
             (0x10ec, 0xc822),
             (0x10ec, 0xc82f),
+            (0x10ec, 0xb852),
+            (0x10ec, 0xb85b),
             (0x8086, 0x2725),
             (0x8086, 0x51f0),
             (0x8086, 0x272b),
@@ -180,7 +181,7 @@ mod tests {
             (0x14c3, 0x7961, "mt7921e"),
             (0x0b48, 0x7922, "mt7921e"),
             (0x14c3, 0x7990, "mt7996e"),
-            (0x10ec, 0xb852, "rtw89_8852be"),
+            (0x10ec, 0xb520, "rtw89_8852bte"),
             (0x10ec, 0xc821, "rtw88_8821ce"),
             (0x17cb, 0x1103, "ath11k_pci"),
             (0x17cb, 0x1109, "ath12k"),

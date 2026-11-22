@@ -75,6 +75,9 @@ pub enum Error {
     IntelWifi(net::wifi::intel::attach::AttachError),
     MediatekWifi(net::wifi::mediatek::attach::AttachError),
     RealtekWifi(net::wifi::realtek::attach::AttachError),
+    /// An RTL8852BE's stage 1 stopped, or the chip was left off, or its
+    /// power-off failed ([`net::wifi::realtek::ax::attach::Outcome::no_station`]).
+    RealtekAxWifi(net::wifi::realtek::ax::attach::NoStation),
     IntelBluetooth(crate::bluetooth::intel_pcie::Error),
     Bcm4377(crate::bluetooth::bcm4377::Error),
     Ehci(usb::ehci::Error),
@@ -108,6 +111,7 @@ impl fmt::Display for Error {
             Self::IntelWifi(error) => write!(f, "iwlwifi: {error}"),
             Self::MediatekWifi(error) => write!(f, "mt76: {error}"),
             Self::RealtekWifi(error) => write!(f, "rtw88: {error}"),
+            Self::RealtekAxWifi(error) => write!(f, "rtw89: {error}"),
             Self::IntelBluetooth(error) => write!(f, "btintel_pcie: {error}"),
             Self::Bcm4377(error) => write!(f, "hci_bcm4377: {error}"),
             Self::Ehci(error) => write!(f, "EHCI: {error}"),
@@ -889,13 +893,10 @@ pub struct Devices {
     /// Storage, network, audio and USB functions no driver here takes, with
     /// their class and why.
     pub unsupported: Vec<(Address, [u8; 3], &'static str)>,
-    /// RTL8852B functions a boot given a `--wifi` network read before any
-    /// driver powered them ([`native::realtek_ax_identity`]), or why the read
-    /// failed. Each is also in [`Self::unsupported`].
-    pub wifi_identities: Vec<(
-        Address,
-        Result<crate::net::wifi::realtek::identity::Unpowered, Error>,
-    )>,
+    /// The RTL8852B functions a boot given a `--wifi` network took through
+    /// stage 1: each is also in [`Self::unsupported`] (stage 1 reached the
+    /// efuse and the chip is off again) or [`Self::failures`].
+    pub rtl8852b: Vec<Rtl8852b>,
     /// PCI bridges found with bus mastering off, which the scan turned on
     /// so the functions below them reach memory and the interrupt
     /// controllers.
@@ -904,6 +905,18 @@ pub struct Devices {
     /// ended at once, the driver gave up, and the function was left with
     /// bus mastering and interrupts off where the probe still held it.
     pub abandoned: Vec<(Address, budget::Expiry)>,
+}
+
+/// What a boot given a `--wifi` network learned of one RTL8852B function
+/// ([`native::realtek_ax_wifi`]): what it read before any driver powered
+/// it, then how far stage 1 took it.
+pub struct Rtl8852b {
+    pub address: Address,
+    /// SYS_CFG1 and the rest read before power-on, or why the function was
+    /// not read, as its failure says.
+    pub identity: Result<crate::net::wifi::realtek::identity::Unpowered, String>,
+    /// Stage 1's outcome, once the identity was read.
+    pub outcome: Option<crate::net::wifi::realtek::ax::attach::Outcome>,
 }
 
 /// The longest one PCI function's start may take. Linux's own per-step
@@ -1070,7 +1083,10 @@ impl Devices {
             // The r8169 Ethernet driver's; a Realtek card reader fails as a
             // device.
             Error::Realtek(_) | Error::Tg3(_) | Error::Aqtion(_) | Error::Pch(_) => "network",
-            Error::IntelWifi(_) | Error::MediatekWifi(_) | Error::RealtekWifi(_) => "Wi-Fi",
+            Error::IntelWifi(_)
+            | Error::MediatekWifi(_)
+            | Error::RealtekWifi(_)
+            | Error::RealtekAxWifi(_) => "Wi-Fi",
             Error::IntelBluetooth(_) | Error::Bcm4377(_) => "Bluetooth",
             Error::Sfh(_) | Error::SfhCold(_) | Error::Ish(_) | Error::IshCold(_) => "sensors",
             Error::Ehci(_) => "USB",
@@ -1287,6 +1303,7 @@ fn plain(error: &Error) -> impl fmt::Display + '_ {
                 Error::IntelWifi(error) => error.fmt(f),
                 Error::MediatekWifi(error) => error.fmt(f),
                 Error::RealtekWifi(error) => error.fmt(f),
+                Error::RealtekAxWifi(error) => error.fmt(f),
                 error => error.fmt(f),
             }
         }
@@ -1515,6 +1532,30 @@ unsafe fn realtek_wifi(
     };
     // SAFETY: forwarded from the caller.
     unsafe { native::realtek_wifi(services, address, completion, inputs) }
+}
+
+/// Take the RTL8852BE at `address` through stage 1 and leave it cold. Stage
+/// 1 transmits nothing: the firmware goes over PCIe and the radio is never
+/// enabled, so unlike a station it needs no regulatory database.
+///
+/// # Safety
+/// As for [`intel_wifi`].
+#[allow(
+    clippy::result_large_err,
+    reason = "a failed attach hands back the owners that must outlive the device"
+)]
+unsafe fn realtek_ax_wifi(
+    services: &dyn NativeServices,
+    address: Address,
+    wifi: &WifiInputs<'_>,
+) -> Result<native::RealtekAx, native::Failure> {
+    let inputs = net::wifi::realtek::ax::attach::Inputs {
+        firmware: wifi.firmware,
+        pages: services.pages(),
+        clock: wifi.clock,
+    };
+    // SAFETY: forwarded from the caller.
+    unsafe { native::realtek_ax_wifi(services, address, inputs) }
 }
 
 /// Attach the Broadcom PCIe Bluetooth function at `address` with its
@@ -1850,30 +1891,10 @@ pub unsafe fn probe_observed(
             }
             if function.class[..2] == [2, 0x80] {
                 // A chip Linux drives and no driver here does is named once,
-                // with its Linux driver, and left unpowered. An RTL8852B given
-                // a network has its SYS_CFG1 read first, which powers nothing.
+                // with its Linux driver, and left unpowered.
                 if let Some(why) =
                     crate::net::wifi::unsupported::reason(function.vendor, function.device)
                 {
-                    if let (Some(_), Some(services)) = (wifi, services)
-                        && function.vendor == 0x10ec
-                        && crate::net::wifi::realtek::identity::RTL8852B_DEVICES
-                            .contains(&function.device)
-                    {
-                        // SAFETY: the caller grants `services`' contract, and
-                        // this loop leaves `function` alone once it is claimed.
-                        let read = match unsafe { native::realtek_ax_identity(services, address) } {
-                            Ok((read, owner)) => {
-                                devices.owners.push(owner);
-                                Ok(read)
-                            }
-                            Err((error, kept)) => {
-                                devices.owners.extend(kept);
-                                Err(error)
-                            }
-                        };
-                        devices.wifi_identities.push((address, read));
-                    }
                     devices.unsupported.push((address, function.class, why));
                     continue;
                 }
@@ -1884,6 +1905,7 @@ pub unsafe fn probe_observed(
                             native::Kind::IntelWifi
                                 | native::Kind::MediatekWifi
                                 | native::Kind::RealtekWifi
+                                | native::Kind::RealtekAxWifi
                         )
                     )
                 {
@@ -2759,6 +2781,43 @@ unsafe fn attach_native(
             }
             return;
         }
+        native::Kind::RealtekAxWifi => {
+            let Some(wifi) = inputs.wifi else {
+                devices
+                    .unsupported
+                    .push((address, function.class, NO_WIFI_NETWORK));
+                return;
+            };
+            // SAFETY: as for tg3 below.
+            match unsafe { realtek_ax_wifi(services, address, wifi) } {
+                Ok(found) => {
+                    match found.outcome.no_station() {
+                        None => devices.unsupported.push((
+                            address,
+                            function.class,
+                            net::wifi::realtek::ax::attach::NO_STATION,
+                        )),
+                        Some(why) => devices.failures.push((address, Error::RealtekAxWifi(why))),
+                    }
+                    devices.owners.push(found.kept);
+                    devices.rtl8852b.push(Rtl8852b {
+                        address,
+                        identity: Ok(found.unpowered),
+                        outcome: Some(found.outcome),
+                    });
+                }
+                Err((error, kept)) => {
+                    devices.rtl8852b.push(Rtl8852b {
+                        address,
+                        identity: Err(alloc::format!("{error}")),
+                        outcome: None,
+                    });
+                    devices.failures.push((address, error));
+                    devices.owners.extend(kept);
+                }
+            }
+            return;
+        }
         native::Kind::Vmd => {
             let snapshot = crate::firmware::smbios::load(inputs.firmware).ok();
             let platform = snapshot
@@ -3370,6 +3429,19 @@ mod tests {
                 identity(0x05, 0, 0x1106, 0x0571, 0x01_01_80),
                 "unsupported: IDE storage controller",
             ),
+            // An RTL8852BE's stage 1; its RTL8852BE-VT sibling has no driver.
+            (
+                identity(0x03, 0, 0x10ec, 0xb852, 0x02_80_00),
+                "rtw89 Wi-Fi (with --wifi)",
+            ),
+            (
+                identity(0x03, 0, 0x10ec, 0xb85b, 0x02_80_00),
+                "rtw89 Wi-Fi (with --wifi)",
+            ),
+            (
+                identity(0x03, 0, 0x10ec, 0xb520, 0x02_80_00),
+                "unsupported: Realtek RTL8852BE-VT (Linux rtw89_8852bte): no driver here",
+            ),
         ] {
             assert_eq!(
                 plan(&function, &displays),
@@ -3938,10 +4010,11 @@ mod tests {
         );
     }
 
-    /// An RTL8852BE is read before power-on only when the boot has a
-    /// network, and stays unsupported either way.
+    /// An RTL8852BE is claimed for stage 1 only when the boot has a network:
+    /// without one it stays off, untouched; with one, a preparation the
+    /// mount refuses is its failure, and its record says it was not read.
     #[test]
-    fn an_rtl8852be_is_read_only_with_a_network_and_stays_unsupported() {
+    fn an_rtl8852be_is_claimed_for_stage_1_only_with_a_network() {
         let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
         let page = &mut ecam[..4096 / 4];
         page.fill(0);
@@ -3991,24 +4064,33 @@ mod tests {
                     wifi,
                 )
             };
-            assert!(
-                devices
-                    .unsupported
-                    .iter()
-                    .any(|&(at, _, why)| at == address && why.contains("RTL8852BE")),
-                "{:?}",
-                devices.unsupported
-            );
-            assert!(devices.failures.iter().all(|(at, _)| *at != address));
             let requested = services.requests.borrow().contains(&address);
+            let unsupported = devices
+                .unsupported
+                .iter()
+                .find(|&&(at, ..)| at == address)
+                .map(|&(_, _, why)| why);
+            let failed = devices.failures.iter().find(|(at, _)| *at == address);
             if wifi.is_none() {
-                assert!(devices.wifi_identities.is_empty());
+                assert_eq!(unsupported, Some(NO_WIFI_NETWORK));
+                assert!(failed.is_none());
+                assert!(devices.rtl8852b.is_empty());
                 assert!(!requested);
             } else {
                 assert!(requested);
+                assert_eq!(unsupported, None);
+                assert!(
+                    matches!(failed, Some((_, Error::Native(_)))),
+                    "{:?}",
+                    devices.failures
+                );
                 assert!(matches!(
-                    devices.wifi_identities.as_slice(),
-                    [(at, Err(Error::Native(_)))] if *at == address
+                    devices.rtl8852b.as_slice(),
+                    [Rtl8852b {
+                        address: at,
+                        identity: Err(_),
+                        outcome: None,
+                    }] if *at == address
                 ));
             }
         }
@@ -4191,7 +4273,78 @@ mod tests {
                 None
             ))
         ));
+        // SAFETY: as above.
+        let result = unsafe {
+            realtek_wifi(
+                &services,
+                address,
+                None,
+                &WifiInputs {
+                    clock: handoff.clock,
+                    observations: Default::default(),
+                    firmware,
+                    network: &network,
+                },
+                &None,
+            )
+        };
+        assert!(matches!(
+            result,
+            Err((
+                Error::RealtekWifi(net::wifi::realtek::attach::AttachError::NoRegulatoryDatabase),
+                None
+            ))
+        ));
         assert!(services.requests.borrow().is_empty());
+    }
+
+    /// An RTL8852BE's stage 1 transmits nothing, so it goes ahead without
+    /// regulatory data: only the mount's refusal stops it here.
+    #[test]
+    fn an_rtl8852be_stage_1_needs_no_regulatory_data() {
+        let services = services::tests::Refusing::default();
+        let handoff = Handoff {
+            ecam: Vec::new(),
+            mapped: Vec::new(),
+            dma: 0..0,
+            clock: crate::Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+            network: None,
+        };
+        let network = Network {
+            ssid: b"test".to_vec(),
+            secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
+            country: None,
+        };
+        let address = Address {
+            segment: 0,
+            bus: 3,
+            device: 0,
+            function: 0,
+        };
+        // SAFETY: the refusing services cannot grant hardware access.
+        let result = unsafe {
+            realtek_ax_wifi(
+                &services,
+                address,
+                &WifiInputs {
+                    clock: handoff.clock,
+                    observations: Default::default(),
+                    firmware: handoff_provider(&handoff),
+                    network: &network,
+                },
+            )
+        };
+        assert!(matches!(
+            result,
+            Err((Error::Native(ServiceError::Unavailable), None))
+        ));
+        // It asked for the function's cold preparation, as a driver that
+        // bus-masters does.
+        assert_eq!(*services.preparations.borrow(), [address]);
     }
 
     #[test]
