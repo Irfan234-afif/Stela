@@ -86,3 +86,124 @@ fn a_joined_station_s_address_cam_entry_is_rtw89_s() {
     assert_eq!(field(w13, ADDR_CAM_W13_BSSID_BSS_COLOR), 0x2b);
     assert_eq!(h2c[54..60], AP);
 }
+
+#[test]
+fn ccmp_keys_take_rtw89_s_slots_and_tkip_and_the_igtk_stay_out() {
+    let (mut io, mut h2c, mut cams, mut link, peer) = joined();
+    let ptk = [0x11; 16];
+    let pairwise = Key {
+        cipher: Cipher::Ccmp128,
+        pairwise: true,
+        keyidx: 0,
+        material: &ptk,
+    };
+    let entry = write_key(
+        &mut io,
+        &mut h2c,
+        &mut cams,
+        &mut link,
+        Some(&peer),
+        &pairwise,
+    )
+    .unwrap();
+    assert_eq!(entry, 0);
+    // The security CAM H2C asks REC_ACK and carries the key as it is;
+    // then the address CAM names the entry in slot 0.
+    assert_eq!(
+        h2c.functions(),
+        [
+            (H2C_CL_MAC_SEC_CAM, H2C_FUNC_MAC_SEC_UPD),
+            (H2C_CL_MAC_ADDR_CAM_UPDATE, H2C_FUNC_MAC_ADDR_CAM_UPD),
+        ]
+    );
+    let (header, cmd) = &h2c.sent[0];
+    assert!(header.rec_ack() && !header.done_ack());
+    assert_eq!(word(cmd, 0), u32::from(SEC_CAM_LEN) << 16);
+    assert_eq!(word(cmd, 1), SEC_KEY_TYPE_CCMP128.into());
+    assert_eq!(cmd[8..24], ptk);
+    assert_eq!(
+        field(word(&h2c.sent[1].1, 10), ADDR_CAM_W10_SEC_ENT_VALID),
+        1
+    );
+
+    // A group key in slot 2, its key ID beside it.
+    let gtk = [0x22; 16];
+    let group = Key {
+        cipher: Cipher::Ccmp128,
+        pairwise: false,
+        keyidx: 1,
+        material: &gtk,
+    };
+    let group_entry = write_key(&mut io, &mut h2c, &mut cams, &mut link, None, &group).unwrap();
+    assert_eq!(group_entry, 1);
+    assert_eq!(link.addr_cam.sec_cam_map, 0b101);
+    assert_eq!(link.addr_cam.sec_ent[2], 1);
+    assert_eq!(link.addr_cam.sec_ent_keyid[2], 1);
+    assert_eq!(cams.find_key(false, 1), Some(1));
+    assert_eq!(cams.find_key(true, 0), Some(0));
+
+    // TKIP, the IGTK and a short key are refused without an H2C or an
+    // entry.
+    h2c.sent.clear();
+    let tkip = [0x33; 32];
+    for (cipher, material) in [
+        (Cipher::Tkip, &tkip[..]),
+        (Cipher::AesCmac, &gtk[..]),
+        (Cipher::Other, &gtk[..]),
+        (Cipher::Ccmp128, &gtk[..15]),
+    ] {
+        let refused = Key {
+            cipher,
+            pairwise: false,
+            keyidx: 2,
+            material,
+        };
+        let result = write_key(&mut io, &mut h2c, &mut cams, &mut link, None, &refused);
+        assert!(
+            matches!(result, Err(Error::Unsupported(_) | Error::Invalid(_))),
+            "{cipher:?}: {result:?}"
+        );
+    }
+    assert!(h2c.sent.is_empty());
+    assert_eq!(cams.sec_cam_map, 0b11);
+
+    // Clearing the group key frees its slot and its entry.
+    clear_key(&mut io, &mut h2c, &mut cams, &mut link, None, group_entry).unwrap();
+    assert_eq!(link.addr_cam.sec_cam_map, 0b1);
+    assert_eq!(cams.sec_cam_map, 0b1);
+    assert_eq!(cams.find_key(false, 1), None);
+    assert_eq!(
+        clear_key(&mut io, &mut h2c, &mut cams, &mut link, None, group_entry),
+        Err(Error::Invalid("security CAM entry"))
+    );
+}
+
+#[test]
+fn key_slots_fill_as_rtw89_s_normal_mode_fills_them() {
+    let mut addr_cam = AddrCamEntry {
+        sec_ent_mode: ADDR_CAM_SEC_NORMAL,
+        ..AddrCamEntry::default()
+    };
+    let ccmp = SEC_KEY_TYPE_CCMP128;
+    assert_eq!(addr_cam_key_idx(&addr_cam, ccmp, true), Ok(0));
+    addr_cam.sec_cam_map = 0b11;
+    assert_eq!(
+        addr_cam_key_idx(&addr_cam, ccmp, true),
+        Err(Error::CamFull("address CAM key slots"))
+    );
+    assert_eq!(addr_cam_key_idx(&addr_cam, ccmp, false), Ok(2));
+    addr_cam.sec_cam_map = 0b1_1111;
+    assert!(addr_cam_key_idx(&addr_cam, ccmp, false).is_err());
+    assert_eq!(
+        addr_cam_key_idx(&addr_cam, SEC_KEY_TYPE_BIP_CCMP128, false),
+        Ok(5)
+    );
+    addr_cam.sec_ent_mode = ADDR_CAM_SEC_4GROUP;
+    assert_eq!(addr_cam_key_idx(&addr_cam, ccmp, false), Ok(5));
+    assert_eq!(
+        addr_cam_key_idx(&addr_cam, SEC_KEY_TYPE_BIP_CCMP128, false),
+        Ok(6)
+    );
+    addr_cam.sec_ent_mode = ADDR_CAM_SEC_NONE;
+    assert!(addr_cam_key_idx(&addr_cam, ccmp, true).is_err());
+}

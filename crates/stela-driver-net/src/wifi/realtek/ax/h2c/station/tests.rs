@@ -2,7 +2,7 @@ extern crate std;
 
 use super::*;
 use crate::wifi::realtek::ax::{
-    cam,
+    cam::{self, Cipher, Key},
     h2c::{Function, Header, Sequence},
     io::field,
     registers::{
@@ -165,9 +165,10 @@ fn he(phy6: u8, phy9: u8, hdr: u8, seed: u8) -> HeCap {
 fn errno(result: Result<(), Error>) -> u32 {
     let code: i32 = match result {
         Ok(()) => 0,
-        Err(Error::Port(_)) => -22,
+        Err(Error::Port(_) | Error::Invalid(_)) => -22,
         Err(Error::CmacOff { .. }) => -14,
         Err(Error::CamFull(_)) => -16,
+        Err(Error::Unsupported(_)) => -95,
         Err(Error::H2c(H2cError::NoResource)) => -28,
         Err(error) => panic!("{error:?}"),
     };
@@ -177,6 +178,19 @@ fn errno(result: Result<(), Error>) -> u32 {
 fn step(io: &mut Model, id: u32, result: Result<(), Error>) {
     let code = errno(result);
     io.mark(50, id, code);
+}
+
+fn key(cipher: Cipher, pairwise: bool, keyidx: u8, material: &[u8]) -> Key<'_> {
+    Key {
+        cipher,
+        pairwise,
+        keyidx,
+        material,
+    }
+}
+
+fn material(seed: u8) -> [u8; 16] {
+    core::array::from_fn(|i| seed + i as u8)
 }
 
 /// `rtw89_core_sta_link_assoc` after its H2C: the stubs' marks, which on
@@ -193,6 +207,23 @@ fn assoc(io: &mut Model, h2c: &mut Recorder, link: &mut Link, peer: &Peer, id: u
     step(io, id, result);
     let result = bss_assoc(io, link);
     step(io, id + 1, result);
+}
+
+/// A key written, its return and its entry (rtw89's `hw_key_idx`, which
+/// keeps the entry it was given when the key failed).
+fn add(world: &mut World, peer: Option<&Peer>, id: u32, key: &Key<'_>) -> u8 {
+    let World {
+        io,
+        h2c,
+        cams,
+        link,
+    } = world;
+    let taken = cams.sec_cam_map.trailing_ones() as u8;
+    let result = cam::write_key(io, h2c, cams, link, peer, key);
+    let index = *result.as_ref().unwrap_or(&taken);
+    step(io, id, result.map(|_| ()));
+    io.mark(61, index.into(), 0);
+    index
 }
 
 struct World {
@@ -231,6 +262,18 @@ impl World {
         assoc(&mut self.io, &mut self.h2c, &mut self.link, peer, id);
     }
 
+    fn clear(&mut self, peer: Option<&Peer>, id: u32, entry: u8) {
+        let result = cam::clear_key(
+            &mut self.io,
+            &mut self.h2c,
+            &mut self.cams,
+            &mut self.link,
+            peer,
+            entry,
+        );
+        step(&mut self.io, id, result);
+    }
+
     fn cmac_tbl(&mut self, id: u32, table: &[u8; CMC_TBL_LEN]) {
         let result = send_cmac_tbl(&mut self.io, &mut self.h2c, table);
         step(&mut self.io, id, result.map_err(Error::H2c));
@@ -256,7 +299,7 @@ fn segments(trace: &[u8]) -> Vec<Vec<u32>> {
     segments
 }
 
-/// The user's join: interface up, BSSID, HE association on 5 GHz,
+/// The user's join: interface up, BSSID, HE association on 5 GHz, keys,
 /// disconnect, BSSID cleared, interface down.
 fn join_and_leave() -> Model {
     let mut w = World::new(0, 0, 0, 0);
@@ -277,6 +320,24 @@ fn join_and_leave() -> Model {
         he: Some(he(HE_PHY_CAP6_PPE_THRESHOLD_PRESENT, 0, 0x39, 0x1d)),
     };
     w.assoc(&peer, 3);
+    let (m1, m2, m3, m4) = (material(0x10), material(0x20), [0x30; 32], material(0x40));
+    let k1 = add(&mut w, Some(&peer), 5, &key(Cipher::Ccmp128, true, 0, &m1));
+    let k2 = add(&mut w, None, 6, &key(Cipher::Ccmp128, false, 1, &m2));
+    // The harness's TKIP key never gets an entry: its hw_key_idx stays 0.
+    let result = cam::write_key(
+        &mut w.io,
+        &mut w.h2c,
+        &mut w.cams,
+        &mut w.link,
+        None,
+        &key(Cipher::Tkip, false, 2, &m3),
+    );
+    step(&mut w.io, 7, result.map(|_| ()));
+    w.io.mark(61, 0, 0);
+    let k4 = add(&mut w, None, 8, &key(Cipher::Ccmp128, false, 2, &m4));
+    w.clear(None, 9, k2);
+    w.clear(Some(&peer), 10, k1);
+    w.clear(None, 11, k4);
     w.io.mark(74, 0, 0);
     let result = sta_disconnect(&mut w.io, &mut w.h2c, &mut w.link, &peer);
     step(&mut w.io, 12, result);
@@ -319,6 +380,11 @@ fn second_port() -> Model {
         he: None,
     };
     w.assoc(&peer, 6);
+    let m1 = material(0x50);
+    w.h2c.refuse = true;
+    add(&mut w, Some(&peer), 8, &key(Cipher::Ccmp128, true, 0, &m1));
+    w.h2c.refuse = false;
+    add(&mut w, Some(&peer), 9, &key(Cipher::Ccmp128, true, 0, &m1));
     w.h2c.refuse = true;
     w.vif_deinit(10);
     w.io

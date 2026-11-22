@@ -1,21 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020 Realtek Corporation
-//! An RTL8852B's address and BSSID CAMs as pinned rtw89 keeps them for a
-//! station (cam.c) and sends them to the firmware (fw.c):
+//! An RTL8852B's address, BSSID and security CAMs as pinned rtw89 keeps them
+//! for a station (cam.c) and sends them to the firmware (fw.c):
 //!
-//! - [`Info`] is `rtw89_cam_info`'s address and BSSID CAM maps;
+//! - [`Info`] is `rtw89_cam_info`'s maps and security entries;
 //!   [`Info::init`] and [`Info::deinit`] are `rtw89_cam_init` and
 //!   `rtw89_cam_deinit`, with `rtw89_cam_init_bssid_cam` and
 //!   `rtw89_cam_init_addr_cam` (RTL8852B's long entry, `ADDR_CAM_ENT_SIZE`);
 //! - [`addr_cam`] is the payload of `rtw89_fw_h2c_cam` on an AX chip
 //!   (`struct rtw89_h2c_addr_cam_v0`, address CAM version 0), which
 //!   `rtw89_cam_fill_addr_cam_info` and `rtw89_cam_fill_bssid_cam_info`
-//!   fill, and [`send_addr_cam`] sends it.
+//!   fill, and [`send_addr_cam`] sends it;
+//! - [`write_key`] is `rtw89_cam_sec_key_add` for what a station keeps in
+//!   hardware: a CCMP-128 pairwise or group key gets a security CAM entry
+//!   (`rtw89_cam_sec_key_install`), sent as `H2C_FUNC_MAC_SEC_UPD`
+//!   ([`sec_key_cmd`], `rtw89_cam_send_sec_key_cmd`), then a slot of the
+//!   link's address CAM entry (`__rtw89_cam_attach_sec_cam` with
+//!   `rtw89_cam_get_addr_cam_key_idx`), which the address CAM H2C carries;
+//!   [`clear_key`] is `rtw89_cam_sec_key_del` with the firmware informed.
 //!
-//! A station's AP shares the link's address CAM entry, so the AP-mode and
-//! TDLS entries rtw89 keeps per station are not built. An address CAM sent
-//! proves only that its H2C's BD was written: whether the firmware matched
-//! frames by it is answered, if at all, by DONE_ACK on RXQ.
+//! RTL8852B has no `h2c_dctl_sec_cam` (rtw8852b.c), so the address CAM is
+//! the only table a key reaches. Its `hw_sec_hdr` is false: the chip
+//! neither builds nor strips a CCMP header, the host makes each IV
+//! (`IEEE80211_KEY_FLAG_GENERATE_IV`, Stela's `Protection::HostIv`) and the
+//! chip encrypts and decrypts the payload under the key. Its
+//! `hw_mgmt_tx_encrypt` is false: protected management frames are sealed
+//! by the host (`IEEE80211_KEY_FLAG_SW_MGMT_TX`), with `ccmp::seal` and
+//! `ccmp::open`.
+//!
+//! Refused here, where rtw89 would differ, and why:
+//! - TKIP: RTL8852B's `hw_tkip_crypto` is false, so rtw89 also refuses it
+//!   (`-EOPNOTSUPP`), and Stela does not run TKIP in software either.
+//! - The IGTK (AES-CMAC, `RTW89_SEC_KEY_TYPE_BIP_CCMP128`): rtw89 puts it
+//!   in the CAM, but Stela checks BIP in software, so it stays there.
+//! - WEP, CCMP-256 and GCMP: no Stela station negotiates them.
+//!
+//! A key written proves only that its H2C's BD was written: whether the
+//! firmware took it is answered, if at all, by REC_ACK on RXQ, and whether
+//! the chip decrypts with it shows only in received frames.
 use super::{
     h2c::{
         Error as H2cError,
@@ -24,15 +46,20 @@ use super::{
     io::{Io, prep},
     mac::{Commands, port::NET_TYPE_INFRA},
 };
+use alloc::collections::BTreeMap;
+use zeroize::Zeroize;
 
-/// `rtw8852b_chip_info.acam_num` and `.bcam_num`.
+/// `rtw8852b_chip_info.acam_num`, `.bcam_num` and `.scam_num`.
 pub const ACAM_NUM: u8 = 128;
 pub const BCAM_NUM: u8 = 10;
+pub const SCAM_NUM: u8 = 128;
 /// `RTW89_SEC_CAM_IN_ADDR_CAM`: the key slots of an address CAM entry.
 pub const SEC_CAM_IN_ADDR_CAM: usize = 7;
-/// `ADDR_CAM_ENT_SIZE` (RTL8852B's) and `BSSID_CAM_ENT_SIZE`.
+/// `ADDR_CAM_ENT_SIZE` (RTL8852B's), `BSSID_CAM_ENT_SIZE` and
+/// `RTW89_SEC_CAM_LEN`.
 pub const ADDR_CAM_ENT_SIZE: u8 = 0x40;
 pub const BSSID_CAM_ENT_SIZE: u8 = 0x08;
+pub const SEC_CAM_LEN: u8 = 20;
 /// `RTW89_BSSID_MATCH_ALL` and `RTW89_BSSID_MATCH_5_BYTES`.
 pub const BSSID_MATCH_ALL: u32 = 0x3f;
 pub const BSSID_MATCH_5_BYTES: u32 = 0x1f;
@@ -45,12 +72,20 @@ pub const ADDR_CAM_SEC_4GROUP: u8 = 3;
 pub const NO_MSK: u8 = 0;
 pub const SMA: u8 = 1;
 pub const TMA: u8 = 2;
+/// `RTW89_SEC_KEY_TYPE_TKIP`, `_CCMP128` and `_BIP_CCMP128`.
+pub const SEC_KEY_TYPE_TKIP: u8 = 3;
+pub const SEC_KEY_TYPE_CCMP128: u8 = 6;
+pub const SEC_KEY_TYPE_BIP_CCMP128: u8 = 10;
 
 /// `H2C_CL_MAC_ADDR_CAM_UPDATE` with `H2C_FUNC_MAC_ADDR_CAM_UPD`, and
 /// `sizeof(struct rtw89_h2c_addr_cam_v0)`.
 pub const H2C_CL_MAC_ADDR_CAM_UPDATE: u8 = 0x6;
 pub const H2C_FUNC_MAC_ADDR_CAM_UPD: u8 = 0x0;
 pub const ADDR_CAM_LEN: usize = 60;
+/// `H2C_CL_MAC_SEC_CAM` with `H2C_FUNC_MAC_SEC_UPD`, and `H2C_SEC_CAM_LEN`.
+pub const H2C_CL_MAC_SEC_CAM: u8 = 0xa;
+pub const H2C_FUNC_MAC_SEC_UPD: u8 = 0x1;
+pub const H2C_SEC_CAM_LEN: usize = 24;
 
 /// cam.h's `ADDR_CAM_W*` fields of address CAM version 0.
 pub const ADDR_CAM_W1_IDX: u32 = 0x0000_00ff;
@@ -119,17 +154,47 @@ pub struct BssidCamEntry {
     pub valid: bool,
 }
 
-/// `rtw89_cam_info`: which address and BSSID CAM entries are taken.
+/// `struct rtw89_sec_cam_entry`, with what rtw89 reads of its
+/// `key_conf`: whether the key is pairwise and its key ID. The key is
+/// zeroed when the entry is dropped.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SecCamEntry {
+    pub sec_cam_idx: u8,
+    pub offset: u8,
+    pub len: u8,
+    pub key_type: u8,
+    pub ext_key: bool,
+    pub spp_mode: bool,
+    pub key: [u8; 32],
+    pub pairwise: bool,
+    pub keyidx: u8,
+}
+
+impl Drop for SecCamEntry {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+/// `rtw89_cam_info`: which address, BSSID and security CAM entries are
+/// taken, and each security entry's key.
 #[derive(Clone, Debug, Default)]
 pub struct Info {
     pub addr_cam_map: u128,
     pub bssid_cam_map: u16,
+    pub sec_cam_map: u128,
+    pub sec_entries: BTreeMap<u8, SecCamEntry>,
 }
 
 /// `find_first_zero_bit` over the low `n` bits of `map`: `n` when every
 /// bit is set.
 fn first_zero(map: u128, n: u8) -> u8 {
     (0..n).find(|&i| map & (1 << i) == 0).unwrap_or(n)
+}
+
+/// `find_next_zero_bit` over the low `n` bits of `map` from `start`.
+fn next_zero(map: u8, n: usize, start: usize) -> usize {
+    (start..n).find(|&i| map & (1 << i) == 0).unwrap_or(n)
 }
 
 impl Info {
@@ -209,6 +274,26 @@ impl Info {
         self.addr_cam_map &= !(1 << (link.addr_cam.addr_cam_idx & 0x7f));
         link.bssid_cam.valid = false;
         self.bssid_cam_map &= !(1 << (link.bssid_cam.bssid_cam_idx & 0xf));
+    }
+
+    /// The security CAM entry of a station key: pairwise, or group with
+    /// key ID `keyidx`.
+    pub fn find_key(&self, pairwise: bool, keyidx: u8) -> Option<u8> {
+        self.sec_entries
+            .values()
+            .find(|entry| entry.pairwise == pairwise && (pairwise || entry.keyidx == keyidx))
+            .map(|entry| entry.sec_cam_idx)
+    }
+
+    /// `rtw89_cam_get_avail_sec_cam` for a 128-bit key: the first free
+    /// entry, taken.
+    fn take_sec_cam(&mut self) -> Result<u8, Error> {
+        let idx = first_zero(self.sec_cam_map, SCAM_NUM);
+        if idx >= SCAM_NUM {
+            return Err(Error::CamFull("security CAM"));
+        }
+        self.sec_cam_map |= 1 << idx;
+        Ok(idx)
     }
 }
 
@@ -325,6 +410,206 @@ pub fn send_addr_cam<I: Io + ?Sized, C: Commands<I> + ?Sized>(
         true,
         &payload,
     )
+}
+
+/// `rtw89_cam_get_sec_key_cmd`: the security CAM entry's H2C, its first
+/// 128 bits of key, or the next 128 for `ext_key`'s second entry.
+pub fn sec_key_cmd(entry: &SecCamEntry, ext_key: bool) -> [u8; H2C_SEC_CAM_LEN] {
+    let mut cmd = [0; H2C_SEC_CAM_LEN];
+    let w0 = u32::from(entry.sec_cam_idx.wrapping_add(ext_key.into()))
+        | u32::from(entry.offset) << 8
+        | u32::from(entry.len) << 16;
+    let w1 =
+        u32::from(entry.key_type & 0xf) | u32::from(ext_key) << 4 | u32::from(entry.spp_mode) << 5;
+    cmd[0..4].copy_from_slice(&w0.to_le_bytes());
+    cmd[4..8].copy_from_slice(&w1.to_le_bytes());
+    let from = if ext_key { 16 } else { 0 };
+    cmd[8..24].copy_from_slice(&entry.key[from..from + 16]);
+    cmd
+}
+
+/// `rtw89_cam_send_sec_key_cmd`: [`sec_key_cmd`] as `H2C_FUNC_MAC_SEC_UPD`,
+/// asking REC_ACK, and for an extended key its second entry the same way.
+pub fn send_sec_key_cmd<I: Io + ?Sized, C: Commands<I> + ?Sized>(
+    io: &mut I,
+    commands: &mut C,
+    entry: &SecCamEntry,
+) -> Result<(), H2cError> {
+    let mut cmd = sec_key_cmd(entry, false);
+    let sent = commands.send(
+        io,
+        H2C_CL_MAC_SEC_CAM,
+        H2C_FUNC_MAC_SEC_UPD,
+        true,
+        false,
+        &cmd,
+    );
+    cmd.zeroize();
+    sent?;
+    if !entry.ext_key {
+        return Ok(());
+    }
+    let mut cmd = sec_key_cmd(entry, true);
+    let sent = commands.send(
+        io,
+        H2C_CL_MAC_SEC_CAM,
+        H2C_FUNC_MAC_SEC_UPD,
+        true,
+        false,
+        &cmd,
+    );
+    cmd.zeroize();
+    sent
+}
+
+/// The ciphers a station key may be under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cipher {
+    Ccmp128,
+    Tkip,
+    /// AES-CMAC, the IGTK's.
+    AesCmac,
+    Other,
+}
+
+/// A station key as `rtw89_ops_set_key` gets it: its cipher, whether it
+/// is pairwise, its key ID and its material.
+#[derive(Clone, Copy, Debug)]
+pub struct Key<'a> {
+    pub cipher: Cipher,
+    pub pairwise: bool,
+    pub keyidx: u8,
+    pub material: &'a [u8],
+}
+
+/// `rtw89_cam_get_addr_cam_key_idx`: the free slot of the address CAM
+/// entry a key takes in its mode.
+fn addr_cam_key_idx(addr_cam: &AddrCamEntry, key_type: u8, pairwise: bool) -> Result<usize, Error> {
+    let map = addr_cam.sec_cam_map;
+    let full = Error::CamFull("address CAM key slots");
+    let (start, last) = match addr_cam.sec_ent_mode {
+        ADDR_CAM_SEC_NONE => return Err(Error::Invalid("address CAM key mode")),
+        ADDR_CAM_SEC_ALL_UNI => (0, SEC_CAM_IN_ADDR_CAM - 1),
+        _ if key_type == SEC_KEY_TYPE_BIP_CCMP128 => {
+            if addr_cam.sec_ent_mode == ADDR_CAM_SEC_4GROUP {
+                return if map & (1 << 6) != 0 {
+                    Err(Error::Invalid("address CAM BIP slot"))
+                } else {
+                    Ok(6)
+                };
+            }
+            (5, 6)
+        }
+        _ if pairwise => (0, 1),
+        ADDR_CAM_SEC_NORMAL => (2, 4),
+        _ => (2, 5),
+    };
+    let idx = next_zero(map, SEC_CAM_IN_ADDR_CAM, start);
+    if idx > last {
+        return Err(full);
+    }
+    Ok(idx)
+}
+
+/// `rtw89_cam_sec_key_add` for a station link: a CCMP-128 key gets a
+/// security CAM entry, sent, then a slot of the link's address CAM entry,
+/// which goes to the firmware with `RTW89_ROLE_INFO_CHANGE`; `peer` is the
+/// AP for a pairwise key. What it returns is the entry, rtw89's
+/// `key->hw_key_idx`. A key that fails after its entry was taken is
+/// released, as `rtw89_cam_sec_key_install` releases it.
+pub fn write_key<I: Io + ?Sized, C: Commands<I> + ?Sized>(
+    io: &mut I,
+    commands: &mut C,
+    cams: &mut Info,
+    link: &mut Link,
+    peer: Option<&Peer>,
+    key: &Key<'_>,
+) -> Result<u8, Error> {
+    let key_type = match key.cipher {
+        Cipher::Ccmp128 => SEC_KEY_TYPE_CCMP128,
+        Cipher::Tkip => return Err(Error::Unsupported("TKIP on an RTL8852B")),
+        Cipher::AesCmac => return Err(Error::Unsupported("the IGTK stays in the host")),
+        Cipher::Other => return Err(Error::Unsupported("a cipher other than CCMP-128")),
+    };
+    if key.material.len() != 16 {
+        return Err(Error::Invalid("CCMP-128 key length"));
+    }
+    let idx = cams.take_sec_cam()?;
+    let mut entry = SecCamEntry {
+        sec_cam_idx: idx,
+        key_type,
+        len: SEC_CAM_LEN,
+        pairwise: key.pairwise,
+        keyidx: key.keyidx,
+        ..SecCamEntry::default()
+    };
+    entry.key[..16].copy_from_slice(key.material);
+    let installed = send_sec_key_cmd(io, commands, &entry)
+        .map_err(Error::H2c)
+        .and_then(|()| attach(io, commands, link, peer, &entry));
+    match installed {
+        Ok(()) => {
+            cams.sec_entries.insert(idx, entry);
+            Ok(idx)
+        }
+        Err(error) => {
+            cams.sec_cam_map &= !(1 << idx);
+            Err(error)
+        }
+    }
+}
+
+/// `__rtw89_cam_attach_sec_cam`: the key's address CAM slot, then the
+/// address CAM sent; a failed send frees the slot again.
+fn attach<I: Io + ?Sized, C: Commands<I> + ?Sized>(
+    io: &mut I,
+    commands: &mut C,
+    link: &mut Link,
+    peer: Option<&Peer>,
+    entry: &SecCamEntry,
+) -> Result<(), Error> {
+    let slot = addr_cam_key_idx(&link.addr_cam, entry.key_type, entry.pairwise)?;
+    link.addr_cam.sec_ent_keyid[slot] = entry.keyidx;
+    link.addr_cam.sec_ent[slot] = entry.sec_cam_idx;
+    link.addr_cam.sec_cam_map |= 1 << slot;
+    // RTL8852B has no h2c_dctl_sec_cam.
+    if let Err(error) = send_addr_cam(io, commands, link, peer, None, UpdMode::InfoChange) {
+        link.addr_cam.sec_cam_map &= !(1 << slot);
+        return Err(Error::H2c(error));
+    }
+    Ok(())
+}
+
+/// `rtw89_cam_sec_key_del` with `inform_fw` for security CAM entry
+/// `sec_cam_idx`: every address CAM slot holding it cleared, the address
+/// CAM sent with `RTW89_ROLE_INFO_CHANGE`, then the entry freed whatever
+/// the send returned. As rtw89 notes, a slot no longer valid disables the
+/// entry, so no security CAM H2C follows.
+pub fn clear_key<I: Io + ?Sized, C: Commands<I> + ?Sized>(
+    io: &mut I,
+    commands: &mut C,
+    cams: &mut Info,
+    link: &mut Link,
+    peer: Option<&Peer>,
+    sec_cam_idx: u8,
+) -> Result<(), Error> {
+    let entry = cams
+        .sec_entries
+        .remove(&sec_cam_idx)
+        .ok_or(Error::Invalid("security CAM entry"))?;
+    for slot in 0..SEC_CAM_IN_ADDR_CAM {
+        if link.addr_cam.sec_cam_map & (1 << slot) != 0
+            && link.addr_cam.sec_ent[slot] == entry.sec_cam_idx
+        {
+            link.addr_cam.sec_cam_map &= !(1 << slot);
+        }
+    }
+    let sent = send_addr_cam(io, commands, link, peer, None, UpdMode::InfoChange);
+    cams.sec_cam_map &= !(1 << sec_cam_idx);
+    if entry.ext_key {
+        cams.sec_cam_map &= !(1 << (sec_cam_idx.wrapping_add(1) & 0x7f));
+    }
+    sent.map_err(Error::H2c)
 }
 
 #[cfg(test)]

@@ -33,7 +33,9 @@
 //! - when joined: [`sta_assoc`], then the RA H2C of 4.5
 //!   (`rtw89_phy_ra_assoc`), then [`bss_assoc`] with the BSS's beacon
 //!   interval and DTIM period in [`Link::bss`];
-//! - when left: [`sta_disconnect`], then [`bssid_changed`] to all zeros.
+//! - when left: [`sta_disconnect`], then [`bssid_changed`] to all zeros;
+//! - keys: [`super::super::cam::write_key`] and
+//!   [`super::super::cam::clear_key`].
 //!
 //! What this leaves out, and why:
 //! - AP, ad hoc, P2P, TDLS and MLO links: Stela is a station of one link;
@@ -274,6 +276,11 @@ pub enum Error {
     },
     /// `-EBUSY`: the CAM named has no free entry.
     CamFull(&'static str),
+    /// `-EOPNOTSUPP`: a key the security CAM does not take here.
+    Unsupported(&'static str),
+    /// `-EINVAL` or `-ENOENT`: what the named argument asked does not exist
+    /// or does not fit.
+    Invalid(&'static str),
     Io(io::Error),
     H2c(H2cError),
 }

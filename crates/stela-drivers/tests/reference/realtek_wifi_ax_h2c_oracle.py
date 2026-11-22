@@ -1144,9 +1144,9 @@ def station_oracle(reference, out):
       __get_sta_he_pkt_padding, rtw89_fw_h2c_txtime_cmac_tbl,
       rtw89_fw_h2c_macid_pause, rtw89_h2c_pkt_set_hdr and the H2C skb
       allocation;
-    - cam.c: the address and BSSID CAM paths a station reaches, from
-      rtw89_cam_init and rtw89_cam_deinit down to
-      rtw89_cam_fill_addr_cam_info;
+    - cam.c: the address, BSSID and security CAM paths a station reaches,
+      from rtw89_cam_sec_key_add and rtw89_cam_sec_key_del down to
+      rtw89_cam_send_sec_key_cmd and rtw89_cam_fill_addr_cam_info;
     - core.c: rtw89_vif_type_mapping, rtw89_core_sta_link_assoc with
       rtw89_sta_link_can_er, and rtw89_core_sta_link_disconnect;
     - the reg.h, core.h, mac.h, fw.h and cam.h declarations, inlines and
@@ -1174,16 +1174,19 @@ def station_oracle(reference, out):
 
     Four segments, each prefixed by its byte length, of records of three
     little-endian u32 (tag, a, b): register reads by width, writes by 4
-    plus width, delays, H2C and marks as above, and each step's return (50):
+    plus width, delays, H2C and marks as above, each step's return (50) and
+    each key's hw_key_idx (61):
 
     1. zeroed registers, CMAC0 on, MAC ID 0 on port 0 from sequence 0:
        interface up, BSSID set, association to an HE AP on 5 GHz with its
-       port update, the disconnect, the BSSID cleared and the interface
-       down;
+       port update, a CCMP pairwise key, a CCMP group key, a TKIP group key
+       (refused), a second CCMP group key, the first group key, the
+       pairwise key and the second group key deleted, the disconnect, the
+       BSSID cleared and the interface down;
     2. all-ones registers, MAC ID 37 on port 1 from sequence 0xfe:
        interface up over a port already on, two TX-time tables, MAC ID 37
-       paused, association to a non-HE AP on 2.4 GHz, and the interface
-       down refused by rtw89_h2c_tx;
+       paused, association to a non-HE AP on 2.4 GHz, a pairwise key
+       refused by rtw89_h2c_tx then taken, and the interface down refused;
     3. CMAC0 reading RTW89_R32_DEAD: interface up;
     4. association CMAC tables for nine HE capabilities and none.
     """
@@ -1305,13 +1308,13 @@ def station_oracle(reference, out):
         [declaration('core.h', 'enum', name) for name in [
             'rtw89_core_chip_id', 'rtw89_chip_gen', 'rtw89_net_type', 'rtw89_wifi_role',
             'rtw89_upd_mode', 'rtw89_self_role', 'rtw89_msk_sO_el', 'rtw89_add_cam_sec_mode',
-            'rtw89_port', 'rtw89_band', 'rtw89_hw_rate', 'rtw89_mac_idx',
+            'rtw89_sec_key_type', 'rtw89_port', 'rtw89_band', 'rtw89_hw_rate', 'rtw89_mac_idx',
             'rtw89_phy_idx', 'rtw89_chanctx_idx', 'rtw89_rf_path_bit', 'rtw89_bandwidth',
             'rtw89_pe_duration', 'rtw89_flags']]
         + [declaration('mac.h', 'enum', 'rtw89_mac_hwmod_sel')])
     core_defines = defines('core.h', [
         'RTW89_R32_EA', 'RTW89_R32_DEAD', 'RTW89_SEC_CAM_IN_ADDR_CAM', 'RTW89_MAX_ADDR_CAM_NUM',
-        'RTW89_MAX_BSSID_CAM_NUM', 'RTW89_PPE_BW_NUM'])
+        'RTW89_MAX_BSSID_CAM_NUM', 'RTW89_MAX_SEC_CAM_NUM', 'RTW89_PPE_BW_NUM'])
     mac_defines = defines('mac.h', [
         'ADDR_CAM_ENT_SIZE', 'ADDR_CAM_ENT_SHORT_SIZE', 'BSSID_CAM_ENT_SIZE',
         'R_AX_INDIR_ACCESS_ENTRY', 'DMAC_TBL_BASE_ADDR', 'CMAC_TBL_BASE_ADDR', 'CCTL_INFO_SIZE',
@@ -1321,12 +1324,15 @@ def station_oracle(reference, out):
         'TBTT_ERLY_DEF', 'TBTT_AGG_DEF', 'BCN_ERLY_SET_DLY'])
     h2c_defines = block('fw.h', '#define H2C_HEADER_LEN', '/* CLASS 10 - Security CAM */',
                         'H2C_HEADER_LEN to CLASS 10')
+    sec_defines = defines('fw.h', ['H2C_SEC_CAM_LEN', 'H2C_CL_MAC_SEC_CAM',
+                                   'H2C_FUNC_MAC_SEC_UPD'])
     fw_c_defines = defines('fw.c', ['H2C_CMC_TBL_LEN'])
     structs = '\n\n'.join([
         declaration('core.h', 'struct', 'rtw89_txwd_body'),
         declaration('core.h', 'struct', 'rtw89_port_reg'),
         declaration('core.h', 'struct', 'rtw89_addr_cam_entry'),
         declaration('core.h', 'struct', 'rtw89_bssid_cam_entry'),
+        declaration('core.h', 'struct', 'rtw89_sec_cam_entry'),
         declaration('fw.h', 'struct', 'fwcmd_hdr'),
         declaration('fw.h', 'struct', 'rtw89_fw_macid_pause_grp'),
         declaration('fw.h', 'struct', 'rtw89_fw_macid_pause_sleep_grp'),
@@ -1349,7 +1355,7 @@ def station_oracle(reference, out):
     core_h_inlines = '\n\n'.join(locate('core.h', name)[1] for name in [
         'rtw89_read32_mask', 'rtw89_write32_mask', 'rtw89_write16_mask', 'rtw89_write32_set',
         'rtw89_write32_clr', 'rtw89_write8_set', 'rtw89_write16_clr', 'rtw89_get_addr_cam_of',
-        'rtw89_get_bssid_cam_of'])
+        'rtw89_get_bssid_cam_of', 'rtw89_chip_h2c_dctl_sec_cam'])
     mac_h_inlines = '\n\n'.join(locate('mac.h', name)[1] for name in [
         'rtw89_mac_reg_by_idx', 'rtw89_mac_reg_by_port', 'rtw89_read32_port',
         'rtw89_read32_port_mask', 'rtw89_write32_port', 'rtw89_write32_port_mask',
@@ -1358,6 +1364,9 @@ def station_oracle(reference, out):
     fw_h_inlines = '\n\n'.join([
         block('fw.h', 'static inline void SET_CTRL_INFO_MACID', '#define SET_CMC_TBL_MASK_CSI_BW',
               'SET_CTRL_INFO_MACID to SET_CMC_TBL_MASK_CSI_BW'),
+        block('fw.h', 'static inline void RTW89_SET_FWCMD_SEC_IDX',
+              'static inline void RTW89_SET_EDCA_SEL',
+              'RTW89_SET_FWCMD_SEC_IDX to RTW89_SET_EDCA_SEL'),
         '\n\n'.join(locate('fw.h', name)[1] for name in [
             'rtw89_chip_h2c_default_cmac_tbl', 'rtw89_chip_h2c_default_dmac_tbl',
             'rtw89_chip_h2c_assoc_cmac_tbl'])])
@@ -1384,6 +1393,10 @@ def station_oracle(reference, out):
         'rtw89_fw_h2c_txtime_cmac_tbl', 'rtw89_fw_h2c_role_maintain', 'rtw89_fw_h2c_join_info',
         'rtw89_fw_h2c_macid_pause'])
     cam_c = in_order('cam.c', [
+        'rtw89_cam_get_sec_key_cmd', 'rtw89_cam_send_sec_key_cmd', 'rtw89_cam_get_avail_sec_cam',
+        'rtw89_cam_get_addr_cam_key_idx', '__rtw89_cam_detach_sec_cam',
+        '__rtw89_cam_attach_sec_cam', 'rtw89_cam_detach_sec_cam', 'rtw89_cam_attach_sec_cam',
+        'rtw89_cam_sec_key_install', 'rtw89_cam_sec_key_add', 'rtw89_cam_sec_key_del',
         'rtw89_cam_deinit_addr_cam', 'rtw89_cam_deinit_bssid_cam', 'rtw89_cam_deinit',
         'rtw89_cam_get_avail_addr_cam', 'rtw89_get_addr_cam_entry_size',
         'rtw89_cam_init_addr_cam', 'rtw89_cam_get_avail_bssid_cam', 'rtw89_cam_init_bssid_cam',
@@ -1399,11 +1412,12 @@ def station_oracle(reference, out):
     chip = fields('rtw8852b.c', 'const struct rtw89_chip_info rtw8852b_chip_info', chip_names)
     if chip['ops'] != '&rtw8852b_chip_ops' or chip['mac_def'] != '&rtw89_mac_gen_ax':
         raise ValueError(f'rtw8852b_chip_info is {chip}')
-    ops_names = ['h2c_default_cmac_tbl', 'h2c_assoc_cmac_tbl',
+    ops_names = ['h2c_dctl_sec_cam', 'h2c_default_cmac_tbl', 'h2c_assoc_cmac_tbl',
                  'h2c_txtime_cmac_tbl', 'h2c_default_dmac_tbl']
     chip_ops = fields('rtw8852b.c', 'static const struct rtw89_chip_ops rtw8852b_chip_ops',
                       ops_names)
-    if chip_ops != {'h2c_default_cmac_tbl': 'rtw89_fw_h2c_default_cmac_tbl',
+    if chip_ops != {'h2c_dctl_sec_cam': 'NULL',
+                    'h2c_default_cmac_tbl': 'rtw89_fw_h2c_default_cmac_tbl',
                     'h2c_assoc_cmac_tbl': 'rtw89_fw_h2c_assoc_cmac_tbl',
                     'h2c_txtime_cmac_tbl': 'rtw89_fw_h2c_txtime_cmac_tbl',
                     'h2c_default_dmac_tbl': 'NULL'}:
@@ -1452,6 +1466,8 @@ static inline void le32p_replace_bits(__le32 *p, u32 v, u32 m) { *p = (*p & ~m) 
 #define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + 63) / 64]
 #define rcu_read_lock() ((void)0)
 #define rcu_read_unlock() ((void)0)
+#define kzalloc_obj(x) calloc(1, sizeof(x))
+#define kfree free
 static void ether_addr_copy(u8 *d, const u8 *s) { memcpy(d, s, ETH_ALEN); }
 static int test_bit(unsigned long nr, const unsigned long *map) { return (map[nr / 64] >> (nr % 64)) & 1; }
 static void set_bit(unsigned long nr, unsigned long *map) { map[nr / 64] |= 1UL << (nr % 64); }
@@ -1500,6 +1516,18 @@ static void sink(const char *format, ...) { (void)format; }
 #define IEEE80211_HE_OPERATION_ER_SU_DISABLE 0x00010000
 #define IEEE80211_EML_CAP_EML_PADDING_DELAY_256US 4
 #define IEEE80211_EML_CAP_EMLSR_TRANSITION_DELAY_256US 5
+#define WLAN_CIPHER_SUITE_WEP40 0x000FAC01
+#define WLAN_CIPHER_SUITE_TKIP 0x000FAC02
+#define WLAN_CIPHER_SUITE_CCMP 0x000FAC04
+#define WLAN_CIPHER_SUITE_WEP104 0x000FAC05
+#define WLAN_CIPHER_SUITE_AES_CMAC 0x000FAC06
+#define WLAN_CIPHER_SUITE_GCMP 0x000FAC08
+#define WLAN_CIPHER_SUITE_GCMP_256 0x000FAC09
+#define WLAN_CIPHER_SUITE_CCMP_256 0x000FAC0A
+#define IEEE80211_KEY_FLAG_GENERATE_IV BIT(1)
+#define IEEE80211_KEY_FLAG_GENERATE_MMIC BIT(2)
+#define IEEE80211_KEY_FLAG_PAIRWISE BIT(3)
+#define IEEE80211_KEY_FLAG_SW_MGMT_TX BIT(4)
 enum nl80211_iftype {
 	NL80211_IFTYPE_UNSPECIFIED, NL80211_IFTYPE_ADHOC, NL80211_IFTYPE_STATION,
 	NL80211_IFTYPE_AP, NL80211_IFTYPE_AP_VLAN, NL80211_IFTYPE_WDS, NL80211_IFTYPE_MONITOR,
@@ -1534,6 +1562,15 @@ struct ieee80211_vif {
 	bool p2p;
 	struct { u16 aid; } cfg;
 	void *drv_priv;
+};
+struct ieee80211_key_conf {
+	u32 cipher;
+	u8 hw_key_idx;
+	u16 flags;
+	int link_id;
+	s8 keyidx;
+	u8 keylen;
+	u8 key[32];
 };
 
 /* The members of rtw89's structures the extracted functions reach. */
@@ -1588,6 +1625,7 @@ struct rtw89_sta {
 	struct rtw89_sta_link *links[1];
 	struct ieee80211_sta *sta;
 	struct ieee80211_link_sta *link_sta;
+	DECLARE_BITMAP(pairwise_sec_cam_map, RTW89_MAX_SEC_CAM_NUM);
 };
 #define vif_to_rtwvif(v) ((struct rtw89_vif *)(v)->drv_priv)
 #define sta_to_rtwsta_safe(s) ((s) ? (struct rtw89_sta *)(s)->drv_priv : NULL)
@@ -1607,6 +1645,8 @@ static struct ieee80211_vif *rtwvif_link_to_vif(const struct rtw89_vif_link *l)
 }
 static bool ieee80211_vif_is_mld(const struct ieee80211_vif *vif) { (void)vif; return false; }
 struct rtw89_chip_ops {
+	int (*h2c_dctl_sec_cam)(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif_link,
+				struct rtw89_sta_link *rtwsta_link);
 	int (*h2c_default_cmac_tbl)(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif_link,
 				    struct rtw89_sta_link *rtwsta_link);
 	int (*h2c_assoc_cmac_tbl)(struct rtw89_dev *rtwdev, struct rtw89_vif_link *rtwvif_link,
@@ -1642,6 +1682,8 @@ struct rtw89_fw_secure { bool secure_boot; };
 struct rtw89_cam_info {
 	DECLARE_BITMAP(addr_cam_map, RTW89_MAX_ADDR_CAM_NUM);
 	DECLARE_BITMAP(bssid_cam_map, RTW89_MAX_BSSID_CAM_NUM);
+	DECLARE_BITMAP(sec_cam_map, RTW89_MAX_SEC_CAM_NUM);
+	struct rtw89_sec_cam_entry *sec_entries[RTW89_MAX_SEC_CAM_NUM];
 };
 struct rtw89_dev {
 	const struct rtw89_chip_info *chip;
@@ -1822,6 +1864,7 @@ static void rtw89_mac_bf_disassoc(struct rtw89_dev *d, struct rtw89_vif_link *v,
 #define rtw89_phy_dig_resume(...) ((void)0)
 #define rtw89_assoc_link_set(...) ((void)0)
 #define rtw89_fw_release_general_pkt_list_vif(...) ((void)0)
+#define rtw89_leave_ips_by_hwflags(...) ((void)0)
 /* Reached only by an AP's port, RTL8852C's ER check or BE chips. */
 static void rtw89_mac_bcn_drop(struct rtw89_dev *d, struct rtw89_vif_link *l)
 {
@@ -1921,6 +1964,23 @@ static void assoc(struct world *w, u32 id)
 	step(id + 1, rtw89_mac_port_update(&w->dev, &w->link));
 }
 
+static void key(struct ieee80211_key_conf *k, u32 cipher, bool pairwise, s8 keyidx, u8 seed)
+{
+	memset(k, 0, sizeof(*k));
+	k->cipher = cipher;
+	k->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0;
+	k->keyidx = keyidx;
+	k->keylen = cipher == WLAN_CIPHER_SUITE_TKIP ? 32 : 16;
+	for (int i = 0; i < k->keylen; i++)
+		k->key[i] = seed + i;
+}
+
+static void add(struct world *w, u32 id, struct ieee80211_key_conf *k, bool pairwise)
+{
+	step(id, rtw89_cam_sec_key_add(&w->dev, &w->vif, pairwise ? &w->sta : NULL, k));
+	trace(61, k->hw_key_idx, 0);
+}
+
 static void he(struct ieee80211_link_sta *s, u8 rx_nss, u8 phy6, u8 phy9, u8 hdr, u8 seed)
 {
 	memset(&s->he_cap, 0, sizeof(s->he_cap));
@@ -1933,9 +1993,16 @@ static void he(struct ieee80211_link_sta *s, u8 rx_nss, u8 phy6, u8 phy9, u8 hdr
 		s->he_cap.ppe_thres[i] = (u8)(seed * i + 0x31 * (i & 3));
 }
 
+static void free_keys(struct world *w)
+{
+	for (int i = 0; i < RTW89_MAX_SEC_CAM_NUM; i++)
+		free(w->dev.cam_info.sec_entries[i]);
+}
+
 int main(int argc, char **argv)
 {
 	static struct world w;
+	struct ieee80211_key_conf k1, k2, k3, k4;
 	u32 cases = 0;
 	if (argc != 2)
 		return 2;
@@ -1957,10 +2024,22 @@ int main(int argc, char **argv)
 	w.vif.cfg.aid = 0x1003;
 	he(&w.link_sta, 2, IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT, 0, 0x39, 0x1d);
 	assoc(&w, 3);
+	key(&k1, WLAN_CIPHER_SUITE_CCMP, true, 0, 0x10);
+	add(&w, 5, &k1, true);
+	key(&k2, WLAN_CIPHER_SUITE_CCMP, false, 1, 0x20);
+	add(&w, 6, &k2, false);
+	key(&k3, WLAN_CIPHER_SUITE_TKIP, false, 2, 0x30);
+	add(&w, 7, &k3, false);
+	key(&k4, WLAN_CIPHER_SUITE_CCMP, false, 2, 0x40);
+	add(&w, 8, &k4, false);
+	step(9, rtw89_cam_sec_key_del(&w.dev, &w.vif, NULL, &k2, true));
+	step(10, rtw89_cam_sec_key_del(&w.dev, &w.vif, &w.sta, &k1, true));
+	step(11, rtw89_cam_sec_key_del(&w.dev, &w.vif, NULL, &k4, true));
 	step(12, rtw89_core_sta_link_disconnect(&w.dev, &w.link, &w.sta_link));
 	static const u8 zero[ETH_ALEN];
 	step(13, bssid_changed(&w, zero));
 	step(14, rtw89_mac_vif_deinit(&w.dev, &w.link));
+	free_keys(&w);
 	flush(out);
 	cases++;
 
@@ -1985,8 +2064,14 @@ int main(int argc, char **argv)
 	w.link_sta.rx_nss = 1;
 	assoc(&w, 6);
 	refuse = 1;
+	key(&k1, WLAN_CIPHER_SUITE_CCMP, true, 0, 0x50);
+	add(&w, 8, &k1, true);
+	refuse = 0;
+	add(&w, 9, &k1, true);
+	refuse = 1;
 	step(10, rtw89_mac_vif_deinit(&w.dev, &w.link));
 	refuse = 0;
+	free_keys(&w);
 	flush(out);
 	cases++;
 
@@ -2034,7 +2119,7 @@ int main(int argc, char **argv)
 '''.replace('@GEN@', gen_init).replace('@OPS@', ops_init).replace('@CHIP@', chip_init)
     program = '\n\n'.join([
         preamble, reg_h, enums, core_defines, mac_defines, mac_c_defines, h2c_defines,
-        fw_c_defines, structs, harness, prototypes, core_h_inlines, mac_h_inlines,
+        sec_defines, fw_c_defines, structs, harness, prototypes, core_h_inlines, mac_h_inlines,
         fw_h_inlines, port_base, mac_c, fw_c, cam_c, core_c, main_c])
     generated = out / 'station.c'
     generated.write_text(program, newline='\n')
@@ -2048,7 +2133,7 @@ int main(int argc, char **argv)
     data = trace.read_bytes()
     receipt = dict(
         linux_commit=COMMIT, symbols=manifest, cases=cases,
-        case_order='1: interface up, BSSID, HE association on 5 GHz, disconnect, down; '
+        case_order='1: interface up, BSSID, HE association on 5 GHz, keys, disconnect, down; '
                    '2: all-ones registers, MAC ID 37 on port 1, TX-time tables, pause, '
                    'non-HE association on 2.4 GHz, refused H2C; 3: CMAC0 off; '
                    '4: association CMAC tables over HE capabilities',
