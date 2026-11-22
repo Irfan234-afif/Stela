@@ -24,8 +24,8 @@
 //!   `set_vcore_cfg` are NULL in `rtw89_mac_gen_ax`, so
 //!   `rtw89_mac_set_vcore_reset` reaches nothing either.
 //! - Interpreting the secure-boot efuse bytes (`rtw89_efuse_recognize_mss_*`):
-//!   they are returned raw ([`PoweredOn::secure_efuse`]) for the secure-boot
-//!   step.
+//!   they are returned raw ([`PoweredOn::secure_efuse`]); the firmware
+//!   download decides secure boot from them ([`super::fwdl::FwSecure`]).
 //!
 //! A power-on that returns proves only that the bits rtw89 polls answered.
 //! It proves nothing about the rails, clocks, analog front end or firmware,

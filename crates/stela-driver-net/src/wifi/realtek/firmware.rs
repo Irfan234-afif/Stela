@@ -173,6 +173,10 @@ pub struct Section<'a> {
 #[derive(Debug)]
 pub struct AxImage<'a> {
     pub header: &'a [u8],
+    /// The fixed header and the section descriptors (`base_hdr_len` bytes):
+    /// what `__rtw89_fw_download_hdr` sends, which leaves the dynamic header
+    /// out.
+    pub base_header: &'a [u8],
     pub dynamic_header: &'a [u8],
     pub version: [u8; 4],
     pub commit_id: u32,
@@ -256,6 +260,7 @@ impl<'a> AxImage<'a> {
         }
         Ok(Self {
             header: fixed,
+            base_header: &data[..base],
             dynamic_header,
             version: fixed[4..8].try_into().unwrap(),
             commit_id: le32(data, 8)?,

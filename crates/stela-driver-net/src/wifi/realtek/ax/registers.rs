@@ -96,6 +96,10 @@ pub const APFM_SWLPS: u32 = 1 << 10;
 pub const APFM_OFFMAC: u32 = 1 << 9;
 pub const APFN_ONMAC: u32 = 1 << 8;
 
+/// `R_AX_SYS_CLK_CTRL` and `B_AX_CPU_CLK_EN`, the WCPU's clock.
+pub const SYS_CLK_CTRL: u32 = 0x0008;
+pub const CPU_CLK_EN: u32 = 1 << 14;
+
 /// `R_AX_SYS_SWR_CTRL1` and `B_AX_SYM_CTRL_SPS_PWMFREQ`.
 pub const SYS_SWR_CTRL1: u32 = 0x0010;
 pub const SYM_CTRL_SPS_PWMFREQ: u32 = 1 << 10;
@@ -118,6 +122,15 @@ pub const EF_DATA_MASK: u32 = 0x0000_ffff;
 pub const EFUSE_CTRL_1_V1: u32 = 0x0038;
 pub const EF_BURST: u32 = 1 << 19;
 
+/// `R_AX_DBG_CTRL` and its two selectors, `B_AX_DBG_SEL0` and
+/// `B_AX_DBG_SEL1`, which `rtw89_fw_prog_cnt_dump` points at the WCPU's
+/// program counter.
+pub const DBG_CTRL: u32 = 0x0058;
+pub const DBG_SEL1: u32 = 0x00ff_0000;
+pub const DBG_SEL0: u32 = 0x0000_00ff;
+/// `FW_PROG_CNTR_DBG_SEL` (mac.h).
+pub const FW_PROG_CNTR_DBG_SEL: u32 = 0xf2;
+
 /// `R_AX_SYS_SDIO_CTRL` and its bits: `B_AX_PCIE_DIS_L2_CTRL_LDO_HCI` and
 /// `B_AX_PCIE_DIS_WLSUS_AFT_PDN`, which `rtw89_pci_hci_ldo` sets and clears,
 /// and `B_AX_PCIE_CALIB_EN_V1`.
@@ -134,8 +147,11 @@ pub const WAKE_CTRL: u32 = 1 << 5;
 pub const HCI_LDO_CTRL: u32 = 0x007a;
 pub const R_AX_VADJ_MASK: u32 = 0x0000_000f;
 
-/// `R_AX_PLATFORM_ENABLE` and `B_AX_PLATFORM_EN`.
+/// `R_AX_PLATFORM_ENABLE` and its bits: `B_AX_APB_WRAP_EN`, `B_AX_WCPU_EN`
+/// (the WCPU runs) and `B_AX_PLATFORM_EN`.
 pub const PLATFORM_ENABLE: u32 = 0x0088;
+pub const APB_WRAP_EN: u32 = 1 << 2;
+pub const WCPU_EN: u32 = 1 << 1;
 pub const PLATFORM_EN: u32 = 1 << 0;
 
 /// `R_AX_WLLPS_CTRL`, `B_AX_DIS_WLBT_LPSEN_LOPC`, and `SW_LPS_OPTION`, the
@@ -151,9 +167,44 @@ pub const SCOREBOARD: u32 = 0x00ac;
 pub const MAC_AX_NOTIFY_TP_MAJOR: u8 = 0x81;
 pub const MAC_AX_NOTIFY_PWR_MAJOR: u8 = 0x80;
 
+/// `R_AX_DBG_PORT_SEL`, where `rtw89_fw_prog_cnt_dump` reads the program
+/// counter [`DBG_CTRL`] selects.
+pub const DBG_PORT_SEL: u32 = 0x00c0;
+
 /// `R_AX_PMC_DBG_CTRL2` and `B_AX_SYSON_DIS_PMCR_AX_WRMSK`.
 pub const PMC_DBG_CTRL2: u32 = 0x00cc;
 pub const SYSON_DIS_PMCR_AX_WRMSK: u32 = 1 << 2;
+
+/// `R_AX_SYS_STATUS1`, `B_AX_SEL_0XC0_MASK` and `MAC_DBG_SEL` (mac.h): what
+/// [`DBG_PORT_SEL`] reads.
+pub const SYS_STATUS1: u32 = 0x00f4;
+pub const SEL_0XC0_MASK: u32 = 0x0003_0000;
+pub const MAC_DBG_SEL: u32 = 1;
+
+/// `R_AX_HALT_H2C_CTRL`, `R_AX_HALT_C2H_CTRL`, `R_AX_HALT_H2C` and
+/// `R_AX_HALT_C2H`.
+pub const HALT_H2C_CTRL: u32 = 0x0160;
+pub const HALT_C2H_CTRL: u32 = 0x0164;
+pub const HALT_H2C: u32 = 0x0168;
+pub const HALT_C2H: u32 = 0x016c;
+
+/// `R_AX_WCPU_FW_CTRL` and its fields: the IDMEM share mode a secure boot
+/// records (`B_AX_IDMEM_SHARE_MODE_RECORD_MASK` and `…_VALID`), the download
+/// status (`B_AX_WCPU_FWDL_STS_MASK`), the two paths' ready bits
+/// (`B_AX_FWDL_PATH_RDY`, `B_AX_H2C_PATH_RDY`) and `B_AX_WCPU_FWDL_EN`.
+pub const WCPU_FW_CTRL: u32 = 0x01e0;
+pub const IDMEM_SHARE_MODE_RECORD_MASK: u32 = 0x0f00_0000;
+pub const IDMEM_SHARE_MODE_RECORD_VALID: u32 = 1 << 23;
+pub const WCPU_FWDL_STS_MASK: u32 = 0x0000_00e0;
+pub const FWDL_PATH_RDY: u32 = 1 << 2;
+pub const H2C_PATH_RDY: u32 = 1 << 1;
+pub const WCPU_FWDL_EN: u32 = 1 << 0;
+/// `R_AX_BOOT_REASON` and `B_AX_BOOT_REASON_MASK`.
+pub const BOOT_REASON: u32 = 0x01e6;
+pub const BOOT_REASON_MASK: u32 = 0x0000_0007;
+/// `R_AX_UDM1` and `R_AX_UDM2`.
+pub const UDM1: u32 = 0x01f4;
+pub const UDM2: u32 = 0x01f8;
 
 /// `R_AX_SPS_DIG_ON_CTRL0` and its fields.
 pub const SPS_DIG_ON_CTRL0: u32 = 0x0200;
@@ -185,6 +236,11 @@ pub const R1_L1_MASK: u32 = 0x0000_00c0;
 pub const C3_L1_MASK: u32 = 0x0000_0030;
 pub const C2_L1_MASK: u32 = 0x0000_000c;
 pub const C1_L1_MASK: u32 = 0x0000_0003;
+
+/// `R_AX_SEC_CTRL` and `B_AX_SEC_IDMEM_SIZE_CONFIG_MASK`, which
+/// `rtw89_mac_enable_cpu_ax` sets to 2 on an RTL885xB.
+pub const SEC_CTRL: u32 = 0x0c00;
+pub const SEC_IDMEM_SIZE_CONFIG_MASK: u32 = 0x0003_0000;
 
 /// `R_AX_PCIE_INIT_CFG1` (`rtw8852b_pci_info.init_cfg_reg`) and its bits.
 pub const PCIE_INIT_CFG1: u32 = 0x1000;
@@ -379,6 +435,10 @@ pub const SIC_EN_FORCE_CLKREQ: u32 = 1 << 4;
 pub const HCI_FUNC_EN: u32 = 0x8380;
 pub const HCI_RXDMA_EN: u32 = 1 << 1;
 pub const HCI_TXDMA_EN: u32 = 1 << 0;
+
+/// `R_AX_BOOT_DBG` (`rtw89_mac_gen_ax.boot_dbg`), which a failed download
+/// reads.
+pub const BOOT_DBG: u32 = 0x83f0;
 
 /// `R_AX_DMAC_FUNC_EN` and the bits power-on sets in it.
 /// `B_AX_DMAC_FUNC_EN` is [`DMAC_FUNC_EN_BIT`], since the register takes the
