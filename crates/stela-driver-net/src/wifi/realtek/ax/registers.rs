@@ -1369,3 +1369,35 @@ pub const PWR_UL_TB_1T: u32 = 0xd28c;
 pub const PWR_UL_TB_1T_MASK: u32 = 0x0000_001f;
 pub const PWR_UL_TB_2T: u32 = 0xd290;
 pub const PWR_UL_TB_2T_MASK: u32 = 0x0000_001f;
+/// The interrupt registers `rtw89_pci_enable_intr` and
+/// `rtw89_pci_recognize_intrs` reach (pci.h): `R_AX_HIMR0` and `R_AX_HISR0`
+/// with the halt and watchdog bits `B_AX_HALT_C2H_INT_EN` and
+/// `B_AX_WDT_TIMEOUT_INT_EN`, `R_AX_PCIE_HIMR00` and `R_AX_PCIE_HISR00`
+/// with the DMA bits (each `*_INT` at its `*_INT_EN`'s position), and
+/// `R_AX_PCIE_HIMR10` and `R_AX_PCIE_HISR10` with the HC10 indication.
+pub const HIMR0: u32 = 0x01a0;
+pub const HISR0: u32 = 0x01a4;
+pub const WDT_TIMEOUT_INT_EN: u32 = 1 << 22;
+pub const HALT_C2H_INT_EN: u32 = 1 << 21;
+pub const PCIE_HIMR00: u32 = 0x10b0;
+pub const PCIE_HISR00: u32 = 0x10b4;
+pub const HS0ISR_IND_INT_EN: u32 = 1 << 24;
+pub const RPQBD_FULL_INT_EN: u32 = 1 << 20;
+pub const RDU_INT_EN: u32 = 1 << 19;
+pub const RXDMA_STUCK_INT_EN: u32 = 1 << 18;
+pub const TXDMA_STUCK_INT_EN: u32 = 1 << 17;
+pub const RPQDMA_INT_EN: u32 = 1 << 2;
+pub const RXP1DMA_INT_EN: u32 = 1 << 1;
+pub const RXDMA_INT_EN: u32 = 1 << 0;
+pub const HS0ISR_IND_INT: u32 = 1 << 24;
+pub const RPQBD_FULL_INT: u32 = 1 << 20;
+pub const RDU_INT: u32 = 1 << 19;
+pub const RXDMA_STUCK_INT: u32 = 1 << 18;
+pub const TXDMA_STUCK_INT: u32 = 1 << 17;
+pub const RPQDMA_INT: u32 = 1 << 2;
+pub const RXP1DMA_INT: u32 = 1 << 1;
+pub const RXDMA_INT: u32 = 1 << 0;
+pub const PCIE_HIMR10: u32 = 0x13b0;
+pub const PCIE_HISR10: u32 = 0x13b4;
+pub const HC10ISR_IND_INT_EN: u32 = 1 << 28;
+pub const HC10ISR_IND_INT: u32 = 1 << 28;

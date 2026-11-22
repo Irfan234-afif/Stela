@@ -56,6 +56,34 @@ by 4 plus width, delays 9, configuration reads 21 (23 refused) and writes 22
 - rtw89_pci_fwcmd_submit on CH12: the return and wp (70), the BD (71), the
   skb's length and the queue's (72).
 - rtw89_pci_release_fwcmd: each unmap (60), then both queues' lengths (61).
+
+A second program, interrupt.c, writes interrupt.bin in the same form, so
+oracle.c and trace.bin stay as they were. It takes rtw8852b_pci_info's
+interrupt members (rtw89_pci_config_intr_mask, rtw89_pci_enable_intr,
+rtw89_pci_disable_intr, rtw89_pci_recognize_intrs and rtw89_pci_isr_ax) with
+rtw89_pci_isr_rxd_unavail, rtw89_pci_ops_recovery_start and _complete,
+rtw89_pci_interrupt_handler, rtw89_pci_interrupt_threadfn with the low-power
+handler, rtw89_pci_enable_intr_lock and _disable_intr_lock,
+rtw89_pci_napi_poll, rtw89_pci_poll_rpq_dma, rtw89_pci_poll_rxq_dma and the
+rtw89_chip_* inlines unchanged, over MAC registers as bytes whose three HISRs
+clear the bits written to them. rtw89_pci_rxbd_recalc answers a scripted
+count per ring (83: ring, count), rtw89_pci_rxbd_deliver takes one frame per
+BD while the budget lasts (84: delivered, left), rtw89_pci_release_tx
+releases them all (85: count), rtw89_mac_get_err_status answers 0x1190, and
+rtw89_ser_notify keeps its error. Cases:
+
+- rtw89_chip_config_intr_mask through each configuration: the halt mask and
+  the recovery flag (90), the PCIe masks (91).
+- rtw89_chip_recognize_intrs over seven HISR patterns, normal then
+  recovering: the register accesses, the halt causes (93), the PCIe causes
+  (94).
+- Ten sequences of the start (rtw89_pci_enable_intr_lock), the stop
+  (rtw89_pci_disable_intr_lock), the recovery's start and completion, each
+  followed by the running and recovery flags (92), and looks: the HISRs and
+  the RX rings' indices set, the hard handler, the thread when the handler
+  wakes it, NAPI's poll while it is scheduled, then each error notified (80)
+  and the poll's return (~0 where none ran) with whether NAPI stays
+  scheduled (96).
 """
 import hashlib
 import json
@@ -1004,8 +1032,14 @@ int main(int argc, char **argv)
     run = subprocess.run([str(exe), str(trace)], check=True, capture_output=True, text=True)
     cases = int(run.stdout.strip())
     data = trace.read_bytes()
+    main_symbols = list(manifest)
+    interrupts = interrupt_oracle(
+        out, source, record, function, in_order, declaration, definition, fields,
+        [preamble, reg_h, pci_h_defines, core_defines, declarations, rxbd_defines],
+        dma_addr_set, chip)
+    interrupts['symbols'] = manifest[len(main_symbols):]
     receipt = dict(
-        linux_commit=COMMIT, symbols=manifest, cases=cases,
+        linux_commit=COMMIT, symbols=main_symbols, cases=cases,
         case_order='17 x rtw89_pci_alloc_trx_rings then hci.ops->mac_pre_init; '
                    'rtw89_pci_alloc_trx_rings alone with every RX BD; RX info and tag; '
                    'TX and RX recalc; TX BD availability, ring update and RX increase; '
@@ -1028,10 +1062,364 @@ int main(int argc, char **argv)
             'skb control buffer',
             'the RX tag is also checked with check_rx_tag true, which rtw8852b_pci_info does not '
             'set',
-        ])
+        ],
+        interrupt=interrupts)
     (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n', newline='\n')
     print(json.dumps({k: receipt[k] for k in ['cases', 'trace_bytes', 'trace_sha256']}))
+    print(json.dumps({k: interrupts[k] for k in ['cases', 'trace_bytes', 'trace_sha256']}))
     return 0
+
+
+def interrupt_oracle(out, source, record, function, in_order, declaration, definition, fields,
+                     shared, dma_addr_set, chip):
+    """The interrupt program: rtw8852b_pci_info's interrupt members over a
+    register model of their own, written to interrupt.bin."""
+    pci_info = fields('rtw8852be.c', 'static const struct rtw89_pci_info rtw8852b_pci_info',
+                      ['isr_def', 'config_intr_mask', 'enable_intr', 'disable_intr',
+                       'recognize_intrs'])
+    expected = {'isr_def': '&rtw89_pci_isr_ax', 'config_intr_mask': 'rtw89_pci_config_intr_mask',
+                'enable_intr': 'rtw89_pci_enable_intr', 'disable_intr': 'rtw89_pci_disable_intr',
+                'recognize_intrs': 'rtw89_pci_recognize_intrs'}
+    if pci_info != expected:
+        raise ValueError(f'rtw8852b_pci_info interrupt members are {pci_info}')
+    wdt = re.findall(r'^\tMAC_AX_ERR_L2_ERR_WDT_TIMEOUT_INT = (0x[0-9a-fA-F]+),$',
+                     source('mac.h'), re.M)
+    if len(wdt) != 1:
+        raise ValueError(f'mac.h: MAC_AX_ERR_L2_ERR_WDT_TIMEOUT_INT appears {len(wdt)} times')
+    record('mac.h', 'MAC_AX_ERR_L2_ERR_WDT_TIMEOUT_INT', wdt[0])
+    declarations = '\n\n'.join([
+        declaration('core.h', 'struct', 'rtw89_reg2_def'),
+        declaration('pci.h', 'struct', 'rtw89_pci_isr_def'),
+        declaration('pci.h', 'struct', 'rtw89_pci_isrs'),
+    ])
+    inlines = in_order('pci.h', [
+        'rtw89_chip_config_intr_mask', 'rtw89_chip_enable_intr', 'rtw89_chip_disable_intr',
+        'rtw89_chip_recognize_intrs'])
+    isr_ax = definition('pci.c', 'const struct rtw89_pci_isr_def rtw89_pci_isr_ax')
+    pci_c = in_order('pci.c', [
+        'rtw89_pci_poll_rxq_dma', 'rtw89_pci_poll_rpq_dma', 'rtw89_pci_isr_rxd_unavail',
+        'rtw89_pci_recognize_intrs', 'rtw89_pci_enable_intr', 'rtw89_pci_disable_intr',
+        'rtw89_pci_ops_recovery_start', 'rtw89_pci_ops_recovery_complete',
+        'rtw89_pci_low_power_interrupt_handler', 'rtw89_pci_interrupt_threadfn',
+        'rtw89_pci_interrupt_handler', 'rtw89_pci_enable_intr_lock',
+        'rtw89_pci_disable_intr_lock', 'rtw89_pci_config_intr_mask', 'rtw89_pci_napi_poll'])
+    harness = r'''
+#define likely(x) (x)
+#define RTW89_DBG_TXRX BIT(0)
+#define NAPI_POLL_WEIGHT 64
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+typedef int irqreturn_t;
+#define IRQ_HANDLED 1
+#define IRQ_WAKE_THREAD 2
+#define spin_lock_irqsave(l, f) ((void)(l), (f) = 0)
+#define spin_unlock_irqrestore(l, f) ((void)(l), (void)(f))
+#define local_bh_disable() ((void)0)
+#define local_bh_enable() ((void)0)
+#define MAC_AX_ERR_L2_ERR_WDT_TIMEOUT_INT @WDT@
+/* What the rtw89_mac_get_err_status stand-in answers. */
+#define ERR_STATUS 0x1190
+struct napi_struct { int unused; };
+struct rtw89_chip_info { enum rtw89_core_chip_id chip_id; };
+struct rtw89_dev {
+	const struct rtw89_chip_info *chip;
+	const struct rtw89_pci_info *pci_info;
+	struct napi_struct napi;
+	int napi_budget_countdown;
+	u8 priv[] __attribute__((aligned(8)));
+};
+static struct rtw89_pci *pci_of(struct rtw89_dev *dev) { return (struct rtw89_pci *)dev->priv; }
+
+/* The trace. */
+static u8 *segment;
+static size_t segment_bytes, segment_capacity;
+static void word(u32 v)
+{
+	if (segment_bytes + 4 > segment_capacity) {
+		segment_capacity = segment_capacity ? 2 * segment_capacity : 4096;
+		segment = realloc(segment, segment_capacity);
+		if (!segment)
+			abort();
+	}
+	for (int i = 0; i < 4; i++)
+		segment[segment_bytes++] = v >> (8 * i);
+}
+static void record(u32 tag, u32 r, u32 v) { word(tag); word(r); word(v); }
+static void model_delay(u64 us) { if (us > UINT32_MAX) abort(); record(9, 0, (u32)us); }
+static void flush(FILE *out)
+{
+	u32 n = segment_bytes;
+	u8 length[4] = {n, n >> 8, n >> 16, n >> 24};
+	if (fwrite(length, 1, 4, out) != 4 || fwrite(segment, 1, n, out) != n)
+		abort();
+	segment_bytes = 0;
+}
+
+/* MAC registers as bytes; the three HISRs clear the bits written to them. */
+static u8 memory[0x10000];
+static u32 get(u32 r) { u32 v = 0; for (u32 i = 0; i < 4; i++) v |= (u32)memory[r + i] << (8 * i); return v; }
+static void set(u32 r, u32 v) { for (u32 i = 0; i < 4; i++) memory[r + i] = v >> (8 * i); }
+static void check(u32 r) { if ((r & 3) || r + 4 > sizeof(memory)) abort(); }
+static int w1c(u32 r) { return r == R_AX_HISR0 || r == R_AX_PCIE_HISR00 || r == R_AX_PCIE_HISR10; }
+static u32 rtw89_read32(struct rtw89_dev *d, u32 r) { (void)d; check(r); u32 v = get(r); record(4, r, v); return v; }
+static void rtw89_write32(struct rtw89_dev *d, u32 r, u32 v)
+{
+	(void)d;
+	check(r);
+	record(8, r, v);
+	set(r, w1c(r) ? get(r) & ~v : v);
+}
+
+/* NAPI and the rings: what each ring holds is scripted; a BD carries one
+ * frame or report. */
+static int napi_scheduled;
+static u32 pending[RTW89_RXCH_NUM];
+static u32 sers, ser[4];
+static void napi_schedule(struct napi_struct *n) { (void)n; napi_scheduled = 1; }
+static bool napi_complete_done(struct napi_struct *n, int work_done)
+{
+	(void)n; (void)work_done;
+	napi_scheduled = 0;
+	return true;
+}
+static u32 ring_of(struct rtw89_dev *dev, struct rtw89_pci_rx_ring *rx_ring)
+{
+	return (u32)(rx_ring - pci_of(dev)->rx.rings);
+}
+static u32 rtw89_pci_rxbd_recalc(struct rtw89_dev *dev, struct rtw89_pci_rx_ring *rx_ring)
+{
+	u32 ring = ring_of(dev, rx_ring);
+	record(83, ring, pending[ring]);
+	return pending[ring];
+}
+static void rtw89_pci_rxbd_deliver(struct rtw89_dev *dev, struct rtw89_pci_rx_ring *rx_ring,
+				   u32 cnt)
+{
+	u32 ring = ring_of(dev, rx_ring), delivered = 0;
+	while (cnt && dev->napi_budget_countdown > 0) {
+		dev->napi_budget_countdown--;
+		cnt--;
+		delivered++;
+	}
+	pending[ring] -= delivered;
+	record(84, delivered, cnt);
+}
+static void rtw89_pci_release_tx(struct rtw89_dev *dev, struct rtw89_pci_rx_ring *rx_ring, u32 cnt)
+{
+	pending[ring_of(dev, rx_ring)] -= cnt;
+	record(85, cnt, 0);
+}
+static u32 rtw89_mac_get_err_status(struct rtw89_dev *dev) { (void)dev; return ERR_STATUS; }
+static int rtw89_ser_notify(struct rtw89_dev *dev, u32 err)
+{
+	(void)dev;
+	if (sers == ARRAY_SIZE(ser))
+		abort();
+	ser[sers++] = err;
+	return 0;
+}
+'''.replace('@WDT@', wdt[0])
+    tables = (
+        f'static const struct rtw89_chip_info rtw8852b_chip_info = {{ .chip_id = {chip["chip_id"]} }};\n'
+        'static const struct rtw89_pci_info rtw8852b_pci_info = {\n'
+        + ''.join(f'\t.{name} = {value},\n' for name, value in pci_info.items())
+        + '};\n')
+    main_c = r'''
+enum { LOOK, ENABLE, DISABLE, RECOVERY_START, RECOVERY_COMPLETE };
+struct step { int op; u32 hisr[3]; u32 idx[RTW89_RXCH_NUM]; u32 pending[RTW89_RXCH_NUM]; };
+struct look_case { u32 lens[RTW89_RXCH_NUM]; u32 steps; struct step step[6]; };
+#define CAUSES_RX B_AX_RXDMA_INT | B_AX_TXDMA_ACH0_INT
+static const struct look_case looks[] = {
+	{{256, 256}, 2, {{ENABLE}, {LOOK, {0, CAUSES_RX, 0}, {0, 0}, {5, 0}}}},
+	{{256, 256}, 2, {{ENABLE}, {LOOK, {0, B_AX_RPQDMA_INT | B_AX_RXP1DMA_INT,
+					   B_AX_HC10ISR_IND_INT | B_AX_TXDMA_CH11_INT}, {0, 0}, {10, 3}}}},
+	{{256, 256}, 4, {{ENABLE},
+			 {LOOK, {0, B_AX_RDU_INT | B_AX_RXDMA_INT, 0}, {5 << 16 | 6, 10 << 16 | 20}, {255, 0}},
+			 {LOOK, {0, B_AX_RDU_INT, 0}, {69 << 16 | 70, 10 << 16 | 20}, {30, 0}},
+			 {LOOK, {0, 0, 0}, {99 << 16 | 70, 10 << 16 | 20}, {0, 0}}}},
+	{{8, 8}, 2, {{ENABLE}, {LOOK, {0, B_AX_RDU_INT, 0}, {7 << 16, 3 << 16 | 4}, {8, 2}}}},
+	{{256, 256}, 3, {{ENABLE},
+			 {LOOK, {0, B_AX_RPQDMA_INT | B_AX_RPQBD_FULL_INT | B_AX_RXDMA_INT, 0}, {0, 0}, {4, 100}},
+			 {LOOK, {0, 0, 0}, {0, 0}, {4, 0}}}},
+	{{256, 256}, 3, {{ENABLE}, {LOOK, {0, B_AX_RXDMA_INT, 0}, {0, 0}, {60, 4}},
+			 {LOOK, {0, 0, 0}, {0, 0}, {0, 0}}}},
+	{{256, 256}, 2, {{ENABLE},
+			 {LOOK, {B_AX_HALT_C2H_INT_EN | B_AX_WDT_TIMEOUT_INT_EN | BIT(0),
+				 B_AX_HS0ISR_IND_INT | B_AX_RXDMA_STUCK_INT | B_AX_TXDMA_STUCK_INT, 0},
+			  {0, 0}, {0, 0}}}},
+	{{256, 256}, 4, {{LOOK, {B_AX_HALT_C2H_INT_EN, B_AX_RXDMA_INT, B_AX_HC10ISR_IND_INT}, {0, 0}, {3, 3}},
+			 {ENABLE}, {DISABLE},
+			 {LOOK, {B_AX_HALT_C2H_INT_EN, B_AX_RXDMA_INT, B_AX_HC10ISR_IND_INT}, {0, 0}, {3, 3}}}},
+	{{256, 256}, 5, {{ENABLE}, {RECOVERY_START},
+			 {LOOK, {B_AX_HALT_C2H_INT_EN, B_AX_HS0ISR_IND_INT | B_AX_RXDMA_INT | B_AX_RDU_INT,
+				 B_AX_HC10ISR_IND_INT}, {5 << 16 | 6, 0}, {1, 1}},
+			 {RECOVERY_COMPLETE},
+			 {LOOK, {0, B_AX_RXDMA_INT, 0}, {0, 0}, {1, 1}}}},
+	{{256, 256}, 3, {{ENABLE}, {LOOK, {0, 0, 0}, {0, 0}, {0, 0}}, {DISABLE}}},
+};
+static const u32 recognized[][3] = {
+	{0, 0, 0},
+	{B_AX_HALT_C2H_INT_EN | B_AX_WDT_TIMEOUT_INT_EN, B_AX_RXDMA_INT | B_AX_RPQDMA_INT,
+	 B_AX_HC10ISR_IND_INT},
+	{0xffffffff, 0xffffffff, 0xffffffff},
+	{B_AX_HALT_C2H_INT_EN, B_AX_RDU_INT | B_AX_RXP1DMA_INT | B_AX_TXDMA_ACH0_INT, 0},
+	{B_AX_WDT_TIMEOUT_INT_EN, B_AX_HS0ISR_IND_INT | B_AX_RXDMA_STUCK_INT | B_AX_TXDMA_STUCK_INT |
+	 B_AX_RPQBD_FULL_INT, B_AX_TXDMA_CH11_INT},
+	{0x13ac9571, 0x77235491, 0x129d2157},
+	{0xec536a8e, 0x88dcab6e, 0xed62dea8},
+};
+static struct rtw89_dev *new_dev(void)
+{
+	struct rtw89_dev *dev = calloc(1, sizeof(*dev) + sizeof(struct rtw89_pci));
+	if (!dev)
+		abort();
+	dev->chip = &rtw8852b_chip_info;
+	dev->pci_info = &rtw8852b_pci_info;
+	memset(memory, 0, sizeof(memory));
+	napi_scheduled = 0;
+	/* rtw89_pci_request_irq's mask configuration. */
+	rtw89_chip_config_intr_mask(dev, RTW89_PCI_INTR_MASK_RESET);
+	return dev;
+}
+static void state(struct rtw89_dev *dev)
+{
+	struct rtw89_pci *p = pci_of(dev);
+	record(92, p->running, p->under_recovery);
+}
+static void look(struct rtw89_dev *dev, const struct step *s)
+{
+	struct rtw89_pci *p = pci_of(dev);
+	set(R_AX_HISR0, s->hisr[0]);
+	set(R_AX_PCIE_HISR00, s->hisr[1]);
+	set(R_AX_PCIE_HISR10, s->hisr[2]);
+	for (int i = 0; i < RTW89_RXCH_NUM; i++) {
+		set(p->rx.rings[i].bd_ring.addr.idx, s->idx[i]);
+		pending[i] = s->pending[i];
+	}
+	sers = 0;
+	if (!napi_scheduled && rtw89_pci_interrupt_handler(0, dev) == IRQ_WAKE_THREAD)
+		rtw89_pci_interrupt_threadfn(0, dev);
+	u32 work = UINT32_MAX;
+	if (napi_scheduled)
+		work = rtw89_pci_napi_poll(&dev->napi, NAPI_POLL_WEIGHT);
+	for (u32 i = 0; i < sers; i++)
+		record(80, ser[i], 0);
+	record(96, work, napi_scheduled);
+}
+int main(int argc, char **argv)
+{
+	if (argc != 2)
+		return 2;
+	FILE *out = fopen(argv[1], "wb");
+	if (!out)
+		abort();
+	u32 cases = 0;
+
+	/* rtw89_chip_config_intr_mask through each configuration. */
+	static const enum rtw89_pci_intr_mask_cfg cfgs[] = {
+		RTW89_PCI_INTR_MASK_RESET, RTW89_PCI_INTR_MASK_RECOVERY_START,
+		RTW89_PCI_INTR_MASK_NORMAL, RTW89_PCI_INTR_MASK_LOW_POWER,
+		RTW89_PCI_INTR_MASK_RECOVERY_COMPLETE, RTW89_PCI_INTR_MASK_RECOVERY_START,
+		RTW89_PCI_INTR_MASK_RESET,
+	};
+	struct rtw89_dev *dev = new_dev();
+	for (size_t i = 0; i < ARRAY_SIZE(cfgs); i++) {
+		struct rtw89_pci *p = pci_of(dev);
+		rtw89_chip_config_intr_mask(dev, cfgs[i]);
+		record(90, p->halt_c2h_intrs, p->under_recovery);
+		record(91, p->intrs[0], p->intrs[1]);
+	}
+	free(dev);
+	flush(out);
+	cases++;
+
+	/* rtw89_chip_recognize_intrs over each pattern, normal then recovering. */
+	for (int recovering = 0; recovering < 2; recovering++) {
+		dev = new_dev();
+		if (recovering)
+			rtw89_chip_config_intr_mask(dev, RTW89_PCI_INTR_MASK_RECOVERY_START);
+		for (size_t i = 0; i < ARRAY_SIZE(recognized); i++) {
+			struct rtw89_pci_isrs isrs = {0};
+			set(R_AX_HISR0, recognized[i][0]);
+			set(R_AX_PCIE_HISR00, recognized[i][1]);
+			set(R_AX_PCIE_HISR10, recognized[i][2]);
+			rtw89_chip_recognize_intrs(dev, pci_of(dev), &isrs);
+			record(93, isrs.halt_c2h_isrs, 0);
+			record(94, isrs.isrs[0], isrs.isrs[1]);
+		}
+		free(dev);
+		flush(out);
+		cases++;
+	}
+
+	/* Looks: the hard handler, the thread while it is woken, then NAPI
+	 * while it is scheduled. */
+	for (size_t c = 0; c < ARRAY_SIZE(looks); c++) {
+		dev = new_dev();
+		struct rtw89_pci *p = pci_of(dev);
+		for (int i = 0; i < RTW89_RXCH_NUM; i++) {
+			p->rx.rings[i].bd_ring.addr = rtw89_pci_ch_dma_addr_set.rx[i];
+			p->rx.rings[i].bd_ring.len = looks[c].lens[i];
+		}
+		for (u32 s = 0; s < looks[c].steps; s++) {
+			const struct step *step = &looks[c].step[s];
+			switch (step->op) {
+			case LOOK: look(dev, step); continue;
+			case ENABLE: rtw89_pci_enable_intr_lock(dev); break;
+			case DISABLE: rtw89_pci_disable_intr_lock(dev); break;
+			case RECOVERY_START: rtw89_pci_ops_recovery_start(dev); break;
+			case RECOVERY_COMPLETE: rtw89_pci_ops_recovery_complete(dev); break;
+			default: abort();
+			}
+			state(dev);
+		}
+		free(dev);
+		flush(out);
+		cases++;
+	}
+	if (fclose(out))
+		abort();
+	free(segment);
+	printf("%u\n", cases);
+	return 0;
+}
+'''
+    preamble, *rest = shared
+    program = '\n\n'.join([preamble, *rest, declarations, harness, dma_addr_set, inlines, isr_ax,
+                           pci_c, tables, main_c])
+    generated = out / 'interrupt.c'
+    generated.write_text(program, newline='\n')
+    exe = out / 'interrupt'
+    subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-fsanitize=address,undefined',
+                    '-fno-sanitize-recover=all', '-Wno-unused-function',
+                    str(generated), '-o', str(exe)], check=True)
+    trace = out / 'interrupt.bin'
+    run = subprocess.run([str(exe), str(trace)], check=True, capture_output=True, text=True)
+    data = trace.read_bytes()
+    return dict(
+        cases=int(run.stdout.strip()),
+        case_order='rtw89_chip_config_intr_mask through RESET, RECOVERY_START, NORMAL, '
+                   'LOW_POWER, RECOVERY_COMPLETE, RECOVERY_START, RESET; '
+                   'rtw89_chip_recognize_intrs over 7 patterns, normal then recovering; '
+                   '10 sequences of rtw89_pci_enable_intr_lock, rtw89_pci_disable_intr_lock, '
+                   'rtw89_pci_ops_recovery_start and _complete, and looks: '
+                   'rtw89_pci_interrupt_handler, rtw89_pci_interrupt_threadfn where it wakes the '
+                   'thread, rtw89_pci_napi_poll while NAPI is scheduled',
+        dispatch=dict(rtw8852b_pci_info=pci_info, rtw8852b_chip_info=dict(chip_id=chip['chip_id'])),
+        trace_bytes=len(data), trace_sha256=hashlib.sha256(data).hexdigest(),
+        generated_source_sha256=hashlib.sha256(generated.read_bytes()).hexdigest(),
+        oracle_limit=[
+            'MMIO is a model; HISR0, PCIE_HISR00 and PCIE_HISR10 clear the bits written to '
+            'them, which is what rtw89 relies on, not something read from a chip',
+            'Linux\'s IRQ core and NAPI are a harness: a look runs the hard handler, the thread '
+            'when the handler wakes it, and NAPI\'s poll while napi_schedule left it scheduled; '
+            'napi_complete_done always completes',
+            'rtw89_pci_rxbd_recalc, rtw89_pci_rxbd_deliver and rtw89_pci_release_tx are stubs '
+            'over a scripted count per ring, one frame or report per BD, which keep the budget '
+            'countdown as rtw89_core_napi_rx does; the delivery\'s index write is left out',
+            'rtw89_mac_get_err_status answers a constant and rtw89_ser_notify only records the '
+            'error: the SER is step 5.3',
+            'low power is never entered',
+        ])
 
 
 if __name__ == '__main__':

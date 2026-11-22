@@ -2503,6 +2503,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "interrupt_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/interrupt/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_PCI_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 PCIe interrupt C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "h2c_headers_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/tests.rs",
     "kind": "oracle",

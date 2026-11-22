@@ -42,6 +42,7 @@ pub mod features;
 pub mod fwdl;
 pub mod h2c;
 pub mod h2creg;
+pub mod interrupt;
 pub mod io;
 pub mod listen;
 pub mod mac;
