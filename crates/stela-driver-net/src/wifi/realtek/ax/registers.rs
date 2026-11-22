@@ -1401,3 +1401,79 @@ pub const PCIE_HIMR10: u32 = 0x13b0;
 pub const PCIE_HISR10: u32 = 0x13b4;
 pub const HC10ISR_IND_INT_EN: u32 = 1 << 28;
 pub const HC10ISR_IND_INT: u32 = 1 << 28;
+/// A port's registers as `rtw89_port_base_ax` (mac.c) names them for port
+/// 0; port `n`'s are 0x40 bytes on (`rtw89_mac_reg_by_port`). `R_AX_PORT_CFG_P0`
+/// and the bits `rtw89_mac_port_update` sets and clears in it.
+pub const PORT_CFG_P0: u32 = 0xc400;
+pub const BRK_SETUP: u32 = 1 << 16;
+pub const TBTT_PROHIB_EN: u32 = 1 << 13;
+pub const BCNTX_EN: u32 = 1 << 12;
+pub const NET_TYPE_MASK: u32 = 0x0000_0c00;
+pub const TSFTR_RST: u32 = 1 << 5;
+pub const RX_BSSID_FIT_EN: u32 = 1 << 4;
+pub const TSF_UDT_EN: u32 = 1 << 3;
+pub const PORT_FUNC_EN: u32 = 1 << 2;
+pub const TXBCN_RPT_EN: u32 = 1 << 1;
+pub const RXBCN_RPT_EN: u32 = 1 << 0;
+/// `R_AX_TBTT_PROHIB_P0` with `B_AX_TBTT_HOLD_MASK` and `B_AX_TBTT_SETUP_MASK`.
+pub const TBTT_PROHIB_P0: u32 = 0xc404;
+pub const TBTT_HOLD_MASK: u32 = 0x0fff_0000;
+pub const TBTT_SETUP_MASK: u32 = 0x0000_00ff;
+/// `R_AX_BCN_AREA_P0` with `B_AX_BCN_MSK_AREA_MASK`.
+pub const BCN_AREA_P0: u32 = 0xc408;
+pub const BCN_MSK_AREA_MASK: u32 = 0x0fff_0000;
+/// `R_AX_BCNERLYINT_CFG_P0` with `B_AX_BCNERLY_MASK`.
+pub const BCNERLYINT_CFG_P0: u32 = 0xc40c;
+pub const BCNERLY_MASK: u32 = 0x0000_0fff;
+/// `R_AX_TBTTERLYINT_CFG_P0` with `B_AX_TBTTERLY_MASK`.
+pub const TBTTERLYINT_CFG_P0: u32 = 0xc40e;
+pub const TBTTERLY_MASK: u32 = 0x0000_0fff;
+/// `R_AX_TBTT_AGG_P0` with `B_AX_TBTT_AGG_NUM_MASK`.
+pub const TBTT_AGG_P0: u32 = 0xc412;
+pub const TBTT_AGG_NUM_MASK: u32 = 0x0000_ff00;
+/// `R_AX_BCN_SPACE_CFG_P0` with `B_AX_BCN_SPACE_MASK`.
+pub const BCN_SPACE_CFG_P0: u32 = 0xc414;
+pub const BCN_SPACE_MASK: u32 = 0x0000_ffff;
+/// `R_AX_DTIM_CTRL_P0` with `B_AX_DTIM_NUM_MASK`.
+pub const DTIM_CTRL_P0: u32 = 0xc426;
+pub const DTIM_NUM_MASK: u32 = 0x0000_ff00;
+/// `R_AX_BCN_CNT_TMR_P0`.
+pub const BCN_CNT_TMR_P0: u32 = 0xc434;
+/// `R_AX_MBSSID_CTRL` with `B_AX_P0MB_ALL_MASK`.
+pub const MBSSID_CTRL: u32 = 0xc568;
+pub const P0MB_ALL_MASK: u32 = 0x00ff_fffe;
+/// `R_AX_P0MB_HGQ_WINDOW_CFG_0` and `R_AX_PORT_HGQ_WINDOW_CFG`, the high
+/// queue windows of port 0 and of ports 1 to 4 (a byte each).
+pub const P0MB_HGQ_WINDOW_CFG_0: u32 = 0xc590;
+pub const PORT_HGQ_WINDOW_CFG: u32 = 0xc5a0;
+/// `R_AX_MBSSID_DROP_0` with `B_AX_PORT_DROP_4_0_MASK`.
+pub const MBSSID_DROP_0: u32 = 0xc63c;
+pub const PORT_DROP_4_0_MASK: u32 = 0x001f_0000;
+/// `R_AX_PTCL_BSS_COLOR_0` with `B_AX_BSS_COLOB_AX_PORT_0_MASK` to
+/// `_3_MASK`; port 4's color is `B_AX_BSS_COLOB_AX_PORT_4_MASK` of the word
+/// after (`R_AX_PTCL_BSS_COLOR_1`).
+pub const PTCL_BSS_COLOR_0: u32 = 0xc6a0;
+pub const BSS_COLOR_PORT_MASKS: [u32; 5] = [
+    0x0000_003f,
+    0x0000_3f00,
+    0x003f_0000,
+    0x3f00_0000,
+    0x0000_003f,
+];
+/// `R_AX_MD_TSFT_STMP_CTL` with `B_AX_UPD_HGQMD` and `B_AX_UPD_TIMIE`.
+pub const MD_TSFT_STMP_CTL: u32 = 0xca08;
+pub const UPD_HGQMD: u8 = 1 << 1;
+pub const UPD_TIMIE: u8 = 1 << 0;
+/// `R_AX_BCN_PSR_RPT_P0` with `B_AX_BCAID_P0_MASK`.
+pub const BCN_PSR_RPT_P0: u32 = 0xce84;
+pub const BCAID_P0_MASK: u32 = 0x0000_07ff;
+/// `R_AX_FILTER_MODEL_ADDR` and `R_AX_INDIR_ACCESS_ENTRY` (mac.h), the
+/// indirect window `rtw89_mac_dmac_tbl_init` and `rtw89_mac_cmac_tbl_init`
+/// write a MAC ID's tables through, and the tables' bases in that window:
+/// `DMAC_TBL_BASE_ADDR` and `CMAC_TBL_BASE_ADDR`, `CCTL_INFO_SIZE` bytes
+/// per MAC ID in the latter.
+pub const FILTER_MODEL_ADDR: u32 = 0x0c04;
+pub const INDIR_ACCESS_ENTRY: u32 = 0x4_0000;
+pub const DMAC_TBL_BASE_ADDR: u32 = 0x1880_0000;
+pub const CMAC_TBL_BASE_ADDR: u32 = 0x1884_0000;
+pub const CCTL_INFO_SIZE: u32 = 32;

@@ -2523,6 +2523,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "station_h2c_bytes_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/station/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_H2C_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 station role, CAM and CMAC table H2C C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "fwdl_packets_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/fwdl/tests.rs",
     "kind": "oracle",

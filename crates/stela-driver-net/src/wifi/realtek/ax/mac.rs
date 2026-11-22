@@ -1010,5 +1010,7 @@ fn hw_sch_tx_en_h2c<I: Io + ?Sized>(
     Ok(())
 }
 
+pub mod port;
+
 #[cfg(test)]
 mod tests;

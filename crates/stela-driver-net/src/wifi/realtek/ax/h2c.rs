@@ -402,6 +402,7 @@ impl Channel<'_> {
     }
 }
 pub mod phy;
+pub mod station;
 
 #[cfg(test)]
 mod tests;
