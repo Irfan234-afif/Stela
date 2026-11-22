@@ -155,6 +155,16 @@ pub trait Registers: Io {
         let value = self.read16(register)?;
         self.write16(register, value & !bits)
     }
+    /// `rtw89_write8_mask`: the mask's low 8 bits, a read, then the write,
+    /// made even when the byte does not change.
+    fn write8_mask(&mut self, register: u32, mask: u32, data: u8) -> Result<(), Error> {
+        let mask = mask & 0xff;
+        let original = self.read8(register)?;
+        self.write8(
+            register,
+            (original & !(mask as u8)) | prep(u32::from(data), mask) as u8,
+        )
+    }
     /// `rtw89_write8_set`.
     fn write8_set(&mut self, register: u32, bits: u8) -> Result<(), Error> {
         let value = self.read8(register)?;

@@ -6,7 +6,8 @@
 //! `rtw89_mac_power_switch`, with RTL8852B's `rtw8852b_pwr_on_func` and
 //! `rtw8852b_pwr_off_func` (rtw8852b.c), the AX generation's
 //! `reset_pwr_state`, the scoreboard notice, and the physical efuse read the
-//! first power-on makes (`rtw89_efuse_read_fw_secure_ax`, efuse.c).
+//! first power-on makes (`rtw89_efuse_read_fw_secure_ax`, efuse.c), which
+//! [`efuse::read_fw_secure`] makes.
 //!
 //! Each step makes the reads and writes its rtw89 counterpart makes, in the
 //! same order, read-modify-write included. `fsleep(1000)` is a 1000 us
@@ -31,7 +32,8 @@
 //! It proves nothing about the rails, clocks, analog front end or firmware,
 //! and nothing here enables, stops or proves the end of the chip's DMA.
 use super::{
-    io::{self, Io, Registers, prep},
+    efuse,
+    io::{self, Io, Registers},
     registers::*,
     rtw8852b::{BTC_SB_CFG, RTL8852B_RFE_05_SPS_ANA},
 };
@@ -39,15 +41,6 @@ use super::{
 /// `read_poll_timeout(…, 1000, 20000, …)`: the power polls' step and bound.
 const POLL_STEP_US: u64 = 1000;
 const POLL_BOUND_US: u64 = 20_000;
-/// `EFUSE_EXTERNALPN_ADDR_AX`: the first of the two physical efuse bytes
-/// `rtw89_efuse_read_fw_secure_ax` reads.
-pub const EFUSE_EXTERNALPN_ADDR_AX: u32 = 0x5ec;
-/// The attempts `rtw89_dump_physical_efuse_map` makes.
-const EFUSE_ATTEMPTS: usize = 5;
-/// `read_poll_timeout_atomic(…, 1, 1000000, true, …)`: one physical efuse
-/// byte's step and bound.
-const EFUSE_STEP_US: u64 = 1;
-const EFUSE_BOUND_US: u64 = 1_000_000;
 
 /// What rtw89's power path reads from its own state rather than the chip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,8 +97,8 @@ pub struct PoweredOn {
     /// off and on again: [`Error::AlreadyOn`] for a chip a previous boot left
     /// on.
     pub first_failure: Option<Error>,
-    /// The physical efuse bytes at [`EFUSE_EXTERNALPN_ADDR_AX`] and the next
-    /// address, uninterpreted, or why the fifth attempt to read them failed,
+    /// The physical efuse bytes at [`efuse::EFUSE_EXTERNALPN_ADDR_AX`] and the
+    /// next address, uninterpreted, or why the fifth attempt to read them failed,
     /// which rtw89 only warns about. `None` once probe is done, where rtw89
     /// does not read them.
     pub secure_efuse: Option<Result<[u8; 2], io::Error>>,
@@ -147,7 +140,7 @@ fn switch_on<I: Io + ?Sized>(
     reset_pwr_state(io)?;
     pwr_on_func(io, inputs)?;
     // rtw89 ignores what `efuse_read_fw_secure` returns.
-    let secure_efuse = (!inputs.probe_done).then(|| read_fw_secure(io, inputs.cut));
+    let secure_efuse = (!inputs.probe_done).then(|| efuse::read_fw_secure(io, inputs.cut));
     update_scoreboard(io, MAC_AX_NOTIFY_TP_MAJOR)?;
     Ok(secure_efuse)
 }
@@ -350,70 +343,6 @@ fn pwr_off_func<I: Io + ?Sized>(io: &mut I, inputs: &Inputs) -> Result<(), io::E
     io.write32_set(SYS_SWR_CTRL1, SYM_CTRL_SPS_PWMFREQ)?;
     io.write32_mask(SPS_DIG_ON_CTRL0, REG_ZCDC_H_MASK, 0x3)?;
     io.write32_set(SYS_PW_CTRL, APFM_SWLPS)
-}
-
-/// `rtw89_efuse_read_fw_secure_ax`'s read: `rtw89_dump_physical_efuse_map`
-/// of the two bytes from [`EFUSE_EXTERNALPN_ADDR_AX`] through DDV, five
-/// attempts at most. `rtw89_switch_efuse_bank` makes no access on an
-/// RTL8852B.
-fn read_fw_secure<I: Io + ?Sized>(io: &mut I, cut: u8) -> Result<[u8; 2], io::Error> {
-    let mut map = [0; 2];
-    let mut result = Ok(());
-    for _ in 0..EFUSE_ATTEMPTS {
-        result = dump_physical_efuse_ddv(io, cut, EFUSE_EXTERNALPN_ADDR_AX, &mut map);
-        if result.is_ok() {
-            break;
-        }
-    }
-    result.map(|()| map)
-}
-
-/// `rtw89_dump_physical_efuse_map_ddv` on an RTL8852B: power the efuse up,
-/// read one byte per address, power it down. A byte that never reads ready
-/// ends the attempt before the power-down, as in rtw89.
-fn dump_physical_efuse_ddv<I: Io + ?Sized>(
-    io: &mut I,
-    cut: u8,
-    address: u32,
-    map: &mut [u8],
-) -> Result<(), io::Error> {
-    // rtw89_enable_efuse_pwr_cut_ddv
-    io.write8_set(PMC_DBG_CTRL2, SYSON_DIS_PMCR_AX_WRMSK as u8)?;
-    io.write16_set(SYS_ISO_CTRL, PWC_EV2EF_B14 as u16)?;
-    io.delay_us(1000);
-    io.write16_set(SYS_ISO_CTRL, PWC_EV2EF_B15 as u16)?;
-    io.write16_clr(SYS_ISO_CTRL, ISO_EB2CORE as u16)?;
-    if cut == CHIP_CAV {
-        // rtw89_enable_otp_burst_mode(rtwdev, true)
-        io.write32_set(EFUSE_CTRL_1_V1, EF_BURST)?;
-    }
-
-    for (at, byte) in (address..).zip(map.iter_mut()) {
-        let control = prep(at, EF_ADDR_MASK);
-        io.write32(EFUSE_CTRL, control & !EF_RDY)?;
-        // read_poll_timeout_atomic(…, 1, 1000000, true, …) waits one step
-        // before its first read, and that step counts toward the bound.
-        io.delay_us(EFUSE_STEP_US);
-        let control = io.poll32(
-            EFUSE_CTRL,
-            EF_RDY,
-            EFUSE_STEP_US,
-            EFUSE_BOUND_US - EFUSE_STEP_US,
-            |value| value & EF_RDY != 0,
-        )?;
-        *byte = control as u8;
-    }
-
-    // rtw89_disable_efuse_pwr_cut_ddv
-    if cut == CHIP_CAV {
-        // rtw89_enable_otp_burst_mode(rtwdev, false)
-        io.write32_clr(EFUSE_CTRL_1_V1, EF_BURST)?;
-    }
-    io.write16_set(SYS_ISO_CTRL, ISO_EB2CORE as u16)?;
-    io.write16_clr(SYS_ISO_CTRL, PWC_EV2EF_B15 as u16)?;
-    io.delay_us(1000);
-    io.write16_clr(SYS_ISO_CTRL, PWC_EV2EF_B14 as u16)?;
-    io.write8_clr(PMC_DBG_CTRL2, SYSON_DIS_PMCR_AX_WRMSK as u8)
 }
 
 #[cfg(test)]

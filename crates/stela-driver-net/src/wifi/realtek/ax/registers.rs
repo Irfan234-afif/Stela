@@ -82,6 +82,11 @@ pub const SYS_FUNC_EN: u32 = 0x0002;
 pub const FEN_BB_GLB_RSTN: u32 = 1 << 1;
 pub const FEN_BBRSTB: u32 = 1 << 0;
 
+/// `R_AX_SYS_WL_EFUSE_CTRL` and `B_AX_AUTOLOAD_SUS`, which
+/// `rtw89_parse_efuse_map_ax` reads as the efuse being valid.
+pub const SYS_WL_EFUSE_CTRL: u32 = 0x000a;
+pub const AUTOLOAD_SUS: u16 = 1 << 5;
+
 /// `R_AX_SYS_PW_CTRL` and its bits.
 pub const SYS_PW_CTRL: u32 = 0x0004;
 pub const DIS_WLBT_PDNSUSEN_SOPC: u32 = 1 << 18;
@@ -205,6 +210,12 @@ pub const BOOT_REASON_MASK: u32 = 0x0000_0007;
 /// `R_AX_UDM1` and `R_AX_UDM2`.
 pub const UDM1: u32 = 0x01f4;
 pub const UDM2: u32 = 0x01f8;
+/// UDM1's `B_AX_UDM1_HALMAC_C2H_ENQ_CNT_MASK` and
+/// `B_AX_UDM1_HALMAC_H2C_DEQ_CNT_MASK`, where the register mailbox counts
+/// what it received and sent (`rtw8852b_chip_info.c2h_counter_reg` and
+/// `.h2c_counter_reg` reach them a byte up, at `R_AX_UDM1 + 1`).
+pub const UDM1_HALMAC_C2H_ENQ_CNT_MASK: u32 = 0x0000_f000;
+pub const UDM1_HALMAC_H2C_DEQ_CNT_MASK: u32 = 0x0000_0f00;
 
 /// `R_AX_SPS_DIG_ON_CTRL0` and its fields.
 pub const SPS_DIG_ON_CTRL0: u32 = 0x0200;
@@ -436,6 +447,22 @@ pub const HCI_FUNC_EN: u32 = 0x8380;
 pub const HCI_RXDMA_EN: u32 = 1 << 1;
 pub const HCI_TXDMA_EN: u32 = 1 << 0;
 
+/// The register mailbox (`rtw8852b_h2c_regs`, `rtw8852b_c2h_regs`,
+/// `rtw8852b_chip_info.h2c_ctrl_reg` and `.c2h_ctrl_reg`): `R_AX_H2CREG_DATA0`
+/// to `R_AX_H2CREG_DATA3`, `R_AX_C2HREG_DATA0` to `R_AX_C2HREG_DATA3`,
+/// `R_AX_H2CREG_CTRL` with `B_AX_H2CREG_TRIGGER`, and `R_AX_C2HREG_CTRL`.
+pub const H2CREG_DATA0: u32 = 0x8140;
+pub const H2CREG_DATA1: u32 = 0x8144;
+pub const H2CREG_DATA2: u32 = 0x8148;
+pub const H2CREG_DATA3: u32 = 0x814c;
+pub const C2HREG_DATA0: u32 = 0x8150;
+pub const C2HREG_DATA1: u32 = 0x8154;
+pub const C2HREG_DATA2: u32 = 0x8158;
+pub const C2HREG_DATA3: u32 = 0x815c;
+pub const H2CREG_CTRL: u32 = 0x8160;
+pub const H2CREG_TRIGGER: u8 = 1 << 0;
+pub const C2HREG_CTRL: u32 = 0x8164;
+
 /// `R_AX_BOOT_DBG` (`rtw89_mac_gen_ax.boot_dbg`), which a failed download
 /// reads.
 pub const BOOT_DBG: u32 = 0x83f0;
@@ -586,6 +613,18 @@ pub const XTAL_SI_PON_EI: u8 = 1 << 1;
 pub const XTAL_SI_PON_WEI: u8 = 1 << 0;
 pub const XTAL_SI_SRAM_CTRL: u8 = 0xa1;
 pub const XTAL_SI_SRAM_DIS: u8 = 1 << 1;
+/// The XTAL SI offsets and fields `rtw89_dump_physical_efuse_map_dav` reads
+/// a DAV efuse byte through: `XTAL_SI_LOW_ADDR` with `XTAL_SI_LOW_ADDR_MASK`,
+/// `XTAL_SI_CTRL` with `XTAL_SI_MODE_SEL_MASK`, `XTAL_SI_RDY` and
+/// `XTAL_SI_HIGH_ADDR_MASK`, `XTAL_SI_READ_VAL`, and `FULL_BIT_MASK`.
+pub const XTAL_SI_LOW_ADDR: u8 = 0x62;
+pub const XTAL_SI_LOW_ADDR_MASK: u8 = 0xff;
+pub const XTAL_SI_CTRL: u8 = 0x63;
+pub const XTAL_SI_MODE_SEL_MASK: u8 = 0xc0;
+pub const XTAL_SI_RDY: u8 = 1 << 5;
+pub const XTAL_SI_HIGH_ADDR_MASK: u8 = 0x07;
+pub const XTAL_SI_READ_VAL: u8 = 0x7a;
+pub const FULL_BIT_MASK: u8 = 0xff;
 
 /// The PCIe PHY's MDIO pages (`MDIO_PG0_G1` to `MDIO_PG1_G2`): page 0 holds
 /// addresses below 0x20, page 1 the rest, one pair per link generation.

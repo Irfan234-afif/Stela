@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2022 Realtek Corporation
 //! What is RTL8852B's own in pinned rtw89, beside the AX generation's shared
-//! layers: its RF calibration tables ([`rfk`]), the values its power
-//! functions and chip info give [`super::power`], and the PCIe HCI flow
-//! control and DLE tables its chip info gives [`super::dle`].
+//! layers: its RF calibration tables ([`rfk`]), its efuse layout and readers
+//! ([`efuse`]), the values its power functions and chip info give
+//! [`super::power`], and the PCIe HCI flow control and DLE tables its chip
+//! info gives [`super::dle`].
 use super::{
     dle::{
         ChipQuota, DMA_CH_NUM, DleMem, GRP_0, HcifcMode, HfcChCfg, HfcParamIni, HfcPubCfg, QTA_NUM,
@@ -12,6 +13,7 @@ use super::{
     registers::SCOREBOARD,
 };
 
+pub mod efuse;
 pub mod rfk;
 
 /// `RTL8852B_RFE_05_SPS_ANA`: what `rtw8852b_pwr_sps_ana` writes to

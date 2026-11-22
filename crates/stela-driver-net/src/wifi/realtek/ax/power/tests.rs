@@ -1,7 +1,7 @@
 extern crate std;
 
 use super::*;
-use crate::wifi::realtek::ax::io::field;
+use crate::wifi::realtek::ax::io::{field, prep};
 use alloc::{vec, vec::Vec};
 
 /// One access, as the C oracle's harness records it.

@@ -11,17 +11,22 @@
 //! with the firmware download's quota ([`dle`]), its PCIe pre-init with
 //! the DMA rings ([`pci`]), the firmware command channel, H2C out on
 //! CH12 behind a TXWD body ([`h2c`], [`txwd`]) and C2H back on RXQ
-//! ([`c2h`]), the firmware download ([`fwdl`]) and the firmware features
-//! rtw89 expects by version ([`features`]) are the first slices. Powering
-//! the chip on, pre-initializing its DMAC and PCIe DMA and handing it
-//! commands prove that its polled bits answered, the ring addresses were
-//! written and the command BDs were filled; a download that returns proves
-//! that the firmware reported FREERTOS_DONE, nothing about its radio.
+//! ([`c2h`]), the firmware download ([`fwdl`]), the firmware features
+//! rtw89 expects by version ([`features`]), and the efuse and phycap read
+//! once the firmware runs ([`efuse`], [`rtw8852b::efuse`]) over the register
+//! mailbox ([`h2creg`]) are the first slices. Powering the chip on,
+//! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
+//! its polled bits answered, the ring addresses were written and the command
+//! BDs were filled; a download that returns proves that the firmware
+//! reported FREERTOS_DONE, nothing about its radio; an efuse read proves
+//! that every byte was answered, not what the bytes mean.
 pub mod c2h;
 pub mod dle;
+pub mod efuse;
 pub mod features;
 pub mod fwdl;
 pub mod h2c;
+pub mod h2creg;
 pub mod io;
 pub mod pci;
 pub mod power;

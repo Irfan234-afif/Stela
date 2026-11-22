@@ -448,6 +448,14 @@ fn dphy_delay<I: Io + ?Sized>(io: &mut I) -> Result<(), Error> {
     )?)
 }
 
+/// `rtw89_pci_ops_mac_pre_deinit_ax`, which `rtw89_chip_efuse_info_setup`
+/// reaches through `rtw89_hci_mac_pre_deinit` once the efuse is read:
+/// HCI_OPT_CTRL's wake bit cleared (`rtw89_pci_power_wake_ax(rtwdev,
+/// false)`). It returns 0 in rtw89; a failure here is a refused access.
+pub fn mac_pre_deinit<I: Io + ?Sized>(io: &mut I) -> Result<(), io::Error> {
+    power_wake(io, false)
+}
+
 /// `rtw89_pci_power_wake_ax`.
 fn power_wake<I: Io + ?Sized>(io: &mut I, pwr_up: bool) -> Result<(), io::Error> {
     if pwr_up {

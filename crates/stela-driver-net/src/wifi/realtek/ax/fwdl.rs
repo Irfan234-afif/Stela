@@ -58,9 +58,11 @@
 //!   makes no access.
 //! - `rtw89_mac_enable_cpu_ax` with `dlfw` false, USB's shorter path-ready
 //!   bound, and RTL8922A's secure-boot malloc info: not reached here.
-//! - `RTW89_FLAG_FW_RDY`, `rec_seq`, the H2C/C2H counters and the RPWM/CPWM
-//!   sequence numbers `__rtw89_fw_download` resets: Stela keeps no such
-//!   state; a [`Downloaded`] stands for the flag.
+//! - `RTW89_FLAG_FW_RDY`, `rec_seq` and the RPWM/CPWM sequence numbers
+//!   `__rtw89_fw_download` resets: Stela keeps no such state; a
+//!   [`Downloaded`] stands for the flag. The register mailbox's H2C/C2H
+//!   counters it resets start at 0 in the mailbox a [`Downloaded`] opens
+//!   ([`super::h2creg::Mailbox::after_download`]).
 //!
 //! A download that returns proves only that WCPU_FW_CTRL read
 //! `RTW89_FWDL_WCPU_FW_INIT_RDY` (FREERTOS_DONE): the firmware booted far
