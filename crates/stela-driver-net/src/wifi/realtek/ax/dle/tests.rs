@@ -689,12 +689,13 @@ fn oracle_cases() -> Vec<Case> {
 /// The errno rtw89 returns for `error`.
 fn errno(error: Error) -> i32 {
     match error {
-        Error::DmacOff { .. } => -14,
+        Error::DmacOff { .. } | Error::HfcPubCfg | Error::HfcPubInfo { .. } => -14,
         Error::Io(io::Error::Timeout { .. }) => -110,
         Error::NoDleMem(_)
         | Error::DleSize { .. }
         | Error::WdePageSize(_)
-        | Error::PlePageSize(_) => -22,
+        | Error::PlePageSize(_)
+        | Error::HfcChCfg { .. } => -22,
         Error::Io(error) => panic!("the model refuses no access: {error:?}"),
     }
 }

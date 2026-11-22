@@ -2463,6 +2463,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "scc_init_register_trace_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/mac/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_MAC_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 full MAC init C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "pre_init_register_trace_matches_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/pci/tests.rs",
     "kind": "oracle",

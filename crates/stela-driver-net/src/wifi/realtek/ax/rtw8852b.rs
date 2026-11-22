@@ -115,6 +115,11 @@ pub const FIFO_SIZE: u32 = 196_608;
 /// DLE.
 pub const DLE_SCC_RSVD_SIZE: u32 = 98_304;
 
+/// `rtw8852b_chip_info.dma_ch_mask`: ACH4 to ACH7, B1MGQ and B1HIQ
+/// (`RTW89_DMA_ACH4` and on, `RTW89_DMA_B1MG`, `RTW89_DMA_B1HI`), the
+/// channels an RTL8852B lacks.
+pub const DMA_CH_MASK: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 10) | (1 << 11);
+
 /// What the DLE and HFC code reads from `rtw8852b_chip_info` over PCIe
 /// (`RTW89_HCI_DLE_TYPE_PCIE`).
 pub const PCIE_QUOTA: ChipQuota = ChipQuota {
@@ -122,4 +127,5 @@ pub const PCIE_QUOTA: ChipQuota = ChipQuota {
     dle_mem: &RTW8852B_DLE_MEM_PCIE,
     fifo_size: FIFO_SIZE,
     dle_scc_rsvd_size: DLE_SCC_RSVD_SIZE,
+    dma_ch_mask: DMA_CH_MASK,
 };

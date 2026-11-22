@@ -16,7 +16,10 @@
 //! - here, as the power step's and the DMAC pre-init's models answer them:
 //!   SYS_PW_CTRL reading RDY_SYSPWR and completing the ON and OFF MAC
 //!   requests, IC_PWR_STATE reading whether the WL MAC is on, and the DLE's
-//!   ready bits; and the WCPU.
+//!   ready bits; as the MAC init's model answers them ([`super::mac`]): the
+//!   STA scheduler's init done, no public page used and every one
+//!   available, and the address CAM's clear and the BA CAM's reset
+//!   completing at once; and the WCPU.
 //!
 //! The WCPU starts an attempt when WCPU_EN goes from 0 to 1, and reads
 //! H2C_PATH_RDY at once. A kick on CH12 hands it every BD up to the new
@@ -196,6 +199,12 @@ impl Chip {
             ),
             (WDE_INI_STATUS, _) => Some(stored | WDE_MGN_INI_RDY),
             (PLE_INI_STATUS, _) => Some(stored | PLE_MGN_INI_RDY),
+            (SS_CTRL, 4) => Some(stored | SS_INIT_DONE_1),
+            (PUB_PAGE_INFO1, 4) => Some(stored & !(G0_USE_PG_MASK | G1_USE_PG_MASK)),
+            (PUB_PAGE_INFO2, 4) => {
+                let available = self.bus.get(PUB_PAGE_CTRL2, 4) & PUBPG_ALL_MASK;
+                Some((stored & !PUB_AVAL_PG_MASK) | prep(available, PUB_AVAL_PG_MASK))
+            }
             (WCPU_FW_CTRL, 1 | 4) if self.cpu() => {
                 let frames = state.attempts.last().map_or(0, Vec::len);
                 let mut value = stored | H2C_PATH_RDY;
@@ -244,6 +253,11 @@ impl Chip {
                 _ => efuse.write32(register, value),
             }
             .unwrap();
+        }
+        match (register, width) {
+            (ADDR_CAM_CTRL, 4) => self.bus.set(register, 4, value & !ADDR_CAM_CLR),
+            (RESPBA_CAM_CTRL, 4) => self.bus.set(register, 4, value & !BACAM_RST_MASK),
+            _ => {}
         }
         let state = &mut *self.state.borrow_mut();
         if register == SYS_PW_CTRL {

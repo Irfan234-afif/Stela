@@ -626,6 +626,371 @@ pub const XTAL_SI_HIGH_ADDR_MASK: u8 = 0x07;
 pub const XTAL_SI_READ_VAL: u8 = 0x7a;
 pub const FULL_BIT_MASK: u8 = 0xff;
 
+// The full MAC init's registers (`rtw89_mac_init`'s `sys_init_ax`,
+// `trx_init_ax` and their callees), in the order rtw89 reaches them.
+/// `R_AX_PHYREG_SET` and `PHYREG_SET_XYN_CYCLE`, which
+/// `__rtw8852bx_mac_enable_bb_rf` writes last.
+pub const PHYREG_SET: u32 = 0x8040;
+pub const PHYREG_SET_XYN_CYCLE: u8 = 0xe;
+
+/// The `R_AX_DMAC_FUNC_EN` bit `dmac_func_en_ax` adds to the pre-init's,
+/// and the `R_AX_DMAC_CLK_EN` clocks it enables.
+pub const DMAC_CRPRT: u32 = 1 << 31;
+pub const MAC_SEC_CLK_EN: u32 = 1 << 16;
+pub const DLE_CPUIO_CLK_EN: u32 = 1 << 19;
+pub const PKT_IN_CLK_EN: u32 = 1 << 20;
+pub const STA_SCH_CLK_EN: u32 = 1 << 24;
+pub const TXPKT_CTRL_CLK_EN: u32 = 1 << 25;
+pub const WD_RLS_CLK_EN: u32 = 1 << 27;
+pub const BBRPT_CLK_EN: u32 = 1 << 17;
+
+/// The `R_AX_CMAC_FUNC_EN` bit and the `R_AX_CK_EN` clocks
+/// `cmac_func_en_ax` sets for CMAC0, and `B_AX_OCP_L1_MASK`, which
+/// `chip_func_en_ax` sets in `R_AX_SPS_DIG_ON_CTRL0`.
+pub const CMAC_CRPRT: u32 = 1 << 31;
+pub const CMAC_CKEN: u32 = 1 << 30;
+pub const PHYINTF_CKEN: u32 = 1 << 5;
+pub const CMAC_DMA_CKEN: u32 = 1 << 4;
+pub const PTCLTOP_CKEN: u32 = 1 << 3;
+pub const SCHEDULER_CKEN: u32 = 1 << 2;
+pub const TMAC_CKEN: u32 = 1 << 1;
+pub const RMAC_CKEN: u32 = 1 << 0;
+pub const OCP_L1_MASK: u32 = 0x0000_e000;
+
+/// The rest of `rtw8852b_page_regs` and the HCI flow-control fields the
+/// full flow control sets and reads back. Channel `ch`'s page control and
+/// page information are 4 * `ch` past `R_AX_ACH0_PAGE_CTRL` and
+/// `R_AX_ACH0_PAGE_INFO`.
+pub const HCI_FC_MODE_MASK: u32 = 0x0000_0006;
+pub const HCI_FC_WD_FULL_COND_MASK: u32 = 0x0000_0030;
+pub const HCI_FC_WP_CH07_FULL_COND_MASK: u32 = 0x0000_00c0;
+pub const HCI_FC_WP_CH811_FULL_COND_MASK: u32 = 0x0000_0300;
+pub const PREC_PAGE_CH011_MASK: u32 = 0x0000_01ff;
+pub const ACH0_PAGE_CTRL: u32 = 0x8a10;
+pub const MIN_PG_MASK: u32 = 0x0000_1fff;
+pub const MAX_PG_MASK: u32 = 0x1fff_0000;
+pub const GRP: u32 = 1 << 31;
+pub const ACH0_PAGE_INFO: u32 = 0x8a50;
+pub const AVAL_PG_MASK: u32 = 0x0fff_0000;
+pub const USE_PG_MASK: u32 = 0x0000_1fff;
+pub const PUB_PAGE_CTRL1: u32 = 0x8a90;
+pub const PUBPG_G0_MASK: u32 = 0x0000_1fff;
+pub const PUBPG_G1_MASK: u32 = 0x1fff_0000;
+pub const PUB_PAGE_CTRL2: u32 = 0x8a94;
+pub const PUBPG_ALL_MASK: u32 = 0x0000_1fff;
+pub const PUB_PAGE_INFO1: u32 = 0x8a98;
+pub const G0_USE_PG_MASK: u32 = 0x0000_1fff;
+pub const G1_USE_PG_MASK: u32 = 0x1fff_0000;
+pub const PUB_PAGE_INFO2: u32 = 0x8a9c;
+pub const PUB_AVAL_PG_MASK: u32 = 0x0000_1fff;
+pub const PUB_PAGE_INFO3: u32 = 0x8a8c;
+pub const G0_AVAL_PG_MASK: u32 = 0x0000_1fff;
+pub const G1_AVAL_PG_MASK: u32 = 0x1fff_0000;
+pub const WP_PAGE_CTRL1: u32 = 0x8aa0;
+pub const PREC_PAGE_WP_CH07_MASK: u32 = 0x0000_01ff;
+pub const PREC_PAGE_WP_CH811_MASK: u32 = 0x01ff_0000;
+pub const WP_PAGE_CTRL2: u32 = 0x8aa4;
+pub const WP_THRD_MASK: u32 = 0x0000_1fff;
+pub const WP_PAGE_INFO1: u32 = 0x8aa8;
+pub const WP_AVAL_PG_MASK: u32 = 0x1fff_0000;
+
+/// `R_AX_SS_CTRL`, the STA scheduler's control, and its bits.
+pub const SS_CTRL: u32 = 0x9e10;
+pub const SS_INIT_DONE_1: u32 = 1 << 31;
+pub const SS_WARM_INIT_FLG: u32 = 1 << 29;
+pub const SS_NONEMPTY_SS2FINFO_EN: u32 = 1 << 28;
+pub const SS_EN: u8 = 1 << 0;
+
+/// The MPDU processor's forwarding and A-MSDU settings `mpdu_proc_init_ax`
+/// writes.
+pub const MPDU_PROC: u32 = 0x9c00;
+pub const A_ICV_ERR: u32 = 1 << 1;
+pub const APPEND_FCS: u32 = 1 << 0;
+pub const ACTION_FWD0: u32 = 0x9c04;
+pub const TRXCFG_MPDU_PROC_ACT_FRWD: u32 = 0x02a9_5a95;
+pub const TF_FWD: u32 = 0x9c14;
+pub const TRXCFG_MPDU_PROC_TF_FRWD: u32 = 0x0000_aa55;
+pub const CUT_AMSDU_CTRL: u32 = 0x9c40;
+pub const TRXCFG_MPDU_PROC_CUT_CTRL: u32 = 0x010e_05f0;
+
+/// The security engine's control and MPDU options `sec_eng_init_ax` sets.
+pub const SEC_ENG_CTRL: u32 = 0x9d00;
+pub const TX_PARTIAL_MODE: u32 = 1 << 11;
+pub const CLK_EN_CGCMP: u32 = 1 << 10;
+pub const CLK_EN_WAPI: u32 = 1 << 9;
+pub const CLK_EN_WEP_TKIP: u32 = 1 << 8;
+pub const MC_DEC: u32 = 1 << 3;
+pub const BC_DEC: u32 = 1 << 2;
+pub const SEC_RX_DEC: u32 = 1 << 1;
+pub const SEC_TX_ENC: u32 = 1 << 0;
+pub const SEC_MPDU_PROC: u32 = 0x9d04;
+pub const APPEND_ICV: u32 = 1 << 1;
+pub const APPEND_MIC: u32 = 1 << 0;
+
+/// CMAC0's scheduler registers `scheduler_init_ax` sets.
+pub const PREBKF_CFG_0: u32 = 0xc338;
+pub const PREBKF_TIME_MASK: u32 = 0x0000_001f;
+pub const SCH_PREBKF_24US: u32 = 0x18;
+pub const PREBKF_CFG_1: u32 = 0xc33c;
+pub const SIFS_MACTXEN_T1_MASK: u32 = 0x0000_007f;
+pub const SIFS_MACTXEN_T1: u32 = 0x47;
+pub const CCA_CFG_0: u32 = 0xc340;
+pub const BTCCA_EN: u32 = 1 << 5;
+pub const SCH_EXT_CTRL: u32 = 0xc3fc;
+pub const PORT_RST_TSF_ADV: u32 = 1 << 1;
+
+/// CMAC0's address CAM control, whose clear bit the chip drops once the CAM
+/// is cleared.
+pub const ADDR_CAM_CTRL: u32 = 0xce34;
+pub const ADDR_CAM_RANGE_MASK: u32 = 0x00ff_0000;
+pub const ADDR_CAM_CLR: u32 = 1 << 8;
+pub const ADDR_CAM_EN: u32 = 1 << 0;
+
+/// CMAC0's RX filters: per frame type, the MAC filter (`DEFAULT_AX_RX_FLTR`
+/// is `rtw89_mac_gen_ax.default_rx_fltr`, which `rtw89_core_init` gives
+/// `hal.rx_fltr`) with its maximum MPDU length, and the PLCP header checks.
+pub const PLCP_HDR_FLTR: u32 = 0xce04;
+pub const HE_SIGB_CRC_CHK: u32 = 1 << 6;
+pub const VHT_MU_SIGB_CRC_CHK: u32 = 1 << 5;
+pub const VHT_SU_SIGB_CRC_CHK: u32 = 1 << 4;
+pub const SIGA_CRC_CHK: u32 = 1 << 3;
+pub const LSIG_PARITY_CHK_EN: u32 = 1 << 2;
+pub const CCK_SIG_CHK: u32 = 1 << 1;
+pub const CCK_CRC_CHK: u32 = 1 << 0;
+pub const RX_FLTR_OPT: u32 = 0xce20;
+pub const RX_MPDU_MAX_LEN_MASK: u32 = 0x003f_0000;
+pub const DEFAULT_AX_RX_FLTR: u32 = 0x0300_44be;
+pub const CTRL_FLTR: u32 = 0xce24;
+pub const MGNT_FLTR: u32 = 0xce28;
+pub const DATA_FLTR: u32 = 0xce2c;
+pub const RX_FLTR_FRAME_TO_HOST: u32 = 0x5555_5555;
+
+/// CMAC0's CCA control and the checks it enables and disables.
+pub const CCA_CONTROL: u32 = 0xc390;
+pub const TB_CHK_TX_NAV: u32 = 1 << 31;
+pub const TB_CHK_BASIC_NAV: u32 = 1 << 30;
+pub const TB_CHK_BTCCA: u32 = 1 << 29;
+pub const TB_CHK_EDCCA: u32 = 1 << 28;
+pub const TB_CHK_CCA_S80: u32 = 1 << 27;
+pub const TB_CHK_CCA_S40: u32 = 1 << 26;
+pub const TB_CHK_CCA_S20: u32 = 1 << 25;
+pub const TB_CHK_CCA_P20: u32 = 1 << 24;
+pub const SIFS_CHK_BTCCA: u32 = 1 << 21;
+pub const SIFS_CHK_EDCCA: u32 = 1 << 20;
+pub const SIFS_CHK_CCA_S80: u32 = 1 << 19;
+pub const SIFS_CHK_CCA_S40: u32 = 1 << 18;
+pub const SIFS_CHK_CCA_S20: u32 = 1 << 17;
+pub const SIFS_CHK_CCA_P20: u32 = 1 << 16;
+pub const CTN_CHK_TXNAV: u32 = 1 << 8;
+pub const CTN_CHK_INTRA_NAV: u32 = 1 << 7;
+pub const CTN_CHK_BASIC_NAV: u32 = 1 << 6;
+pub const CTN_CHK_BTCCA: u32 = 1 << 5;
+pub const CTN_CHK_EDCCA: u32 = 1 << 4;
+pub const CTN_CHK_CCA_S80: u32 = 1 << 3;
+pub const CTN_CHK_CCA_S40: u32 = 1 << 2;
+pub const CTN_CHK_CCA_S20: u32 = 1 << 1;
+pub const CTN_CHK_CCA_P20: u32 = 1 << 0;
+
+/// CMAC0's response checks (`R_AX_RSP_CHK_SIG`, `R_AX_TRXPTCL_RESP_0`), the
+/// SIFS fields of the latter, and the response rate settings
+/// (`rtw8852b_rrsr_cfgs`).
+pub const RSP_CHK_SIG: u32 = 0xcc00;
+pub const RSP_CHK_BASIC_NAV: u32 = 1 << 21;
+pub const RSP_CHK_INTRA_NAV: u32 = 1 << 20;
+pub const RSP_CHK_TXNAV: u32 = 1 << 19;
+pub const TRXPTCL_RESP_0: u32 = 0xcc04;
+pub const RSP_CHK_SEC_CCA_80: u32 = 1 << 28;
+pub const RSP_CHK_SEC_CCA_40: u32 = 1 << 27;
+pub const RSP_CHK_SEC_CCA_20: u32 = 1 << 26;
+pub const RSP_CHK_BTCCA: u32 = 1 << 25;
+pub const RSP_CHK_EDCCA: u32 = 1 << 24;
+pub const RSP_CHK_CCA: u32 = 1 << 23;
+pub const WMAC_SPEC_SIFS_OFDM_MASK: u32 = 0x0000_ff00;
+pub const WMAC_SPEC_SIFS_CCK_MASK: u32 = 0x0000_00ff;
+pub const WMAC_SPEC_SIFS_OFDM_52B: u32 = 0x11;
+pub const WMAC_SPEC_SIFS_CCK: u32 = 0xa;
+pub const TRXPTCL_RRSR_CTL_0: u32 = 0xcc08;
+pub const WMAC_RESP_RSC_MASK: u32 = 0x0000_0c00;
+pub const WMAC_RESP_REF_RATE_SEL: u32 = 1 << 9;
+pub const RXTRIG_TEST_USER_2: u32 = 0xccb0;
+pub const RXTRIG_FCSCHK_EN: u32 = 1 << 20;
+
+/// The WMAC's NAV control, which `nav_ctrl_init_ax` sets for both bands at
+/// once.
+pub const WMAC_NAV_CTL: u32 = 0xcc80;
+pub const WMAC_NAV_UPPER_EN: u32 = 1 << 26;
+pub const WMAC_PLCP_UP_NAV_EN: u32 = 1 << 17;
+pub const WMAC_TF_UP_NAV_EN: u32 = 1 << 16;
+pub const WMAC_NAV_UPPER_MASK: u32 = 0x0000_ff00;
+pub const NAV_25MS: u32 = 0xc4;
+
+/// CMAC0's spatial reuse and BSSID source controls, each reached a byte at a
+/// time.
+pub const RX_SR_CTRL: u32 = 0xce4a;
+pub const SR_EN: u8 = 1 << 0;
+pub const BSSID_SRC_CTRL: u32 = 0xce4b;
+pub const PLCP_SRC_EN: u8 = 1 << 0;
+
+/// CMAC0's TMAC registers `tmac_init_ax` sets.
+pub const MAC_LOOPBACK: u32 = 0xcc20;
+pub const MACLBK_EN: u32 = 1 << 0;
+pub const TCR0: u32 = 0xca00;
+pub const TCR_UDF_THSD_MASK: u32 = 0x007f_0000;
+pub const TCR_UDF_THSD: u32 = 6;
+pub const TXD_FIFO_CTRL: u32 = 0xca1c;
+pub const TXDFIFO_HIGH_MCS_THRE_MASK: u32 = 0x0000_f000;
+pub const TXDFIFO_HIGH_MCS_THRE: u32 = 7;
+pub const TXDFIFO_LOW_MCS_THRE_MASK: u32 = 0x0000_0f00;
+pub const TXDFIFO_LOW_MCS_THRE: u32 = 7;
+
+/// CMAC0's RMAC registers `rmac_init_ax` sets: the BA CAM's control, whose
+/// reset field the chip clears once the CAM is reset, the deadlock
+/// protection's timers, and the receive configuration's channel enables.
+pub const RESPBA_CAM_CTRL: u32 = 0xce3c;
+pub const SSN_SEL: u8 = 1 << 2;
+pub const BACAM_RST_MASK: u32 = 0x0000_0003;
+pub const S_AX_BACAM_RST_ALL: u32 = 2;
+pub const DLK_PROTECT_CTL: u32 = 0xce02;
+pub const RX_DLK_CCA_TIME_MASK: u32 = 0x0000_ff00;
+pub const RX_DLK_DATA_TIME_MASK: u32 = 0x0000_00f0;
+pub const RCR: u32 = 0xce00;
+pub const CH_EN_MASK: u32 = 0x0000_000f;
+
+/// CMAC0's TX sub-carrier values and response rate enables.
+pub const TX_SUB_CARRIER_VALUE: u32 = 0xc088;
+pub const TXSC_80M_MASK: u32 = 0x0000_0f00;
+pub const TXSC_40M_MASK: u32 = 0x0000_00f0;
+pub const TXSC_20M_MASK: u32 = 0x0000_000f;
+pub const PTCL_RRSR1: u32 = 0xc090;
+pub const RRSR_RATE_EN_MASK: u32 = 0x0000_0f00;
+pub const RRSR_OFDM_CCK_EN: u32 = 3;
+
+/// CMAC0's protocol registers `ptcl_init_ax` sets.
+pub const SIFS_SETTING: u32 = 0xc624;
+pub const HW_CTS2SELF_PKT_LEN_TH_MASK: u32 = 0xff00_0000;
+pub const HW_CTS2SELF_PKT_LEN_TH_TWW_MASK: u32 = 0x00fc_0000;
+pub const HW_CTS2SELF_EN: u32 = 1 << 16;
+pub const S_AX_CTS2S_TH_1K: u32 = 4;
+pub const S_AX_CTS2S_TH_SEC_256B: u32 = 1;
+pub const PTCL_FSM_MON: u32 = 0xc6e8;
+pub const PTCL_TX_ARB_TO_MODE: u32 = 1 << 6;
+pub const PTCL_TX_ARB_TO_THR_MASK: u32 = 0x0000_003f;
+pub const S_AX_PTCL_TO_2MS: u32 = 0x3f;
+pub const PTCL_COMMON_SETTING_0: u32 = 0xc600;
+pub const PTCL_TRIGGER_SS_EN_UL: u32 = 1 << 4;
+pub const PTCL_TRIGGER_SS_EN_1: u32 = 1 << 3;
+pub const PTCL_TRIGGER_SS_EN_0: u32 = 1 << 2;
+pub const CMAC_TX_MODE_1: u32 = 1 << 1;
+pub const CMAC_TX_MODE_0: u32 = 1 << 0;
+pub const PTCLRPT_FULL_HDL: u32 = 0xc660;
+pub const SPE_RPT_PATH_MASK: u32 = 0x0000_0030;
+pub const FWD_TO_WLCPU: u32 = 1;
+pub const AGG_LEN_VHT_0: u32 = 0xc618;
+pub const AMPDU_MAX_LEN_VHT_MASK: u32 = 0x000f_ffff;
+
+/// CMAC0's RX DMA control and `RX_FULL_MODE`, its RU pointers' full modes.
+pub const RXDMA_CTRL_0: u32 = 0xc804;
+pub const RX_FULL_MODE: u8 = 0x3f;
+
+/// The DMAC error interrupt masks `enable_imr_ax` sets, with
+/// `rtw8852b_imr_info`'s values.
+pub const WDRLS_ERR_IMR: u32 = 0x9430;
+pub const WDRLS_IMR_EN_CLR: u32 = 0x0000_3337;
+pub const WDRLS_IMR_SET: u32 = 0x0000_3327;
+pub const SEC_DEBUG: u32 = 0x9d1c;
+pub const IMR_ERROR: u32 = 1 << 3;
+pub const MPDU_TX_ERR_IMR: u32 = 0x9bf4;
+pub const TX_HDR3_SIZE_ERR_INT_EN: u32 = 1 << 5;
+pub const TX_OFFSET_ERR_INT_EN: u32 = 1 << 4;
+pub const TX_MPDU_SIZE_ZERO_INT_EN: u32 = 1 << 3;
+pub const TX_NXT_ERRPKTID_INT_EN: u32 = 1 << 2;
+pub const TX_GET_ERRPKTID_INT_EN: u32 = 1 << 1;
+pub const MPDU_RX_ERR_IMR: u32 = 0x9cf4;
+pub const RPT_ERR_INT_EN: u32 = 1 << 3;
+pub const MHDRLEN_ERR_INT_EN: u32 = 1 << 1;
+pub const GETPKTID_ERR_INT_EN: u32 = 1 << 0;
+pub const STA_SCHEDULER_ERR_IMR: u32 = 0x9ef0;
+pub const PLE_B_PKTID_ERR_INT_EN: u32 = 1 << 2;
+pub const RPT_HANG_TIMEOUT_INT_EN: u32 = 1 << 1;
+pub const SEARCH_HANG_TIMEOUT_INT_EN: u32 = 1 << 0;
+pub const STA_SCHEDULER_IMR_SET: u32 = 0x0000_0007;
+pub const TXPKTCTL_ERR_IMR_ISR: u32 = 0x9f1c;
+pub const TXPKTCTL_IMR_B0_CLR: u32 = 0x0000_030f;
+pub const TXPKTCTL_IMR_B0_SET: u32 = 0x0000_0101;
+pub const TXPKTCTL_ERR_IMR_ISR_B1: u32 = 0x9f2c;
+pub const TXPKTCTL_IMR_B1_CLR: u32 = 0x0000_030f;
+pub const TXPKTCTL_IMR_B1_SET: u32 = 0x0000_0303;
+pub const WDE_ERR_IMR: u32 = 0x8c38;
+pub const WDE_IMR_CLR: u32 = 0x070f_f0ff;
+pub const WDE_IMR_SET: u32 = 0x070f_f0ff;
+pub const PLE_ERR_IMR: u32 = 0x9038;
+pub const PLE_IMR_CLR: u32 = 0x070f_f0ff;
+pub const PLE_IMR_SET: u32 = 0x070f_f0df;
+pub const PKTIN_ERR_IMR: u32 = 0x9a20;
+pub const PKTIN_GETPKTID_ERR_INT_EN: u32 = 1 << 0;
+pub const HOST_DISPATCHER_ERR_IMR: u32 = 0x8850;
+pub const HOST_DISP_IMR_CLR: u32 = 0xff0f_ffff;
+pub const HOST_DISP_IMR_SET: u32 = 0x0c00_0161;
+pub const CPU_DISPATCHER_ERR_IMR: u32 = 0x8854;
+pub const CPU_DISP_IMR_CLR: u32 = 0xff07_ffff;
+pub const CPU_DISP_IMR_SET: u32 = 0x0400_0062;
+pub const OTHER_DISPATCHER_ERR_IMR: u32 = 0x8858;
+pub const OTHER_DISP_IMR_CLR: u32 = 0x3f03_1f1f;
+pub const CPUIO_ERR_IMR: u32 = 0x9840;
+pub const CPUIO_IMR_CLR: u32 = 0x0000_1111;
+pub const CPUIO_IMR_SET: u32 = 0x0000_1111;
+pub const BBRPT_COM_ERR_IMR_ISR: u32 = 0x960c;
+pub const BBRPT_COM_NULL_PLPKTID_ERR_INT_EN: u32 = 1 << 0;
+pub const BBRPT_CHINFO_ERR_IMR_ISR: u32 = 0x962c;
+pub const BBRPT_CHINFO_IMR_CLR: u32 = 0x0000_00ff;
+pub const BBRPT_DFS_ERR_IMR_ISR: u32 = 0x963c;
+pub const BBRPT_DFS_TO_ERR_INT_EN: u32 = 1 << 0;
+pub const LA_ERRFLAG: u32 = 0x966c;
+pub const LA_IMR_DATA_LOSS_ERR: u32 = 1 << 0;
+
+/// CMAC0's error interrupt masks `enable_imr_ax` sets, with
+/// `rtw8852b_imr_info`'s values; its PHY interface mask clears and sets
+/// nothing.
+pub const SCHEDULE_ERR_IMR: u32 = 0xc3e8;
+pub const SORT_NON_IDLE_ERR_INT_EN: u32 = 1 << 1;
+pub const FSM_TIMEOUT_ERR_INT_EN: u32 = 1 << 0;
+pub const PTCL_IMR0: u32 = 0xc6c0;
+pub const PTCL_IMR_CLR_ALL: u32 = 0xffff_ffff;
+pub const PTCL_IMR_SET: u32 = 0x1080_0001;
+pub const DLE_CTRL: u32 = 0xc800;
+pub const DLE_IMR_CLR: u32 = 0x0080_c000;
+pub const DLE_IMR_SET: u32 = 0x0000_c000;
+pub const PHYINFO_ERR_IMR: u32 = 0xccfc;
+pub const RMAC_ERR_ISR: u32 = 0xcef4;
+pub const RMAC_IMR_CLR: u32 = 0x000f_f000;
+pub const RMAC_IMR_SET: u32 = 0x000e_4000;
+pub const TMAC_ERR_IMR_ISR: u32 = 0xccec;
+pub const TMAC_IMR_CLR: u32 = 0x0000_0780;
+pub const TMAC_IMR_SET: u32 = 0x0000_0780;
+
+/// The DMAC's and CMAC0's error interrupt enables `err_imr_ctrl_ax` writes.
+pub const DMAC_ERR_IMR: u32 = 0x8520;
+pub const DMAC_ERR_IMR_EN: u32 = 0xffff_ffff;
+pub const CMAC_ERR_IMR: u32 = 0xc160;
+pub const CMAC0_ERR_IMR_EN: u32 = 0xffff_ffff;
+
+/// The WD release mode and release report settings `set_host_rpr_ax` makes
+/// over PCIe.
+pub const WDRLS_CFG: u32 = 0x9408;
+pub const WDRLS_MODE_MASK: u32 = 0x0000_0003;
+pub const RLSRPT0_CFG0: u32 = 0x9410;
+pub const RLSRPT0_FLTR_MAP_MASK: u32 = 0x0f00_0000;
+pub const RLSRPT0_CFG1: u32 = 0x9414;
+pub const RLSRPT0_TO_MASK: u32 = 0x00ff_0000;
+pub const RLSRPT0_AGGNUM_MASK: u32 = 0x0000_00ff;
+
+/// CMAC0's contention TX enables, which `rtw89_set_hw_sch_tx_en` reaches 16
+/// bits at a time.
+pub const CTN_TXEN: u32 = 0xc348;
+pub const CTN_TXEN_ALL_MASK: u32 = 0x0000_ffff;
+pub const CTN_TXEN_HGQ: u32 = 1 << 11;
+pub const CTN_TXEN_MGQ: u32 = 1 << 8;
+
 /// The PCIe PHY's MDIO pages (`MDIO_PG0_G1` to `MDIO_PG1_G2`): page 0 holds
 /// addresses below 0x20, page 1 the rest, one pair per link generation.
 pub const MDIO_PG0_G1: u16 = 0;

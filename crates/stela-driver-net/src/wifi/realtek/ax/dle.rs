@@ -46,7 +46,9 @@
 //!   `dle_used_size` adds no reserved size.
 //! - The part of `rtw89_mac_hfc_init` that sets channel and public pages:
 //!   the pre-init asks for H2C flow control alone (`en` false, `h2c_en`
-//!   true), which returns before it. The full MAC init is where it runs.
+//!   true), which returns before it. The full MAC init runs it
+//!   ([`hfc_init`], from [`super::mac`]'s DMAC init), with the SCC quota
+//!   [`dle_init`] gives it.
 //!
 //! Like rtw89, this sets HCI_TXDMA_EN and HCI_RXDMA_EN before the PCIe
 //! pre-init stops each DMA channel and resets its rings, so that pre-init
@@ -86,18 +88,30 @@ pub enum QtaMode {
 /// mode the DLFW quota takes its WCPU minimum from.
 pub const QTA_MODE: QtaMode = QtaMode::Scc;
 
-/// `enum rtw89_hcifc_mode`.
+/// `enum rtw89_hcifc_mode`. `hfc_param.mode` is a `u8` that HCI_FC_CTRL's
+/// two-bit field fills on read-back, so it can also hold
+/// `RTW89_HCIFC_MODE_INVALID`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum HcifcMode {
     Poh = 0,
     Stf = 1,
     Sdio = 2,
+    Invalid = 3,
 }
 
 /// `grp_0` and `grp_1`: a channel's public page group.
 pub const GRP_0: u8 = 0;
 pub const GRP_1: u8 = 1;
+/// `grp_num`: how many public page groups there are.
+const GRP_NUM: u8 = 2;
+/// `RTW89_DMA_B1HI` and `RTW89_DMA_H2C`: the last channel with page
+/// control, and the firmware command channel, whose pages the full flow
+/// control neither sets nor reads.
+const DMA_B1HI: u8 = 11;
+const DMA_H2C: u8 = 12;
+/// `rtw89_mac_hfc_init`'s `udelay(10)` after enabling flow control.
+const HFC_EN_DELAY_US: u64 = 10;
 
 /// `struct rtw89_hfc_ch_cfg`: one DMA channel's page bounds and group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +306,9 @@ pub struct ChipQuota {
     pub fifo_size: u32,
     /// `dle_scc_rsvd_size`.
     pub dle_scc_rsvd_size: u32,
+    /// `dma_ch_mask`: the DMA channels, one bit each, the chip lacks, whose
+    /// pages the full flow control leaves alone.
+    pub dma_ch_mask: u32,
 }
 
 /// The `rtw89_mac_size` members (mac.c) RTL8852B's PCIe tables name, with
@@ -349,7 +366,8 @@ impl DleInfo {
 }
 
 /// `struct rtw89_hfc_param`, without `ch_info` and `pub_info`, which
-/// `hfc_reset_param` zeroes and only the full flow control reads back.
+/// `hfc_reset_param` zeroes and only the full flow control reads back
+/// ([`HfcInfo`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HfcParam {
     pub en: bool,
@@ -375,6 +393,34 @@ impl HfcParam {
         },
         prec_cfg: HfcPrecCfg::new([0; 4], [0; 4]),
     };
+}
+
+/// `struct rtw89_hfc_ch_info`: a channel's available and used pages, as the
+/// full flow control reads them back.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HfcChInfo {
+    pub aval: u16,
+    pub used: u16,
+}
+
+/// `struct rtw89_hfc_pub_info`: the public pages' use, as the full flow
+/// control reads it back.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HfcPubInfo {
+    pub g0_used: u16,
+    pub g1_used: u16,
+    pub g0_aval: u16,
+    pub g1_aval: u16,
+    pub pub_aval: u16,
+    pub wp_aval: u16,
+}
+
+/// `hfc_param.ch_info` and `.pub_info`, which `hfc_reset_param` zeroes and
+/// the full flow control fills from the chip's page information.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HfcInfo {
+    pub ch_info: [HfcChInfo; DMA_CH_NUM],
+    pub pub_info: HfcPubInfo,
 }
 
 /// What a successful DMAC pre-init leaves in rtw89's `rtwdev->mac`.
@@ -404,6 +450,23 @@ pub enum Error {
     /// `dle_mix_cfg_ax`'s `-EINVAL` for PLE pages of neither 128 nor 256
     /// bytes.
     PlePageSize(u16),
+    /// `hfc_ch_cfg_chk`'s `-EINVAL`: channel `ch`'s minimum is below the
+    /// pre-cost, its maximum above the public pages, or its group neither 0
+    /// nor 1; or the parameters name no channel table, which rtw89 would
+    /// dereference anyway.
+    HfcChCfg { ch: u8 },
+    /// `hfc_pub_cfg_chk`'s `-EFAULT`: the groups' public pages do not add up
+    /// to the public maximum.
+    HfcPubCfg,
+    /// `hfc_pub_info_chk`'s `-EFAULT` with flow control reading enabled: the
+    /// public pages the chip reports used and available do not add up to the
+    /// maximum it reads back.
+    HfcPubInfo {
+        g0_used: u16,
+        g1_used: u16,
+        pub_aval: u16,
+        pub_max: u16,
+    },
 }
 
 impl From<io::Error> for Error {
@@ -529,7 +592,7 @@ fn dle_init_failed<I: Io + ?Sized>(io: &mut I, error: Error) -> Error {
 }
 
 /// `rtw89_mac_check_mac_en_ax(rtwdev, RTW89_MAC_0, RTW89_DMAC_SEL)`.
-fn check_mac_en<I: Io + ?Sized>(io: &mut I) -> Result<(), Error> {
+pub(super) fn check_mac_en<I: Io + ?Sized>(io: &mut I) -> Result<(), Error> {
     let value = io.read32(DMAC_FUNC_EN)?;
     let bits = MAC_FUNC_EN | DMAC_FUNC_EN_BIT;
     if value == R32_EA || value == R32_DEAD || value & bits != bits {
@@ -718,12 +781,291 @@ fn hfc_init_h2c<I: Io + ?Sized>(
     dle_info: &DleInfo,
     mut param: HfcParam,
 ) -> Result<HfcParam, Error> {
-    hfc_reset_param(&mut param, quota, dle_info.qta_mode);
-    check_mac_en(io)?;
-    hfc_func_en(io, &mut param, false, false)?;
-    hfc_h2c_cfg(io, &param)?;
-    hfc_func_en(io, &mut param, false, true)?;
+    let mut info = HfcInfo::default();
+    hfc_init_with(
+        io, quota, dle_info, &mut param, &mut info, true, false, true,
+    )?;
     Ok(param)
+}
+
+/// `rtw89_mac_hfc_init(rtwdev, reset, en, h2c_en)` on a PCIe RTL8852B, over
+/// rtw89's `rtwdev->mac.hfc_param` (`param` and `info`), with `dle_info`
+/// what [`dle_init`] last left. With `reset` the parameters come from the
+/// chip's entry for `dle_info.qta_mode`. `en` false with `h2c_en` true is
+/// H2C flow control alone, the pre-init's; otherwise every channel the chip
+/// has gets its page bounds, the public pages and pre-costs are set, flow
+/// control is enabled as asked, and each channel's and the public pages'
+/// use is read back into `info`, and the flow-control state into `param`.
+///
+/// The read-back decides whether the public pages are checked: rtw89 takes
+/// `param.en` from HCI_FC_CTRL as read, and only then refuses public pages
+/// that do not add up ([`Error::HfcPubInfo`]); `param` and `info` keep what
+/// was read either way.
+pub fn hfc_init<I: Io + ?Sized>(
+    io: &mut I,
+    dle_info: &DleInfo,
+    param: &mut HfcParam,
+    info: &mut HfcInfo,
+    reset: bool,
+    en: bool,
+    h2c_en: bool,
+) -> Result<(), Error> {
+    hfc_init_with(
+        io,
+        &rtw8852b::PCIE_QUOTA,
+        dle_info,
+        param,
+        info,
+        reset,
+        en,
+        h2c_en,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rtw89_mac_hfc_init's three flags over the state it reads and fills"
+)]
+pub(super) fn hfc_init_with<I: Io + ?Sized>(
+    io: &mut I,
+    quota: &ChipQuota,
+    dle_info: &DleInfo,
+    param: &mut HfcParam,
+    info: &mut HfcInfo,
+    reset: bool,
+    en: bool,
+    h2c_en: bool,
+) -> Result<(), Error> {
+    if reset {
+        hfc_reset_param(param, quota, dle_info.qta_mode);
+        *info = HfcInfo::default();
+    }
+    check_mac_en(io)?;
+    hfc_func_en(io, param, false, false)?;
+
+    if !en && h2c_en {
+        hfc_h2c_cfg(io, param)?;
+        hfc_func_en(io, param, en, h2c_en)?;
+        return Ok(());
+    }
+
+    for ch in channels(quota) {
+        hfc_ch_ctrl(io, param, ch)?;
+    }
+    hfc_pub_ctrl(io, param)?;
+    hfc_mix_cfg(io, param)?;
+    if en || h2c_en {
+        hfc_func_en(io, param, en, h2c_en)?;
+        io.delay_us(HFC_EN_DELAY_US);
+    }
+    for ch in channels(quota) {
+        hfc_upd_ch_info(io, param, info, ch)?;
+    }
+    hfc_upd_mix_info(io, param, info)
+}
+
+/// The channels below `RTW89_DMA_H2C` the chip's `dma_ch_mask` leaves it,
+/// in order.
+fn channels(quota: &ChipQuota) -> impl Iterator<Item = u8> + use<> {
+    let mask = quota.dma_ch_mask;
+    (0..DMA_H2C).filter(move |ch| mask & (1 << ch) == 0)
+}
+
+/// `hfc_ch_cfg_chk`.
+fn hfc_ch_cfg_chk(param: &HfcParam, ch: u8) -> Result<HfcChCfg, Error> {
+    let refused = Error::HfcChCfg { ch };
+    let cfg = param
+        .ch_cfg
+        .and_then(|table| table.get(usize::from(ch)))
+        .copied()
+        .ok_or(refused)?;
+    if (cfg.min != 0 && cfg.min < param.prec_cfg.ch011_prec)
+        || cfg.max > param.pub_cfg.pub_max
+        || cfg.grp >= GRP_NUM
+    {
+        return Err(refused);
+    }
+    Ok(cfg)
+}
+
+/// `hfc_ch_ctrl` on `rtw8852b_page_regs.ach_page_ctrl`: channel `ch`'s
+/// minimum, maximum and group.
+fn hfc_ch_ctrl<I: Io + ?Sized>(io: &mut I, param: &HfcParam, ch: u8) -> Result<(), Error> {
+    check_mac_en(io)?;
+    let cfg = hfc_ch_cfg_chk(param, ch)?;
+    if ch > DMA_B1HI {
+        return Err(Error::HfcChCfg { ch });
+    }
+    let value = prep(cfg.min.into(), MIN_PG_MASK)
+        | prep(cfg.max.into(), MAX_PG_MASK)
+        | if cfg.grp != 0 { GRP } else { 0 };
+    io.write32(ACH0_PAGE_CTRL + u32::from(ch) * 4, value)?;
+    Ok(())
+}
+
+/// `hfc_upd_ch_info` on `rtw8852b_page_regs.ach_page_info`: channel `ch`'s
+/// available and used pages.
+fn hfc_upd_ch_info<I: Io + ?Sized>(
+    io: &mut I,
+    param: &HfcParam,
+    info: &mut HfcInfo,
+    ch: u8,
+) -> Result<(), Error> {
+    check_mac_en(io)?;
+    if ch > DMA_H2C {
+        return Err(Error::HfcChCfg { ch });
+    }
+    let value = io.read32(ACH0_PAGE_INFO + u32::from(ch) * 4)?;
+    let entry = &mut info.ch_info[usize::from(ch)];
+    entry.aval = io::field(value, AVAL_PG_MASK) as u16;
+    entry.used = if ch < DMA_H2C {
+        io::field(value, USE_PG_MASK) as u16
+    } else {
+        // The firmware command channel's pages are its minimum less what is
+        // available; the loops never reach it.
+        let min = param
+            .ch_cfg
+            .map_or(0, |table| table[usize::from(DMA_H2C)].min);
+        min.wrapping_sub(entry.aval)
+    };
+    Ok(())
+}
+
+/// `hfc_pub_cfg_chk`.
+fn hfc_pub_cfg_chk(param: &HfcParam) -> Result<(), Error> {
+    let pub_cfg = &param.pub_cfg;
+    if u32::from(pub_cfg.grp0) + u32::from(pub_cfg.grp1) != u32::from(pub_cfg.pub_max) {
+        return Err(Error::HfcPubCfg);
+    }
+    Ok(())
+}
+
+/// `hfc_pub_ctrl`: the groups' public pages and the WP threshold.
+fn hfc_pub_ctrl<I: Io + ?Sized>(io: &mut I, param: &HfcParam) -> Result<(), Error> {
+    check_mac_en(io)?;
+    hfc_pub_cfg_chk(param)?;
+    let cfg = &param.pub_cfg;
+    io.write32(
+        PUB_PAGE_CTRL1,
+        prep(cfg.grp0.into(), PUBPG_G0_MASK) | prep(cfg.grp1.into(), PUBPG_G1_MASK),
+    )?;
+    io.write32(WP_PAGE_CTRL2, prep(cfg.wp_thrd.into(), WP_THRD_MASK))?;
+    Ok(())
+}
+
+/// `hfc_mix_cfg_ax`: the pre-costs, the public maximum, the WP pre-costs,
+/// then HCI_FC_CTRL's mode and full conditions.
+fn hfc_mix_cfg<I: Io + ?Sized>(io: &mut I, param: &HfcParam) -> Result<(), io::Error> {
+    let pub_cfg = &param.pub_cfg;
+    let prec_cfg = &param.prec_cfg;
+    io.write32(
+        CH_PAGE_CTRL,
+        prep(prec_cfg.ch011_prec.into(), PREC_PAGE_CH011_MASK)
+            | prep(prec_cfg.h2c_prec.into(), PREC_PAGE_CH12_MASK),
+    )?;
+    io.write32(PUB_PAGE_CTRL2, prep(pub_cfg.pub_max.into(), PUBPG_ALL_MASK))?;
+    io.write32(
+        WP_PAGE_CTRL1,
+        prep(prec_cfg.wp_ch07_prec.into(), PREC_PAGE_WP_CH07_MASK)
+            | prep(prec_cfg.wp_ch811_prec.into(), PREC_PAGE_WP_CH811_MASK),
+    )?;
+    let mut value = replace_bits(io.read32(HCI_FC_CTRL)?, param.mode as u32, HCI_FC_MODE_MASK);
+    value = replace_bits(
+        value,
+        prec_cfg.ch011_full_cond.into(),
+        HCI_FC_WD_FULL_COND_MASK,
+    );
+    value = replace_bits(
+        value,
+        prec_cfg.h2c_full_cond.into(),
+        HCI_FC_CH12_FULL_COND_MASK,
+    );
+    value = replace_bits(
+        value,
+        prec_cfg.wp_ch07_full_cond.into(),
+        HCI_FC_WP_CH07_FULL_COND_MASK,
+    );
+    value = replace_bits(
+        value,
+        prec_cfg.wp_ch811_full_cond.into(),
+        HCI_FC_WP_CH811_FULL_COND_MASK,
+    );
+    io.write32(HCI_FC_CTRL, value)
+}
+
+/// `hfc_upd_mix_info`: `hfc_get_mix_info_ax`, then `hfc_pub_info_chk`, whose
+/// failure counts only when HCI_FC_CTRL read flow control enabled.
+fn hfc_upd_mix_info<I: Io + ?Sized>(
+    io: &mut I,
+    param: &mut HfcParam,
+    info: &mut HfcInfo,
+) -> Result<(), Error> {
+    check_mac_en(io)?;
+    hfc_get_mix_info(io, param, &mut info.pub_info)?;
+    let pub_info = &info.pub_info;
+    let used =
+        u32::from(pub_info.g0_used) + u32::from(pub_info.g1_used) + u32::from(pub_info.pub_aval);
+    // rtw89 makes the comparison an RTL8852A passes whatever it reads.
+    if param.en && used != u32::from(param.pub_cfg.pub_max) {
+        return Err(Error::HfcPubInfo {
+            g0_used: pub_info.g0_used,
+            g1_used: pub_info.g1_used,
+            pub_aval: pub_info.pub_aval,
+            pub_max: param.pub_cfg.pub_max,
+        });
+    }
+    Ok(())
+}
+
+/// `hfc_get_mix_info_ax`: the public pages' use, then the flow-control
+/// state and page settings as the chip holds them, in rtw89's order.
+fn hfc_get_mix_info<I: Io + ?Sized>(
+    io: &mut I,
+    param: &mut HfcParam,
+    info: &mut HfcPubInfo,
+) -> Result<(), io::Error> {
+    let get = |value: u32, mask: u32| io::field(value, mask) as u16;
+    let value = io.read32(PUB_PAGE_INFO1)?;
+    info.g0_used = get(value, G0_USE_PG_MASK);
+    info.g1_used = get(value, G1_USE_PG_MASK);
+    let value = io.read32(PUB_PAGE_INFO3)?;
+    info.g0_aval = get(value, G0_AVAL_PG_MASK);
+    info.g1_aval = get(value, G1_AVAL_PG_MASK);
+    info.pub_aval = get(io.read32(PUB_PAGE_INFO2)?, PUB_AVAL_PG_MASK);
+    info.wp_aval = get(io.read32(WP_PAGE_INFO1)?, WP_AVAL_PG_MASK);
+
+    let value = io.read32(HCI_FC_CTRL)?;
+    param.en = value & HCI_FC_EN != 0;
+    param.h2c_en = value & HCI_FC_CH12_EN != 0;
+    param.mode = match io::field(value, HCI_FC_MODE_MASK) {
+        0 => HcifcMode::Poh,
+        1 => HcifcMode::Stf,
+        2 => HcifcMode::Sdio,
+        _ => HcifcMode::Invalid,
+    };
+    let prec_cfg = &mut param.prec_cfg;
+    prec_cfg.ch011_full_cond = io::field(value, HCI_FC_WD_FULL_COND_MASK) as u8;
+    prec_cfg.h2c_full_cond = io::field(value, HCI_FC_CH12_FULL_COND_MASK) as u8;
+    prec_cfg.wp_ch07_full_cond = io::field(value, HCI_FC_WP_CH07_FULL_COND_MASK) as u8;
+    prec_cfg.wp_ch811_full_cond = io::field(value, HCI_FC_WP_CH811_FULL_COND_MASK) as u8;
+
+    let value = io.read32(CH_PAGE_CTRL)?;
+    prec_cfg.ch011_prec = get(value, PREC_PAGE_CH011_MASK);
+    prec_cfg.h2c_prec = get(value, PREC_PAGE_CH12_MASK);
+
+    let pub_cfg = &mut param.pub_cfg;
+    pub_cfg.pub_max = get(io.read32(PUB_PAGE_CTRL2)?, PUBPG_ALL_MASK);
+
+    let value = io.read32(WP_PAGE_CTRL1)?;
+    prec_cfg.wp_ch07_prec = get(value, PREC_PAGE_WP_CH07_MASK);
+    prec_cfg.wp_ch811_prec = get(value, PREC_PAGE_WP_CH811_MASK);
+
+    pub_cfg.wp_thrd = get(io.read32(WP_PAGE_CTRL2)?, WP_THRD_MASK);
+
+    let value = io.read32(PUB_PAGE_CTRL1)?;
+    pub_cfg.grp0 = get(value, PUBPG_G0_MASK);
+    pub_cfg.grp1 = get(value, PUBPG_G1_MASK);
+    Ok(())
 }
 
 /// `hfc_reset_param`: what the entry names replaces the parameters; a NULL

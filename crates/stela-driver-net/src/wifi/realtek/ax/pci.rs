@@ -21,6 +21,12 @@
 //! As in rtw89, the DMA stop comes after the PCIe settings, so the HCI DMA
 //! enables the DMAC pre-init set stay on until then.
 //!
+//! Once the firmware runs, the full MAC init ([`super::mac::init`]) reaches
+//! `rtw89_pci_ops_mac_post_init_ax` through `hci.ops->mac_post_init`:
+//! [`mac_post_init`] sets the 8-byte address info mode again, as every
+//! RTL885xB's branch does, starts every TX channel, and releases the PCIe
+//! I/O and WP DMA stops.
+//!
 //! Configuration space is read and written as `rtw89_pci_read_config_byte`
 //! and `rtw89_pci_write_config_byte` do: through the configuration space,
 //! and through the chip's DBI window when that access fails.
@@ -40,9 +46,12 @@
 //! - `rtw89_pci_link_cfg` and `rtw89_pci_l1ss_cfg`, which
 //!   `rtw89_pci_basic_cfg` calls once `rtw89_chip_info_setup` returns (and
 //!   on resume), and `rtw89_pci_ltr_set`, which
-//!   `rtw89_pci_ops_mac_post_init_ax` calls in the full MAC init after the
-//!   download: Stela never enables the chip's ASPM, CLKREQ, L1SS or LTR and
-//!   leaves them as the platform left them, off.
+//!   `rtw89_pci_ops_mac_post_init_ax` calls first: Stela never enables the
+//!   chip's ASPM, CLKREQ, L1SS or LTR and leaves them as the platform left
+//!   them, off. `rtw89_pci_ltr_set` makes no access while the function's
+//!   DEVCTL2 has LTR disabled, which is the case [`mac_post_init`] mirrors;
+//!   where a platform enabled LTR there, rtw89 would also program the
+//!   chip's LTR registers, and this does not.
 //! - Interrupts: the pre-init does not touch them; a later step configures
 //!   them.
 //!
@@ -446,6 +455,26 @@ fn dphy_delay<I: Io + ?Sized>(io: &mut I) -> Result<(), Error> {
         PCIE_DPHY_DLY_25US,
         PhyRate::Gen1,
     )?)
+}
+
+/// `rtw89_pci_ops_mac_post_init_ax` on an RTL8852BE whose DEVCTL2 leaves
+/// LTR disabled, so that `rtw89_pci_ltr_set` returns at once: the address
+/// info mode `rtw89_pci_mode_op` set at the pre-init set once more, every TX
+/// channel's stop cleared (`rtw89_pci_ctrl_txdma_ch_ax`), then STOP_WPDMA
+/// and STOP_PCIEIO cleared. It returns 0 in rtw89; a failure here is a
+/// refused access.
+///
+/// From here the chip may fetch from every TX ring once its host index
+/// moves, not CH12 alone; nothing here moves one.
+pub fn mac_post_init<I: Io + ?Sized>(io: &mut I) -> Result<(), io::Error> {
+    // rtw89_pci_ltr_set: no access with DEVCTL2's LTR_EN clear.
+    // ADDR info 8-byte mode, as for every RTL885xB.
+    io.write32_set(TX_ADDRESS_INFO_MODE_SETTING, HOST_ADDR_INFO_8B_SEL)?;
+    io.write32_clr(PKTIN_SETTING, WD_ADDR_INFO_LENGTH)?;
+    // enable DMA for all queues
+    ctrl_txdma_ch(io, true)?;
+    // Release PCI IO
+    io.write32_clr(PCIE_DMA_STOP1, STOP_WPDMA | STOP_PCIEIO)
 }
 
 /// `rtw89_pci_ops_mac_pre_deinit_ax`, which `rtw89_chip_efuse_info_setup`

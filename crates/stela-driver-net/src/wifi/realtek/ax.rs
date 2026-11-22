@@ -16,12 +16,15 @@
 //! once the firmware runs ([`efuse`], [`rtw8852b::efuse`]) over the register
 //! mailbox ([`h2creg`]) are the first slices, and [`bootstrap`] composes
 //! them in rtw89's probe order into one power cycle, which [`attach`]
-//! runs for a boot and ends with the chip cold again. Powering the chip on,
+//! runs for a boot and ends with the chip cold again. The full MAC init
+//! ([`mac`]) is the first slice after that power cycle's firmware runs. Powering the chip on,
 //! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
 //! its polled bits answered, the ring addresses were written and the command
 //! BDs were filled; a download that returns proves that the firmware
 //! reported FREERTOS_DONE, nothing about its radio; an efuse read proves
-//! that every byte was answered, not what the bytes mean.
+//! that every byte was answered, not what the bytes mean; a MAC init that
+//! returns proves that its polls and checks answered, not that the radio
+//! works.
 pub mod attach;
 pub mod bootstrap;
 pub mod c2h;
@@ -32,6 +35,7 @@ pub mod fwdl;
 pub mod h2c;
 pub mod h2creg;
 pub mod io;
+pub mod mac;
 #[cfg(test)]
 mod model;
 pub mod pci;
