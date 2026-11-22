@@ -34,6 +34,8 @@ pub const CMAC_ALLCKEN: u32 = u32::MAX;
 pub const MAC_REG_POOL_COUNT: usize = 10;
 /// `RTW89_R32_DEAD`: what a register block that is off reads as.
 pub const R32_DEAD: u32 = 0xdead_beef;
+/// `RTW89_R32_EA`: what a read the bus did not complete returns.
+pub const R32_EA: u32 = 0xeaea_eaea;
 
 /// `R_SWSI_DATA_V1` and its fields: an indirect RF write.
 pub const SWSI_DATA_V1: u32 = 0x0370;
@@ -173,6 +175,12 @@ pub const C3_L1_MASK: u32 = 0x0000_0030;
 pub const C2_L1_MASK: u32 = 0x0000_000c;
 pub const C1_L1_MASK: u32 = 0x0000_0003;
 
+/// `R_AX_HCI_FUNC_EN` (`rtw8852b_chip_info.hci_func_en_addr`) and its DMA
+/// enables, `B_AX_HCI_RXDMA_EN` and `B_AX_HCI_TXDMA_EN`.
+pub const HCI_FUNC_EN: u32 = 0x8380;
+pub const HCI_RXDMA_EN: u32 = 1 << 1;
+pub const HCI_TXDMA_EN: u32 = 1 << 0;
+
 /// `R_AX_DMAC_FUNC_EN` and the bits power-on sets in it.
 /// `B_AX_DMAC_FUNC_EN` is [`DMAC_FUNC_EN_BIT`], since the register takes the
 /// bare name.
@@ -193,6 +201,89 @@ pub const DISPATCHER_EN: u32 = 1 << 18;
 pub const BBRPT_EN: u32 = 1 << 17;
 pub const MAC_SEC_EN: u32 = 1 << 16;
 pub const DMACREG_GCKEN: u32 = 1 << 15;
+
+/// `R_AX_DMAC_CLK_EN` and the clocks the DMAC pre-init enables:
+/// `B_AX_DLE_WDE_CLK_EN`, `B_AX_DLE_PLE_CLK_EN` and `B_AX_DISPATCHER_CLK_EN`.
+pub const DMAC_CLK_EN: u32 = 0x8404;
+pub const DLE_WDE_CLK_EN: u32 = 1 << 26;
+pub const DLE_PLE_CLK_EN: u32 = 1 << 23;
+pub const DISPATCHER_CLK_EN: u32 = 1 << 18;
+
+/// `R_AX_HCI_FC_CTRL` (`rtw8852b_page_regs.hci_fc_ctrl`) and the fields the
+/// H2C-only flow control sets: `B_AX_HCI_FC_CH12_FULL_COND_MASK`,
+/// `B_AX_HCI_FC_CH12_EN` and `B_AX_HCI_FC_EN`.
+pub const HCI_FC_CTRL: u32 = 0x8a00;
+pub const HCI_FC_CH12_FULL_COND_MASK: u32 = 0x0000_0c00;
+pub const HCI_FC_CH12_EN: u32 = 1 << 3;
+pub const HCI_FC_EN: u32 = 1 << 0;
+/// `R_AX_CH_PAGE_CTRL` (`rtw8852b_page_regs.ch_page_ctrl`) and
+/// `B_AX_PREC_PAGE_CH12_MASK`, the H2C channel's pre-cost.
+pub const CH_PAGE_CTRL: u32 = 0x8a04;
+pub const PREC_PAGE_CH12_MASK: u32 = 0x01ff_0000;
+
+/// `R_AX_WDE_PKTBUF_CFG` and its fields.
+pub const WDE_PKTBUF_CFG: u32 = 0x8c08;
+pub const WDE_FREE_PAGE_NUM_MASK: u32 = 0x1fff_0000;
+pub const WDE_START_BOUND_MASK: u32 = 0x0000_3f00;
+pub const WDE_PAGE_SEL_MASK: u32 = 0x0000_0003;
+/// `R_AX_WDE_QTA0_CFG` to `R_AX_WDE_QTA4_CFG`, of which the AX quota leaves
+/// QTA2 (the unused DCPU) alone, and `B_AX_WDE_MAX_SIZE_MASK` and
+/// `B_AX_WDE_MIN_SIZE_MASK`.
+pub const WDE_QTA0_CFG: u32 = 0x8c40;
+pub const WDE_QTA1_CFG: u32 = 0x8c44;
+pub const WDE_QTA3_CFG: u32 = 0x8c4c;
+pub const WDE_QTA4_CFG: u32 = 0x8c50;
+pub const WDE_MAX_SIZE_MASK: u32 = 0x0fff_0000;
+pub const WDE_MIN_SIZE_MASK: u32 = 0x0000_0fff;
+/// `R_AX_WDE_INI_STATUS` and `WDE_MGN_INI_RDY`, `B_AX_WDE_Q_MGN_INI_RDY` with
+/// `B_AX_WDE_BUF_MGN_INI_RDY`.
+pub const WDE_INI_STATUS: u32 = 0x8d00;
+pub const WDE_Q_MGN_INI_RDY: u32 = 1 << 1;
+pub const WDE_BUF_MGN_INI_RDY: u32 = 1 << 0;
+pub const WDE_MGN_INI_RDY: u32 = WDE_Q_MGN_INI_RDY | WDE_BUF_MGN_INI_RDY;
+
+/// `R_AX_PLE_PKTBUF_CFG` and its fields.
+pub const PLE_PKTBUF_CFG: u32 = 0x9008;
+pub const PLE_FREE_PAGE_NUM_MASK: u32 = 0x1fff_0000;
+pub const PLE_START_BOUND_MASK: u32 = 0x0000_3f00;
+pub const PLE_PAGE_SEL_MASK: u32 = 0x0000_0003;
+/// `R_AX_PLE_QTA0_CFG` to `R_AX_PLE_QTA10_CFG`, one per
+/// `struct rtw89_ple_quota` member in order, and `B_AX_PLE_MAX_SIZE_MASK`
+/// and `B_AX_PLE_MIN_SIZE_MASK`. QTA11 (`tx_rpt`) is RTL8852C's alone.
+pub const PLE_QTA0_CFG: u32 = 0x9040;
+pub const PLE_QTA1_CFG: u32 = 0x9044;
+pub const PLE_QTA2_CFG: u32 = 0x9048;
+pub const PLE_QTA3_CFG: u32 = 0x904c;
+pub const PLE_QTA4_CFG: u32 = 0x9050;
+pub const PLE_QTA5_CFG: u32 = 0x9054;
+pub const PLE_QTA6_CFG: u32 = 0x9058;
+pub const PLE_QTA7_CFG: u32 = 0x905c;
+pub const PLE_QTA8_CFG: u32 = 0x9060;
+pub const PLE_QTA9_CFG: u32 = 0x9064;
+pub const PLE_QTA10_CFG: u32 = 0x9068;
+pub const PLE_MAX_SIZE_MASK: u32 = 0x0fff_0000;
+pub const PLE_MIN_SIZE_MASK: u32 = 0x0000_0fff;
+/// `R_AX_PLE_INI_STATUS` and `PLE_MGN_INI_RDY`, `B_AX_PLE_Q_MGN_INI_RDY` with
+/// `B_AX_PLE_BUF_MGN_INI_RDY`.
+pub const PLE_INI_STATUS: u32 = 0x9100;
+pub const PLE_Q_MGN_INI_RDY: u32 = 1 << 1;
+pub const PLE_BUF_MGN_INI_RDY: u32 = 1 << 0;
+pub const PLE_MGN_INI_RDY: u32 = PLE_Q_MGN_INI_RDY | PLE_BUF_MGN_INI_RDY;
+
+/// mac.h's DLE page sizes (`RTW89_WDE_PG_*`, `RTW89_PLE_PG_*`), their page
+/// selections (`S_AX_WDE_PAGE_SEL_*`, `S_AX_PLE_PAGE_SEL_*`), and
+/// `DLE_BOUND_UNIT`, the PLE start bound's unit in bytes.
+pub const WDE_PG_64: u16 = 64;
+pub const WDE_PG_128: u16 = 128;
+pub const WDE_PG_256: u16 = 256;
+pub const S_AX_WDE_PAGE_SEL_64: u32 = 0;
+pub const S_AX_WDE_PAGE_SEL_128: u32 = 1;
+pub const PLE_PG_64: u16 = 64;
+pub const PLE_PG_128: u16 = 128;
+pub const PLE_PG_256: u16 = 256;
+pub const S_AX_PLE_PAGE_SEL_128: u32 = 1;
+pub const S_AX_PLE_PAGE_SEL_256: u32 = 2;
+pub const DLE_BOUND_UNIT: u32 = 8 * 1024;
 
 /// `R_AX_CMAC_FUNC_EN` and the bits power-on sets in it.
 pub const CMAC_FUNC_EN: u32 = 0xc000;
