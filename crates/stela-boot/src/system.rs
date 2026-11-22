@@ -858,6 +858,15 @@ fn load(
 
     let remapping = crate::native_dma::firmware_units()?;
     let amd_tables = crate::native_dma::reserve_amd_tables(&remapping);
+    // The low zone for 32-bit DMA, whether or not an IOMMU is described:
+    // AMD-Vi is left off on a PC whose firmware display sits behind it. It
+    // is reserved when the storage pool is, for a boot that starts host
+    // devices, after the AMD-Vi tables, which need low memory more.
+    let dma32 = if storage.is_some() {
+        crate::native_memory::reserve_dma32(&image.ram)
+    } else {
+        Region::default()
+    };
 
     let mut native_mmio = crate::native_mmio::Prepared::capture().map_err(|error| {
         output::arguments(format_args!("NATIVE MMIO unavailable capture={error}\n"));
@@ -1166,6 +1175,7 @@ fn load(
             native_mmio_capture,
             inactive_firmware_units,
             amd_tables,
+            dma32,
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),

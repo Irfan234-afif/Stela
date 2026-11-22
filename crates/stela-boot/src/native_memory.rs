@@ -1,25 +1,95 @@
 //! The mount's native page source over its heap, and the Linux page catalog
 //! bound to it. The source itself is `stela_boot_core::native_memory`.
+use crate::handoff::Region;
 use core::ptr::NonNull;
-use stela_boot_core::native_memory::{NativeMemory, PAGE, Registration};
+use stela_boot_core::heap::Heap;
+use stela_boot_core::native_memory::{NativeMemory, PAGE, Registration, Zoned};
 use stela_drivers::bus::dma::memory::{CacheAttribute, MemoryError, PageSource, PinnedPages};
 
 pub(crate) mod cache;
 
 pub static SOURCE: NativeMemory = NativeMemory::new(&crate::ALLOCATOR, cache::verify_writeback);
 
-static AMD_TABLE_HEAP: stela_boot_core::heap::Heap = stela_boot_core::heap::Heap::new();
+static AMD_TABLE_HEAP: Heap = Heap::new();
 pub(crate) static AMD_TABLES: NativeMemory =
     NativeMemory::new(&AMD_TABLE_HEAP, cache::verify_writeback);
 
-/// Register the separate low physical memory reserved for AMD-Vi tables.
+static DMA32_HEAP: Heap = Heap::new();
+/// The low zone: firmware RAM below 4 GiB the loader reserved for 32-bit
+/// device DMA ([`reserve_dma32`]).
+static DMA32: NativeMemory = NativeMemory::new(&DMA32_HEAP, cache::verify_writeback);
+
+/// The native drivers' page source (`NativeServices::pages`): the heap, and
+/// the low zone for 32-bit DMA when the heap has no free memory below 4 GiB.
+/// A PC with more than 4 GiB of RAM gets its heap above 4 GiB, and with no
+/// IOMMU translating, or AMD-Vi left off for the firmware's display, a
+/// device's address is the physical one.
+pub static DRIVER_PAGES: Zoned = Zoned::new(&SOURCE, &DMA32);
+
+/// The low zone's sizes, largest first, for the first one the firmware has
+/// room for. An RTL8852BE's rings take about 8 MiB: 512 receive buffers of
+/// three pages, each with the zone heap's page of bookkeeping before it,
+/// plus their descriptor pools and command buffers. The rest is for the
+/// other Wi-Fi drivers' 32-bit rings.
+const DMA32_SIZES: [usize; 2] = [32 << 20, 16 << 20];
+
+/// Reserve the low zone, before ExitBootServices, as LOADER_DATA below
+/// 4 GiB: the final map then leaves it out of guest RAM, and the physmap,
+/// which maps all of `ram`, keeps it mapped write-back in every native
+/// root. Without room for the smallest size the boot has no zone, and
+/// 32-bit DMA gets only the heap's memory below 4 GiB.
+pub(crate) fn reserve_dma32(ram: &[(usize, usize)]) -> Region {
+    use uefi::boot::{self, AllocateType, MemoryType};
+    for bytes in DMA32_SIZES {
+        let Ok(allocation) = boot::allocate_pages(
+            AllocateType::MaxAddress(u32::MAX.into()),
+            MemoryType::LOADER_DATA,
+            bytes / PAGE,
+        ) else {
+            continue;
+        };
+        let region = Region {
+            physical: allocation.as_ptr() as u64,
+            bytes: bytes as u64,
+        };
+        let end = region.physical + region.bytes;
+        if !ram
+            .iter()
+            .any(|&(start, top)| start as u64 <= region.physical && end <= top as u64)
+        {
+            // Kept, and so still out of guest RAM, but no driver reaches it.
+            crate::output::arguments(format_args!(
+                "HOST DMA32 pool withheld: {:#x}-{end:#x} lies outside the physmap's RAM\n",
+                region.physical
+            ));
+            return Region::default();
+        }
+        crate::output::arguments(format_args!(
+            "HOST DMA32 pool={}M at {:#x}\n",
+            bytes >> 20,
+            region.physical
+        ));
+        return region;
+    }
+    crate::output::arguments(format_args!(
+        "HOST DMA32 pool unavailable: the firmware has no {}M below 4 GiB, so 32-bit DMA gets only the heap's memory there\n",
+        DMA32_SIZES[DMA32_SIZES.len() - 1] >> 20
+    ));
+    Region::default()
+}
+
+/// Register a loader reservation as the separate page source `memory` over
+/// `heap`, its only allocator. An empty region leaves it unregistered.
 ///
 /// # Safety
-/// The loader's exclusive LOADER_DATA reservation remains mapped in every
-/// native root, outside the guest and driver DMA ranges. Call once on the BSP
-/// before remapper startup.
-pub(crate) unsafe fn initialize_amd_tables(
-    region: crate::handoff::Region,
+/// `memory` was made over `heap`, and neither is registered yet. The
+/// loader's exclusive LOADER_DATA reservation stays mapped in every native
+/// root and out of guest RAM. The heap is registered (`initialize`), so its
+/// table offset reads the roots. Call once on the BSP, before any user.
+unsafe fn initialize_reserved(
+    heap: &Heap,
+    memory: &NativeMemory,
+    region: Region,
 ) -> Result<(), MemoryError> {
     if region.bytes == 0 {
         return Ok(());
@@ -28,10 +98,10 @@ pub(crate) unsafe fn initialize_amd_tables(
     let cpu = crate::layout::physical(region.physical);
     // SAFETY: the caller retains this reservation and all shared mappings.
     unsafe { qualify_reserved_writeback(cpu, region.physical, bytes) }?;
-    // SAFETY: unused firmware-owned RAM; the AMD table heap is its only owner.
+    // SAFETY: unused firmware-owned RAM; `heap` is its only owner.
     unsafe {
-        AMD_TABLE_HEAP.initialize(cpu as *mut u8, bytes);
-        AMD_TABLES.initialize(
+        heap.initialize(cpu as *mut u8, bytes);
+        memory.initialize(
             cpu as usize,
             region.physical,
             bytes,
@@ -39,6 +109,37 @@ pub(crate) unsafe fn initialize_amd_tables(
         );
     }
     Ok(())
+}
+
+/// Register the separate low physical memory reserved for AMD-Vi tables.
+///
+/// # Safety
+/// The loader's exclusive LOADER_DATA reservation remains mapped in every
+/// native root, outside the guest and driver DMA ranges. Call once on the BSP
+/// before remapper startup.
+pub(crate) unsafe fn initialize_amd_tables(region: Region) -> Result<(), MemoryError> {
+    // SAFETY: the caller's contract, for the AMD table heap's own source.
+    unsafe { initialize_reserved(&AMD_TABLE_HEAP, &AMD_TABLES, region) }
+}
+
+/// Register the low zone [`reserve_dma32`] reserved, which [`DRIVER_PAGES`]
+/// falls back to.
+///
+/// # Safety
+/// The loader's exclusive LOADER_DATA reservation remains mapped in every
+/// native root and out of guest RAM, and the heap is registered. Call once
+/// on the BSP, before any driver starts.
+pub(crate) unsafe fn initialize_dma32(region: Region) -> Result<(), MemoryError> {
+    // SAFETY: the caller's contract, for the low zone's own source.
+    unsafe { initialize_reserved(&DMA32_HEAP, &DMA32, region) }
+}
+
+/// The low zone's physical extent, once registered: device DMA reaches it
+/// as it reaches the heap.
+pub(crate) fn dma32() -> Option<core::ops::Range<u64>> {
+    let registration = DMA32.registration();
+    (registration.bytes != 0)
+        .then(|| registration.physical..registration.physical + registration.bytes as u64)
 }
 
 /// Register the heap's CPU/physical mapping (`NativeMemory::initialize`).

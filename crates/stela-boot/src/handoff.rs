@@ -120,6 +120,10 @@ pub struct Handoff {
     pub(crate) inactive_firmware_units: crate::native_dma::InactiveFirmwareUnits,
     /// Exclusive firmware RAM below 4 GiB for AMD-Vi device tables.
     pub(crate) amd_tables: Region,
+    /// Exclusive firmware RAM below 4 GiB for 32-bit device DMA the heap
+    /// cannot place (`native_memory::reserve_dma32`); empty when the boot
+    /// starts no host devices or the firmware had no room.
+    pub(crate) dma32: Region,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,
