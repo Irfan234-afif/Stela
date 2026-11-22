@@ -70,6 +70,17 @@ lto = "thin"
 # engine's functions; the image itself is unchanged.
 debug = "line-tables-only"
 
+# Test images (`cargo xtask boot build --fast`): release code without
+# cross-crate LTO, in parallel codegen units and incremental, so a change to
+# one crate rebuilds that crate and links, in minutes rather than the
+# release's quarter of an hour. Its code is slower than a release's, and a
+# result to rely on is checked again on a release image.
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

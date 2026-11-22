@@ -121,6 +121,11 @@ pub enum Command {
     Build {
         #[arg(long)]
         release: bool,
+        /// A test image: release code without cross-crate LTO, in parallel
+        /// codegen units and incremental (stela-boot's `profile.fast`), so
+        /// a change rebuilds in minutes.
+        #[arg(long, conflicts_with = "release")]
+        fast: bool,
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
@@ -499,13 +504,19 @@ pub fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Build {
             release,
+            fast,
             diagnostics,
         } => {
             crate::gpu::fetch::fetch(false)?;
             crate::gpu::build_nvk(crate::gpu::default_jobs())?;
+            let profile = if fast {
+                Profile::Fast
+            } else {
+                Profile::of(release)
+            };
             println!(
                 "{}",
-                build_for_boot(release, diagnostics, Gpu::Linked)?.display()
+                build_for_boot(profile, diagnostics, Gpu::Linked)?.display()
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -515,7 +526,31 @@ pub fn run(command: Command) -> Result<ExitCode> {
 
 pub fn build(release: bool) -> Result<PathBuf> {
     crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-    build_with_diagnostics(release, false, Gpu::Linked)
+    build_with_diagnostics(Profile::of(release), false, Gpu::Linked)
+}
+
+/// The Cargo profile `stela.efi` is built with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    Debug,
+    Release,
+    /// stela-boot's `profile.fast`: a test image, without cross-crate LTO.
+    Fast,
+}
+
+impl Profile {
+    fn of(release: bool) -> Self {
+        if release { Self::Release } else { Self::Debug }
+    }
+
+    /// Its directory under the target's.
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+            Self::Fast => "fast",
+        }
+    }
 }
 
 /// The GPU drivers a `stela.efi` carries beyond its Linux environment.
@@ -536,9 +571,9 @@ pub(crate) fn linked_features(release: bool) -> &'static str {
     if release { "nvk" } else { "nvk,amdgpu" }
 }
 
-fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
-    let built = build_with_diagnostics(release, diagnostics, gpu)?;
-    if !release {
+fn build_for_boot(profile: Profile, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
+    let built = build_with_diagnostics(profile, diagnostics, gpu)?;
+    if profile == Profile::Debug {
         return Ok(built);
     }
     let image = built.with_file_name("stela-deploy.efi");
@@ -581,7 +616,7 @@ pub fn vram_cap(set: bool, shipped: bool) -> Result<bool> {
     Ok(set)
 }
 
-fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
+fn build_with_diagnostics(profile: Profile, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
     let mut command = cargo();
     command.args(["build", "--locked", "--manifest-path", BOOT_MANIFEST]);
     command.args(["--target", BOOT_TARGET, "--target-dir", BOOT_TARGET_DIR]);
@@ -601,16 +636,21 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
     )? {
         command.args(["--features", "vram-cap"]);
     }
-    if release {
-        command.arg("--release");
+    match profile {
+        Profile::Debug => {}
+        Profile::Release => {
+            command.arg("--release");
+        }
+        Profile::Fast => {
+            command.args(["--profile", "fast"]);
+        }
     }
     crate::clang::toolset()?.apply(&mut command);
     exec(&mut command)?;
-    let profile = if release { "release" } else { "debug" };
     Ok(root()
         .join(BOOT_TARGET_DIR)
         .join(BOOT_TARGET)
-        .join(profile)
+        .join(profile.directory())
         .join("stela.efi"))
 }
 
@@ -768,7 +808,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
     let attached = storage_disks(&arguments.storage_disk, &arguments.storage_serial)?;
     let image = match &arguments.image {
         Some(image) => image.clone(),
-        None => build_for_boot(true, true, Gpu::None)?,
+        None => build_for_boot(Profile::Release, true, Gpu::None)?,
     };
     let paths = storage::Paths::new(arguments.output.clone());
     if paths.output.exists() {
