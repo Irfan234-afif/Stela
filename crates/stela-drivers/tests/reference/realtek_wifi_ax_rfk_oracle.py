@@ -8,7 +8,10 @@ realtek_wifi_reference.py checks. rtw8852b.c's rtw8852b_rfk_init and the
 rtw8852b_rfk.c functions it reaches (rtw8852b_dpk_init with
 _set_dpd_backoff, rtw8852b_rck with _rck, rtw8852b_dack with _dac_cal and
 every DACK helper, rtw8852b_rx_dck with _wait_rx_mode, _rx_dck and
-_set_rx_dck), the file's leading defines, enums and tables, every table of
+_set_rx_dck), rtw8852b_iqk with _iqk_init, _iqk and every helper _doiqk
+reaches (the BB and RF backups, the LOK, TXK and RXK by group and
+narrowband, _iqk_one_shot, _iqk_check_cal, the restores), the file's
+leading defines, enums and tables, every table of
 rtw8852b_rfk_table.c, rtw89_rfk_parser with its handlers, rtw89_phy_read_rf_v1
 and rtw89_phy_write_rf_v1 with the direct and SWSI paths below them, the BB
 and MMIO helpers of phy.h and core.h, reg.h, and the declarations they read
@@ -22,7 +25,12 @@ R_SWSI_V1 holding the done bit and the RF word; R_DRCK_RS reads its done
 bit, R_ADDCKR0 and R_ADDCKR1 bit 0, R_DACK_S0P0/S0P1 and R_DACK_S1P0/S1P1
 bit 31, R_DACK_S0P2/S0P3, R_DACK10S and R_DACK11S bit 2, and RF RR_RCKS bit
 3, each set unless the case keeps it clear. RF RR_MOD reads as written, or
-with mode 2 (TX) when the case says so. Every other read, the ones that
+with mode 2 (TX) when the case says so. For IQK, each write to R_NCTL_CFG
+starts a one-shot: 0xbff8's low byte reads 0x55 unless the case names that
+one-shot as never reporting, and R_NCTL_RPT reads B_NCTL_RPT_FLG only for
+the one-shots the case fails; RF RR_TXMO reads LO leakage core codes 0x10
+and 0x0f (0x1f, out of range, for I when the case fails LOK) and RR_LOKVB
+buffer codes 0x20 and 0x1f. Every other read, the ones that
 feed DACK's and RX DCK's computations among them (R_DRCK_RS's code,
 R_ADDCKR*, the MSBK, bias and DADCK results, R_DBG32_D, R_DPD_BF, RF 0x05
 and RR_DCK), reads what the patterned, all-ones or zeroed memory holds or
@@ -40,6 +48,18 @@ reads tagged by width, writes by 4 plus width, delays 9 (0, us), then
 rtwdev->dack (14: flags, dack_cnt; 15 per path and I/Q: index and DADCK,
 ADDCK and bias; 16 per path, I/Q and word: MSBK bytes), dpk_gs, the MCC
 table index and is_tssi_mode (17).
+
+iqk_trace.bin holds thirteen cases in the same form, each over patterned
+memory: rtw8852b_iqk(PHY 0) on 2 GHz 20 MHz channel 1, 2 GHz 40 MHz channel
+6, 5 GHz 20 MHz channel 36, 5 GHz 40 MHz channel 149 and 5 GHz 80 MHz
+channels 36 and 149; channel 36 at 80 MHz with LOK failing; channel 1 with
+one-shots 1, 6, 11, 13 and 20 failing; channel 6 with one-shot 7 never
+reporting; channel 36 under MCC table 1; channel 1 then channel 149 at 80
+MHz on one state; and channel 149 at 40 MHz narrowband, passing and with
+every one-shot failing. After the state's records, rtwdev->iqk follows (20:
+fail count and flags, times, version; 21 to 24 per path: channel, flags and
+table, the narrowband CFIRs, the TX and RX results, the enable and syn1to2;
+25 and 26 per table and path: MCC channel and LOK codes).
 """
 import hashlib
 import json
@@ -175,7 +195,8 @@ def main(argv):
     reg_h = record('reg.h', 'reg.h', source('reg.h'))
     core_defines = defines('core.h', [
         'MASKBYTE0', 'MASKLWORD', 'MASKDWORD', 'RFREG_MASK', 'INV_RF_DATA', 'RF_PATH_MAX',
-        'RTW89_DACK_PATH_NR', 'RTW89_DACK_IDX_NR', 'RTW89_DACK_MSBK_NR'])
+        'RTW89_DACK_PATH_NR', 'RTW89_DACK_IDX_NR', 'RTW89_DACK_MSBK_NR', 'RTW89_IQK_CHS_NR',
+        'RTW89_IQK_PATH_NR'])
     phy_defines = defines('phy.h', ['RTW89_RF_ADDR_ADSEL_MASK'])
     chip_defines = defines('rtw8852b.h', ['RF_PATH_NUM_8852B'])
     rfk_macros = block('phy.h', '#define RTW89_DECLARE_RFK_TBL', 'RTW89_DECL_RFK_DELAY')
@@ -187,7 +208,7 @@ def main(argv):
             'rtw89_rfk_chs_nrs']]
         + [declaration('core.h', 'struct', name) for name in [
             'rtw89_reg3_def', 'rtw89_reg5_def', 'rtw89_dack_info', 'rtw89_rfk_mcc_info_data',
-            'rtw89_rfk_mcc_info']]
+            'rtw89_rfk_mcc_info', 'rtw89_iqk_info']]
         + [declaration('phy.h', 'enum', 'rtw89_rfk_flag'),
            declaration('phy.h', 'struct', 'rtw89_rfk_tbl')])
     core_helpers = functions('core.h', [
@@ -212,7 +233,14 @@ def main(argv):
         '_addck_reload', '_dack_backup_s0', '_dack_backup_s1', '_check_addc', '_addck',
         '_check_dadc', '_dack_s0_check_done', '_dack_s0', '_dack_s1_check_done', '_dack_s1',
         '_dack', '_dack_dump', '_dac_cal', '_wait_rx_mode', '_set_dpd_backoff',
-        'rtw8852b_dpk_init', 'rtw8852b_rck', 'rtw8852b_dack', 'rtw8852b_rx_dck'])
+        'rtw8852b_dpk_init', 'rtw8852b_rck', 'rtw8852b_dack', 'rtw8852b_rx_dck',
+        '_rfk_backup_bb_reg', '_rfk_backup_rf_reg', '_rfk_restore_bb_reg', '_rfk_restore_rf_reg',
+        '_iqk_check_cal', '_iqk_rxk_setting', '_iqk_one_shot', '_rxk_group_sel', '_iqk_nbrxk',
+        '_iqk_rxclk_setting', '_txk_group_sel', '_iqk_nbtxk', '_lok_res_table',
+        '_lok_finetune_check', '_iqk_lok', '_iqk_txk_setting', '_iqk_txclk_setting',
+        '_iqk_info_iqk', '_iqk_by_path', '_iqk_get_ch_info', '_iqk_start_iqk', '_iqk_restore',
+        '_iqk_afebb_restore', '_iqk_preset', '_iqk_macbb_setting', '_iqk_init', '_doiqk', '_iqk',
+        'rtw8852b_iqk'])
     rfk_init = functions('rtw8852b.c', ['rtw8852b_rfk_init'])
 
     chip_ops = members('rtw8852b.c', 'static const struct rtw89_chip_ops rtw8852b_chip_ops',
@@ -292,6 +320,7 @@ struct rtw89_chip_info {
 };
 struct rtw89_hal { u8 cv; };
 struct rtw89_dpk_info { u8 dpk_gs[RTW89_PHY_NUM]; };
+struct rtw89_chan { u8 channel; enum rtw89_band band_type; enum rtw89_bandwidth band_width; };
 struct rtw89_dev {
 	const struct rtw89_chip_info *chip;
 	bool dbcc_en;
@@ -301,7 +330,14 @@ struct rtw89_dev {
 	struct rtw89_rfk_mcc_info rfk_mcc;
 	bool is_tssi_mode[RF_PATH_MAX];
 	unsigned long flags[(NUM_OF_RTW89_FLAGS + 63) / 64];
+	struct rtw89_iqk_info iqk;
+	struct rtw89_chan chan;
 };
+static const struct rtw89_chan *rtw89_chan_get(struct rtw89_dev *d, enum rtw89_chanctx_idx i)
+{
+	(void)i;
+	return &d->chan;
+}
 
 /* The coex notifications are no-ops; the PHY map they take is not computed. */
 #define rtw89_btc_phymap(d, phy, paths, chanctx) ((void)(d), (u8)0)
@@ -314,7 +350,12 @@ static u8 memory[0x20000];
 static u32 rf[2][256];
 static struct {
 	int rck_stuck, drck_stuck, addck_stuck, s0_stuck, s1_stuck, rx_stuck;
+	int lok_fail;
+	u64 nctl_fail;
+	u32 nctl_stuck;
 } fault;
+/* The NCTL one-shots started: writes to R_NCTL_CFG. */
+static u32 oneshots;
 static u8 *segment;
 static size_t segment_bytes, segment_capacity;
 static void word(u32 v)
@@ -347,6 +388,11 @@ static u32 rf_view(u32 path, u32 addr)
 		return forced(v, BIT(3), fault.rck_stuck);
 	case RR_MOD:
 		return fault.rx_stuck ? u32_replace_bits(v, 2, RR_MOD_MASK) : v;
+	case RR_TXMO:
+		return u32_replace_bits(u32_replace_bits(v, fault.lok_fail ? 0x1f : 0x10, RR_TXMO_COI),
+					0x0f, RR_TXMO_COQ);
+	case RR_LOKVB:
+		return u32_replace_bits(u32_replace_bits(v, 0x20, RR_LOKVB_COI), 0x1f, RR_LOKVB_COQ);
 	}
 	return v;
 }
@@ -376,6 +422,11 @@ static u32 view(u32 w)
 	case R_DACK10S:
 	case R_DACK11S:
 		return forced(v, B_DACK_S1P2_OK, fault.s1_stuck);
+	case 0xbff8:
+		return (v & ~0xffu) | (oneshots && oneshots == fault.nctl_stuck ? 0 : 0x55);
+	case R_NCTL_RPT:
+		return forced(v, B_NCTL_RPT_FLG,
+			      !oneshots || oneshots > 64 || !((fault.nctl_fail >> (oneshots - 1)) & 1));
 	}
 	return v;
 }
@@ -401,6 +452,8 @@ static void model_write(u32 r, u32 n, u32 v)
 			abort();
 		set(CR_BASE + R_SWSI_V1, 4, B_SWSI_R_DATA_DONE_V1 | rf_view(path, addr));
 	}
+	if (w == CR_BASE + R_NCTL_CFG)
+		oneshots++;
 	if (w == CR_BASE + R_SWSI_DATA_V1) {
 		u32 path = FIELD_GET(B_SWSI_DATA_PATH_V1, s);
 		u32 addr = FIELD_GET(B_SWSI_DATA_ADDR_V1, s);
@@ -485,6 +538,28 @@ static void record_state(const struct rtw89_dev *dev)
 	       dev->rfk_mcc.data[0].table_idx | (u32)dev->is_tssi_mode[0] << 8 |
 	       (u32)dev->is_tssi_mode[1] << 9);
 }
+static void record_iqk(const struct rtw89_dev *dev)
+{
+	const struct rtw89_iqk_info *q = &dev->iqk;
+	record(20, q->iqk_fail_cnt, (u32)q->is_iqk_init | (u32)q->is_nbiqk << 1 |
+				    (u32)q->iqk_times << 8 | (u32)q->version << 16);
+	for (u32 p = 0; p < RTW8852B_IQK_SS; p++) {
+		record(21, p | (u32)q->iqk_band[p] << 8 | (u32)q->iqk_bw[p] << 16 |
+			   (u32)q->iqk_ch[p] << 24,
+		       (u32)q->lok_cor_fail[0][p] | (u32)q->lok_fin_fail[0][p] << 1 |
+		       (u32)q->iqk_tx_fail[0][p] << 2 | (u32)q->iqk_rx_fail[0][p] << 3 |
+		       (u32)q->is_wb_txiqk[p] << 4 | (u32)q->is_wb_rxiqk[p] << 5 |
+		       (u32)q->iqk_table_idx[p] << 8);
+		record(22, q->nb_txcfir[p], q->nb_rxcfir[p]);
+		record(23, q->bp_txkresult[p], q->bp_rxkresult[p]);
+		record(24, q->bp_iqkenable[p], q->syn1to2);
+	}
+	for (u32 i = 0; i < RTW89_IQK_CHS_NR; i++)
+		for (u32 p = 0; p < RTW8852B_IQK_SS; p++) {
+			record(25, i << 8 | p | (u32)q->iqk_mcc_ch[i][p] << 16, q->lok_idac[i][p]);
+			record(26, i << 8 | p, q->lok_vbuf[i][p]);
+		}
+}
 enum kind { INIT, RX_DCK };
 enum fill { PATTERN, ONES, ZEROS };
 static void fill(enum fill f)
@@ -495,7 +570,22 @@ static void fill(enum fill f)
 		for (u32 a = 0; a < 256; a++)
 			rf[p][a] = f == PATTERN ? (a * 0x9e37 + p * 0x3c1 + 0x1234) & RFREG_MASK :
 				   f == ONES ? RFREG_MASK : 0;
+	memset(&fault, 0, sizeof(fault));
+	oneshots = 0;
 }
+static FILE *open_trace(const char *path)
+{
+	FILE *out = fopen(path, "wb");
+	if (!out)
+		abort();
+	return out;
+}
+static void close_trace(FILE *out)
+{
+	if (fclose(out))
+		abort();
+}
+struct chan { enum rtw89_band band; enum rtw89_bandwidth bw; u8 ch; };
 int main(int argc, char **argv)
 {
 	static const struct {
@@ -518,11 +608,37 @@ int main(int argc, char **argv)
 		{INIT, PATTERN, .rx_stuck = 1},
 		{RX_DCK, PATTERN, .tssi = 1},
 	};
-	if (argc != 2)
+	static const struct chan g1 = {RTW89_BAND_2G, RTW89_CHANNEL_WIDTH_20, 1};
+	static const struct chan g6 = {RTW89_BAND_2G, RTW89_CHANNEL_WIDTH_40, 6};
+	static const struct chan a36 = {RTW89_BAND_5G, RTW89_CHANNEL_WIDTH_20, 36};
+	static const struct chan a149 = {RTW89_BAND_5G, RTW89_CHANNEL_WIDTH_40, 149};
+	static const struct chan a36_80 = {RTW89_BAND_5G, RTW89_CHANNEL_WIDTH_80, 36};
+	static const struct chan a149_80 = {RTW89_BAND_5G, RTW89_CHANNEL_WIDTH_80, 149};
+	static const struct {
+		const struct chan *chan, *then;
+		u8 table_idx;
+		int lok_fail;
+		u64 nctl_fail;
+		u32 nctl_stuck;
+		int nbiqk;
+	} iqk_cases[] = {
+		{&g1},
+		{&g6},
+		{&a36},
+		{&a149},
+		{&a36_80},
+		{&a149_80},
+		{&a36_80, .lok_fail = 1},
+		{&g1, .nctl_fail = BIT(0) | BIT(5) | BIT(10) | BIT(12) | BIT(13 + 6)},
+		{&g6, .nctl_stuck = 7},
+		{&a36, .table_idx = 1},
+		{&g1, .then = &a149_80},
+		{&a149, .nbiqk = 1},
+		{&a149, .nbiqk = 1, .nctl_fail = ~0ULL},
+	};
+	if (argc != 3)
 		return 2;
-	FILE *out = fopen(argv[1], "wb");
-	if (!out)
-		abort();
+	FILE *out = open_trace(argv[1]);
 	for (size_t c = 0; c < ARRAY_SIZE(cases); c++) {
 		static struct rtw89_dev dev;
 		memset(&dev, 0, sizeof(dev));
@@ -546,10 +662,35 @@ int main(int argc, char **argv)
 		record_state(&dev);
 		flush(out);
 	}
-	if (fclose(out))
-		abort();
+	close_trace(out);
+	out = open_trace(argv[2]);
+	for (size_t c = 0; c < ARRAY_SIZE(iqk_cases); c++) {
+		static struct rtw89_dev dev;
+		memset(&dev, 0, sizeof(dev));
+		dev.chip = &chip_info;
+		fill(PATTERN);
+		fault.lok_fail = iqk_cases[c].lok_fail;
+		fault.nctl_fail = iqk_cases[c].nctl_fail;
+		fault.nctl_stuck = iqk_cases[c].nctl_stuck;
+		dev.rfk_mcc.data[0].table_idx = iqk_cases[c].table_idx;
+		if (iqk_cases[c].nbiqk) {
+			dev.iqk.is_iqk_init = true;
+			dev.iqk.is_nbiqk = true;
+		}
+		for (const struct chan *ch = iqk_cases[c].chan; ch;
+		     ch = ch == iqk_cases[c].then ? NULL : iqk_cases[c].then) {
+			dev.chan.channel = ch->ch;
+			dev.chan.band_type = ch->band;
+			dev.chan.band_width = ch->bw;
+			rtw8852b_iqk(&dev, RTW89_PHY_0, RTW89_CHANCTX_0);
+		}
+		record_state(&dev);
+		record_iqk(&dev);
+		flush(out);
+	}
+	close_trace(out);
 	free(segment);
-	printf("%zu\n", ARRAY_SIZE(cases));
+	printf("%zu %zu\n", ARRAY_SIZE(cases), ARRAY_SIZE(iqk_cases));
 	return 0;
 }
 '''
@@ -566,10 +707,14 @@ int main(int argc, char **argv)
                     '-Wno-unused-but-set-variable', '-Wno-c23-extensions',
                     str(generated), '-o', str(exe)], check=True)
     trace = out / 'rfk_trace.bin'
-    run = subprocess.run([str(exe), str(trace)], check=True, capture_output=True, text=True)
+    iqk_trace = out / 'iqk_trace.bin'
+    run = subprocess.run([str(exe), str(trace), str(iqk_trace)], check=True,
+                         capture_output=True, text=True)
+    cases, iqk_cases = map(int, run.stdout.split())
     data = trace.read_bytes()
+    iqk_data = iqk_trace.read_bytes()
     receipt = dict(
-        linux_commit=COMMIT, symbols=manifest, cases=int(run.stdout.strip()),
+        linux_commit=COMMIT, symbols=manifest, cases=cases,
         case_order='rtw8852b_rfk_init over patterned memory with R_DPD_BF 0x00000000 and '
                    '0x0001f07f, over all-ones and zeroed memory, with RCK, DRCK, ADDCK, S0 '
                    'DACK and S1 DACK never done, and with RR_MOD reading TX mode; '
@@ -577,6 +722,16 @@ int main(int argc, char **argv)
         dispatch=dict(rtw8852b_chip_ops=chip_ops, rtw8852b_chip_info=info,
                       rtw89_phy_gen_ax=phy_gen, rtw89_raw_io=raw_io),
         trace_bytes=len(data), trace_sha256=hashlib.sha256(data).hexdigest(),
+        iqk_cases=iqk_cases,
+        iqk_case_order='rtw8852b_iqk(PHY 0) on 2 GHz 20 MHz channel 1, 2 GHz 40 MHz channel 6, '
+                       '5 GHz 20 MHz channel 36, 5 GHz 40 MHz channel 149, 5 GHz 80 MHz '
+                       'channels 36 and 149; 5 GHz 80 MHz channel 36 with the LO leakage '
+                       'core code out of range; channel 1 with one-shots 1, 6, 11, 13 and 20 '
+                       'failing; channel 6 with one-shot 7 never reporting; channel 36 under '
+                       'MCC table 1; channel 1 then 5 GHz 80 MHz channel 149 on one state; '
+                       '5 GHz 40 MHz channel 149 narrowband, passing and with every one-shot '
+                       'failing',
+        iqk_trace_bytes=len(iqk_data), iqk_trace_sha256=hashlib.sha256(iqk_data).hexdigest(),
         generated_source_sha256=hashlib.sha256(generated.read_bytes()).hexdigest(),
         oracle_limit=[
             'MMIO, delays and the chip answers are a model derived from the code; no Linux '
@@ -586,10 +741,16 @@ int main(int argc, char **argv)
             'rtw89_chip_stop_sch_tx and rtw89_chip_resume_sch_tx are stubs that note they were '
             'reached; the MAC oracle covers the scheduler',
             'rtw89_btc_ntfy_wl_rfk and rtw89_btc_phymap are no-ops',
+            'rtw89_chan_get gives the case\'s channel, and the MCC table index is the '
+            'case\'s, not rtw8852b_mcc_get_ch_info\'s',
+            'the narrowband IQK cases set is_iqk_init and is_nbiqk beforehand, which nothing '
+            'in rtw89 does',
             'register reads go straight to the model, below rtw89_pci_ops\' CMAC read retry',
         ])
     (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n', newline='\n')
-    print(json.dumps({k: receipt[k] for k in ['cases', 'trace_bytes', 'trace_sha256']}))
+    print(json.dumps({k: receipt[k] for k in [
+        'cases', 'trace_bytes', 'trace_sha256', 'iqk_cases', 'iqk_trace_bytes',
+        'iqk_trace_sha256']}))
     return 0
 
 

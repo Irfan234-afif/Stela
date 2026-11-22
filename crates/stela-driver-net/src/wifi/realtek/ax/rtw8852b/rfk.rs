@@ -9,7 +9,8 @@
 //! The calibrations rtw8852b.c's `rtw8852b_rfk_init` runs once the BB and RF
 //! tables are loaded, from pinned rtw89/rtw8852b_rfk.c line by line: DPK
 //! init ([`dpk_init`]), RCK ([`rck`]), DACK ([`dack`]) and RX DCK
-//! ([`rx_dck`]), composed by [`init`]. What rtw89 keeps between them in
+//! ([`rx_dck`]), composed by [`init`]; and the IQ calibration of the channel
+//! it joins ([`iqk`]). What rtw89 keeps between them in
 //! `rtwdev` is [`State`], which the caller carries from one calibration to
 //! the next. rtw89 runs each with PHY 0 and DBCC off, where `_kpath` gives
 //! both paths; so do these. The coex notifications rtw89 sends around a
@@ -23,10 +24,12 @@ use crate::wifi::realtek::ax::{
     h2creg::Mailbox,
     io::{Error, Io, Registers},
     mac::{self, SchTxSel},
+    registers::{MASKDWORD, RFREG_MASK},
 };
 use reg::*;
 
 pub mod dack;
+pub mod iqk;
 pub mod rck;
 pub mod reg;
 pub mod rx_dck;
@@ -60,6 +63,8 @@ pub struct State {
     pub rfk_mcc: RfkMcc,
     /// `rtwdev->is_tssi_mode` for paths A and B.
     pub is_tssi_mode: [bool; RF_PATH_NUM as usize],
+    /// `rtwdev->iqk`.
+    pub iqk: iqk::IqkInfo,
 }
 
 /// `struct rtw89_rfk_mcc_info_data`, as far as the calibrations here read
@@ -68,6 +73,90 @@ pub struct State {
 pub struct RfkMcc {
     /// `table_idx`: 0 or 1.
     pub table_idx: u8,
+}
+
+/// `enum rtw89_band`, as far as an RTL8852B has it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Band {
+    /// `RTW89_BAND_2G`.
+    Ghz2 = 0,
+    /// `RTW89_BAND_5G`.
+    Ghz5 = 1,
+}
+
+/// `enum rtw89_bandwidth`, as far as an RTL8852B uses it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Bandwidth {
+    /// `RTW89_CHANNEL_WIDTH_20`.
+    Mhz20 = 0,
+    /// `RTW89_CHANNEL_WIDTH_40`.
+    Mhz40 = 1,
+    /// `RTW89_CHANNEL_WIDTH_80`.
+    Mhz80 = 2,
+}
+
+/// What the calibrations read of `struct rtw89_chan`, the channel context's
+/// channel: its band, width and number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Channel {
+    pub band: Band,
+    pub width: Bandwidth,
+    pub number: u8,
+}
+
+/// `rtw8852b_backup_bb_regs`.
+const BACKUP_BB_REGS: [u32; 3] = [0x2344, 0x5800, 0x7800];
+/// `rtw8852b_backup_rf_regs`.
+const BACKUP_RF_REGS: [u32; 11] = [
+    0xde, 0xdf, 0x8b, 0x90, 0x97, 0x85, 0x1e, 0x0, 0x2, 0x5, 0x10005,
+];
+
+/// `_rfk_backup_bb_reg`.
+pub(crate) fn rfk_backup_bb_reg<I: Io + ?Sized>(
+    io: &mut I,
+) -> Result<[u32; BACKUP_BB_REGS.len()], Error> {
+    let mut values = [0; BACKUP_BB_REGS.len()];
+    for (value, register) in values.iter_mut().zip(BACKUP_BB_REGS) {
+        *value = io.phy_read32_mask(register, MASKDWORD)?;
+    }
+    Ok(values)
+}
+
+/// `_rfk_backup_rf_reg`.
+pub(crate) fn rfk_backup_rf_reg<I: Io + ?Sized>(
+    io: &mut I,
+    path: u8,
+) -> Result<[u32; BACKUP_RF_REGS.len()], Error> {
+    let mut values = [0; BACKUP_RF_REGS.len()];
+    for (value, address) in values.iter_mut().zip(BACKUP_RF_REGS) {
+        *value = io.read_rf(path, address, RFREG_MASK)?;
+    }
+    Ok(values)
+}
+
+/// `_rfk_restore_bb_reg`.
+pub(crate) fn rfk_restore_bb_reg<I: Io + ?Sized>(
+    io: &mut I,
+    values: &[u32; BACKUP_BB_REGS.len()],
+) -> Result<(), Error> {
+    for (&value, register) in values.iter().zip(BACKUP_BB_REGS) {
+        io.phy_write32_mask(register, MASKDWORD, value)?;
+    }
+    Ok(())
+}
+
+/// `_rfk_restore_rf_reg`.
+pub(crate) fn rfk_restore_rf_reg<I: Io + ?Sized>(
+    io: &mut I,
+    values: &[u32; BACKUP_RF_REGS.len()],
+    path: u8,
+) -> Result<(), Error> {
+    for (&value, address) in values.iter().zip(BACKUP_RF_REGS) {
+        io.write_rf(path, address, RFREG_MASK, value)?;
+    }
+    Ok(())
 }
 
 /// `rtw89_chip_stop_sch_tx` and `rtw89_chip_resume_sch_tx` on PHY 0, which

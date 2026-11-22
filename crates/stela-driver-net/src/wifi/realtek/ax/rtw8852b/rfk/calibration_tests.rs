@@ -2,7 +2,7 @@ extern crate std;
 
 use super::*;
 use crate::wifi::realtek::ax::{
-    io::{CR_BASE, field, prep},
+    io::{CR_BASE, RF_BASE, field, prep},
     registers::{
         PHYREG_SET, RFREG_MASK, SWSI_BIT_MASK_V1, SWSI_DATA_ADDR_V1, SWSI_DATA_BIT_MASK_EN_V1,
         SWSI_DATA_PATH_V1, SWSI_DATA_V1, SWSI_DATA_VAL_V1, SWSI_R_BUSY_V1, SWSI_R_DATA_DONE_V1,
@@ -39,6 +39,14 @@ struct Faults {
     s1_stuck: bool,
     /// RF RR_MOD reads mode 2 (TX).
     rx_stuck: bool,
+    /// RF RR_TXMO's LO leakage core I code reads 0x1f, out of range;
+    /// otherwise 0x10.
+    lok_fail: bool,
+    /// The NCTL one-shots, by bit from the first, whose report reads
+    /// B_NCTL_RPT_FLG.
+    nctl_fail: u64,
+    /// The NCTL one-shot, counted from 1, whose 0xbff8 never reads 0x55.
+    nctl_stuck: u32,
 }
 
 /// The C oracle's register model: BAR2 as little-endian bytes behaving per
@@ -58,6 +66,8 @@ struct Model {
     log: Vec<[u32; 3]>,
     /// A register the model refuses.
     refuse: Option<u32>,
+    /// The NCTL one-shots started: writes to R_NCTL_CFG.
+    oneshots: u32,
 }
 
 impl Model {
@@ -85,6 +95,7 @@ impl Model {
             faults,
             log: Vec::new(),
             refuse: None,
+            oneshots: 0,
         }
     }
     fn get(&self, register: u32, width: u32) -> u32 {
@@ -105,6 +116,17 @@ impl Model {
         match address as u32 {
             RR_RCKS => forced(value, 1 << 3, self.faults.rck_stuck),
             RR_MOD if self.faults.rx_stuck => (value & !RR_MOD_MASK) | prep(2, RR_MOD_MASK),
+            RR_TXMO => {
+                let core_i = if self.faults.lok_fail { 0x1f } else { 0x10 };
+                (value & !(RR_TXMO_COI | RR_TXMO_COQ))
+                    | prep(core_i, RR_TXMO_COI)
+                    | prep(0x0f, RR_TXMO_COQ)
+            }
+            RR_LOKVB => {
+                (value & !(RR_LOKVB_COI | RR_LOKVB_COQ))
+                    | prep(0x20, RR_LOKVB_COI)
+                    | prep(0x1f, RR_LOKVB_COQ)
+            }
             _ => value,
         }
     }
@@ -122,6 +144,15 @@ impl Model {
             R_DACK_S0P2 | R_DACK_S0P3 => forced(value, B_DACK_S0P2_OK, f.s0_stuck),
             R_DACK_S1P0 | R_DACK_S1P1 => forced(value, B_DACK_S1P0_OK, f.s1_stuck),
             R_DACK10S | R_DACK11S => forced(value, B_DACK_S1P2_OK, f.s1_stuck),
+            0xbff8 => {
+                let stuck = self.oneshots != 0 && self.oneshots == f.nctl_stuck;
+                (value & !0xff) | if stuck { 0 } else { 0x55 }
+            }
+            R_NCTL_RPT => {
+                let fail = (1..=64).contains(&self.oneshots)
+                    && (f.nctl_fail >> (self.oneshots - 1)) & 1 != 0;
+                forced(value, B_NCTL_RPT_FLG, !fail)
+            }
             _ => value,
         }
     }
@@ -152,6 +183,9 @@ impl Model {
             let address = field(stored, SWSI_READ_ADDR_ADDR_V1) as usize;
             let data = SWSI_R_DATA_DONE_V1 | self.rf_view(path, address);
             self.set(CR + SWSI_V1, 4, data);
+        }
+        if word == CR + R_NCTL_CFG {
+            self.oneshots += 1;
         }
         if word == CR + SWSI_DATA_V1 {
             let path = field(stored, SWSI_DATA_PATH_V1) as usize;
@@ -314,6 +348,9 @@ const NONE: Faults = Faults {
     s0_stuck: false,
     s1_stuck: false,
     rx_stuck: false,
+    lok_fail: false,
+    nctl_fail: 0,
+    nctl_stuck: 0,
 };
 
 /// The oracle's cases, in its order.
@@ -596,4 +633,288 @@ fn rf_reads(io: &Model, address: u32) -> usize {
         .into_iter()
         .filter(|request| field(*request, SWSI_READ_ADDR_ADDR_V1) == address)
         .count()
+}
+
+/// The IQK records the oracle makes after the state's.
+fn push_iqk(trace: &mut Vec<u8>, q: &iqk::IqkInfo) {
+    push(
+        trace,
+        20,
+        q.iqk_fail_cnt,
+        u32::from(q.is_iqk_init)
+            | u32::from(q.is_nbiqk) << 1
+            | u32::from(q.iqk_times) << 8
+            | u32::from(q.version) << 16,
+    );
+    for p in 0..iqk::IQK_SS {
+        push(
+            trace,
+            21,
+            p as u32
+                | u32::from(q.iqk_band[p]) << 8
+                | u32::from(q.iqk_bw[p]) << 16
+                | u32::from(q.iqk_ch[p]) << 24,
+            u32::from(q.lok_cor_fail[0][p])
+                | u32::from(q.lok_fin_fail[0][p]) << 1
+                | u32::from(q.iqk_tx_fail[0][p]) << 2
+                | u32::from(q.iqk_rx_fail[0][p]) << 3
+                | u32::from(q.is_wb_txiqk[p]) << 4
+                | u32::from(q.is_wb_rxiqk[p]) << 5
+                | u32::from(q.iqk_table_idx[p]) << 8,
+        );
+        push(trace, 22, q.nb_txcfir[p], q.nb_rxcfir[p]);
+        push(trace, 23, q.bp_txkresult[p], q.bp_rxkresult[p]);
+        push(trace, 24, q.bp_iqkenable[p], q.syn1to2);
+    }
+    for i in 0..iqk::IQK_CHS_NR {
+        for p in 0..iqk::IQK_SS {
+            push(
+                trace,
+                25,
+                (i as u32) << 8 | p as u32 | u32::from(q.iqk_mcc_ch[i][p]) << 16,
+                q.lok_idac[i][p],
+            );
+            push(trace, 26, (i as u32) << 8 | p as u32, q.lok_vbuf[i][p]);
+        }
+    }
+}
+
+const fn channel(band: Band, width: Bandwidth, number: u8) -> Channel {
+    Channel {
+        band,
+        width,
+        number,
+    }
+}
+
+const G1: Channel = channel(Band::Ghz2, Bandwidth::Mhz20, 1);
+const G6: Channel = channel(Band::Ghz2, Bandwidth::Mhz40, 6);
+const A36: Channel = channel(Band::Ghz5, Bandwidth::Mhz20, 36);
+const A149: Channel = channel(Band::Ghz5, Bandwidth::Mhz40, 149);
+const A36_80: Channel = channel(Band::Ghz5, Bandwidth::Mhz80, 36);
+const A149_80: Channel = channel(Band::Ghz5, Bandwidth::Mhz80, 149);
+
+#[derive(Clone, Copy, Debug)]
+struct IqkCase {
+    channel: Channel,
+    /// A second IQK on the same state.
+    then: Option<Channel>,
+    table_idx: u8,
+    faults: Faults,
+    /// `is_iqk_init` and `is_nbiqk` set beforehand.
+    nbiqk: bool,
+}
+
+const fn iqk_case(channel: Channel) -> IqkCase {
+    IqkCase {
+        channel,
+        then: None,
+        table_idx: 0,
+        faults: NONE,
+        nbiqk: false,
+    }
+}
+
+/// The oracle's IQK cases, in its order.
+fn iqk_cases() -> Vec<IqkCase> {
+    vec![
+        iqk_case(G1),
+        iqk_case(G6),
+        iqk_case(A36),
+        iqk_case(A149),
+        iqk_case(A36_80),
+        iqk_case(A149_80),
+        IqkCase {
+            faults: Faults {
+                lok_fail: true,
+                ..NONE
+            },
+            ..iqk_case(A36_80)
+        },
+        IqkCase {
+            faults: Faults {
+                nctl_fail: 1 << 0 | 1 << 5 | 1 << 10 | 1 << 12 | 1 << (13 + 6),
+                ..NONE
+            },
+            ..iqk_case(G1)
+        },
+        IqkCase {
+            faults: Faults {
+                nctl_stuck: 7,
+                ..NONE
+            },
+            ..iqk_case(G6)
+        },
+        IqkCase {
+            table_idx: 1,
+            ..iqk_case(A36)
+        },
+        IqkCase {
+            then: Some(A149_80),
+            ..iqk_case(G1)
+        },
+        IqkCase {
+            nbiqk: true,
+            ..iqk_case(A149)
+        },
+        IqkCase {
+            nbiqk: true,
+            faults: Faults {
+                nctl_fail: u64::MAX,
+                ..NONE
+            },
+            ..iqk_case(A149)
+        },
+    ]
+}
+
+fn run_iqk(case: &IqkCase) -> (Model, State) {
+    let mut io = Model::new(Fill::Pattern, case.faults);
+    let mut state = State::default();
+    state.rfk_mcc.table_idx = case.table_idx;
+    if case.nbiqk {
+        state.iqk.is_iqk_init = true;
+        state.iqk.is_nbiqk = true;
+    }
+    for channel in [Some(case.channel), case.then].into_iter().flatten() {
+        let refused = iqk::iqk(&mut io, &mut Stub::default(), &mut state, channel);
+        assert_eq!(refused, Ok(None));
+    }
+    (io, state)
+}
+
+fn replay_iqk(case: &IqkCase) -> Vec<u8> {
+    let (io, state) = run_iqk(case);
+    let mut trace = io.encode();
+    push_state(&mut trace, &state);
+    push_iqk(&mut trace, &state.iqk);
+    trace
+}
+
+#[test]
+#[ignore = "oracle: STELA_RTW89_RFK_ORACLE"]
+fn iqk_traces_match_unchanged_c() {
+    let directory = std::path::PathBuf::from(std::env::var("STELA_RTW89_RFK_ORACLE").unwrap());
+    let trace = std::fs::read(directory.join("iqk_trace.bin")).unwrap();
+    let mut offset = 0;
+    let cases = iqk_cases();
+    assert_eq!(cases.len(), 13);
+    for case in cases {
+        assert_eq!(segment(&trace, &mut offset), replay_iqk(&case), "{case:?}");
+    }
+    assert_eq!(offset, trace.len());
+}
+
+#[test]
+fn iqk_calibrates_both_paths_on_the_channel_it_is_given() {
+    let (io, state) = run_iqk(&iqk_case(A149_80));
+    let q = &state.iqk;
+    assert!(q.is_iqk_init);
+    assert_eq!(q.version, iqk::IQK_VER);
+    // One run per path.
+    assert_eq!(q.iqk_times, 2);
+    assert_eq!(q.iqk_band, [1, 1]);
+    assert_eq!(q.iqk_bw, [2, 2]);
+    assert_eq!(q.iqk_ch, [149, 149]);
+    assert_eq!(q.iqk_mcc_ch[0], [149, 149]);
+    assert_eq!(q.is_wb_txiqk, [true, true]);
+    assert_eq!(q.is_wb_rxiqk, [true, true]);
+    assert_eq!(q.nb_txcfir, [0x4000_0000; 2]);
+    assert_eq!(q.nb_rxcfir, [0x4000_0000; 2]);
+    assert_eq!(q.iqk_fail_cnt, 0);
+    // Four LOK, four TXK and four RXK one-shots and the restore's, per path.
+    assert_eq!(io.oneshots, 2 * 13);
+    // The scheduler is stopped once, around both paths.
+    let marks: Vec<_> = io
+        .log
+        .iter()
+        .filter(|r| r[0] == 12 || r[0] == 13)
+        .copied()
+        .collect();
+    assert_eq!(marks, [[12, 0, 0], [13, 0xa5c3, 0]]);
+    // Band 5 GHz, 80 MHz and channel 149 for each path in R_IQKCH.
+    let iqkch = io.get(CR + R_IQKCH, 4);
+    for shift in [0, 16] {
+        assert_eq!(field(iqkch, B_IQKCH_BAND << shift), 1);
+        assert_eq!(field(iqkch, B_IQKCH_BW << shift), 2);
+        assert_eq!(field(iqkch, B_IQKCH_CH << shift), 149);
+    }
+}
+
+#[test]
+fn iqk_puts_back_the_bb_and_rf_registers_it_backed_up() {
+    let original = Model::new(Fill::Pattern, NONE);
+    let (io, _) = run_iqk(&iqk_case(G6));
+    for register in BACKUP_BB_REGS {
+        assert_eq!(io.get(CR + register, 4), original.get(CR + register, 4));
+    }
+    for (path, base) in RF_BASE.into_iter().enumerate() {
+        for address in BACKUP_RF_REGS {
+            if address & 0x1_0000 != 0 {
+                let direct = CR + base + ((address & 0xff) << 2);
+                assert_eq!(
+                    io.get(direct, 4) & RFREG_MASK,
+                    original.get(direct, 4) & RFREG_MASK
+                );
+            } else {
+                let address = address as usize;
+                assert_eq!(io.rf[path][address], original.rf[path][address]);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_lok_code_out_of_range_is_tried_three_times_with_a_higher_bias() {
+    let (io, state) = run_iqk(&iqk_cases()[6]);
+    assert_eq!(io.oneshots, 2 * (3 * 4 + 4 + 4 + 1));
+    for path in 0..2 {
+        assert_eq!(io.rf[path][RR_LUTWD0 as usize], 3);
+        assert_eq!(field(state.iqk.lok_idac[0][path], RR_TXMO_COI), 0x1f);
+    }
+    // rtw89 only logs that LOK failed; TXK and RXK still pass.
+    assert_eq!(state.iqk.iqk_tx_fail[0], [false, false]);
+    assert_eq!(state.iqk.iqk_rx_fail[0], [false, false]);
+}
+
+#[test]
+fn a_failed_or_silent_one_shot_fails_its_calibration() {
+    let (_, state) = run_iqk(&iqk_cases()[7]);
+    let q = &state.iqk;
+    // Path A: LOK coarse, TXK group 1, RXK group 2 and the restore; path B:
+    // TXK group 2.
+    assert_eq!(q.lok_cor_fail[0], [true, false]);
+    assert_eq!(q.iqk_tx_fail[0], [true, true]);
+    assert_eq!(q.iqk_rx_fail[0], [true, false]);
+    assert_eq!(q.is_wb_txiqk, [false, false]);
+    assert_eq!(q.nb_txcfir, [0x4000_0002; 2]);
+    assert_eq!(q.nb_rxcfir, [0x4000_0002, 0x4000_0000]);
+    assert_eq!(q.iqk_fail_cnt, 2);
+
+    // A report that never comes: 0xbff8 every 1 us for 8.2 ms, 8201 looks,
+    // and the group counts as failed.
+    let (io, state) = run_iqk(&iqk_cases()[8]);
+    assert_eq!(io.reads(CR + 0xbff8), 8201 + (2 * 13 - 1));
+    assert_eq!(state.iqk.iqk_tx_fail[0], [true, false]);
+}
+
+#[test]
+fn iqk_init_resets_once_and_every_run_counts() {
+    let (_, state) = run_iqk(&iqk_cases()[10]);
+    assert_eq!(state.iqk.iqk_times, 4);
+    assert_eq!(state.iqk.iqk_ch, [149, 149]);
+
+    // Results go under the MCC table the state names; one rtw89 never
+    // gives keeps none.
+    let (_, state) = run_iqk(&iqk_cases()[9]);
+    assert_eq!(state.iqk.iqk_mcc_ch, [[0, 0], [36, 36]]);
+    assert_eq!(state.iqk.lok_idac[0], [0, 0]);
+    assert_ne!(state.iqk.lok_idac[1], [0, 0]);
+    assert_eq!(state.iqk.iqk_table_idx, [1, 1]);
+    let (_, state) = run_iqk(&IqkCase {
+        table_idx: 2,
+        ..iqk_case(A36)
+    });
+    assert_eq!(state.iqk.iqk_mcc_ch, [[0, 0]; 2]);
+    assert_eq!(state.iqk.lok_idac, [[0, 0]; 2]);
 }
