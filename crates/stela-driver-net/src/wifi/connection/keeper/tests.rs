@@ -434,3 +434,20 @@ fn a_radio_with_tkip_group_keys_goes_on_to_join_a_mixed_network() {
     assert_eq!(first_failure(&mut keeper), "no advertisement");
     assert_eq!(keeper.link.advertised.get(), 1);
 }
+
+#[test]
+fn a_kept_station_waits_for_carrier_through_a_scan_sae_and_the_handshake() {
+    let keeper = Scripted::<true>::hearing(mixed());
+    assert_eq!(
+        keeper.carrier_wait_us(),
+        SCAN_BUDGET_US + SAE_BUDGET_US + HANDSHAKE_TIMEOUT_US
+    );
+    assert_eq!(keeper.carrier_wait_us(), crate::WIFI_CARRIER_WAIT_US);
+}
+
+#[test]
+fn a_kept_station_waits_longer_than_its_radio_or_a_wired_phy() {
+    let keeper = Scripted::<false>::hearing(mixed());
+    assert_eq!(keeper.link.carrier_wait_us(), crate::WIRED_CARRIER_WAIT_US);
+    assert!(keeper.carrier_wait_us() > crate::WIRED_CARRIER_WAIT_US);
+}

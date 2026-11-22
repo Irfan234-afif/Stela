@@ -1504,6 +1504,11 @@ impl<R: Radio> Link for Keeper<R> {
         self.poll();
         self.link.carrier()
     }
+    /// The port opens only after a scan, an SAE exchange and the four-way
+    /// handshake, each of which may run to its budget.
+    fn carrier_wait_us(&self) -> u64 {
+        SCAN_BUDGET_US + SAE_BUDGET_US + HANDSHAKE_TIMEOUT_US
+    }
     fn signals(&self) -> bool {
         self.link.signals()
     }
