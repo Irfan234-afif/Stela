@@ -270,6 +270,68 @@ impl<'a> C2h<'a> {
     }
 }
 
+/// `RTW89_PHY_C2H_CLASS_RA` and its `RTW89_PHY_C2H_FUNC_STS_RPT`, the rate
+/// report `rtw89_phy_c2h_handle` sends to `rtw89_phy_c2h_ra_rpt`.
+pub const PHY_C2H_CLASS_RA: u8 = 0x1;
+pub const PHY_C2H_FUNC_STS_RPT: u8 = 0x0;
+/// `sizeof(struct rtw89_c2h_ra_rpt)`: the header, `w2` and `w3`.
+pub const RA_RPT_LEN: usize = 16;
+/// `RTW89_C2H_RA_RPT_W2_*` and `RTW89_C2H_RA_RPT_W3_*`. The `_B7` and `_B2`
+/// bits are the BE format's, which an AX chip's report never uses.
+pub const RA_RPT_W2_MACID: u32 = 0x0000_ffff;
+pub const RA_RPT_W2_RETRY_RATIO: u32 = 0x00ff_0000;
+pub const RA_RPT_W3_MCSNSS: u32 = 0x0000_007f;
+pub const RA_RPT_W3_MD_SEL: u32 = 0x0000_0300;
+pub const RA_RPT_W3_GILTF: u32 = 0x0000_1c00;
+pub const RA_RPT_W3_BW: u32 = 0x0000_6000;
+
+/// What `__rtw89_phy_c2h_ra_rpt_iter` reads of `struct rtw89_c2h_ra_rpt` on
+/// an AX chip (`format_v1` false).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RaRpt {
+    /// `RTW89_C2H_RA_RPT_W2_MACID` as rtw89 keeps it, in a `u8`: its low
+    /// eight bits.
+    pub mac_id: u8,
+    /// Read by the BE format alone; an AX chip's report leaves
+    /// `retry_ratio` at 0.
+    pub retry_ratio: u8,
+    /// `RTW89_C2H_RA_RPT_W3_MCSNSS`: the rate, as its mode reads it.
+    pub rate: u8,
+    /// `enum rtw89_ra_report_mode`.
+    pub mode: u8,
+    /// `enum rtw89_gi_ltf`.
+    pub giltf: u8,
+    /// `enum rtw89_bandwidth`.
+    pub bw: u8,
+}
+
+impl C2h<'_> {
+    /// `rtw89_fw_c2h_cmd_handle`'s OUTSRC category and `rtw89_phy_c2h_handle`'s
+    /// RA class to `rtw89_phy_c2h_ra_rpt`: `None` for any other C2H; a report
+    /// shorter than `struct rtw89_c2h_ra_rpt`, which rtw89 would read past,
+    /// is refused.
+    pub fn ra_report(&self) -> Option<Result<RaRpt, Error>> {
+        let attr = self.attr;
+        if attr.category != C2H_CAT_OUTSRC
+            || attr.class != PHY_C2H_CLASS_RA
+            || attr.func != PHY_C2H_FUNC_STS_RPT
+        {
+            return None;
+        }
+        Some(need(RA_RPT_LEN, self.data.len()).map(|()| {
+            let (w2, w3) = (dword(self.data, 8), dword(self.data, 12));
+            RaRpt {
+                mac_id: field(w2, RA_RPT_W2_MACID) as u8,
+                retry_ratio: 0,
+                rate: field(w3, RA_RPT_W3_MCSNSS) as u8,
+                mode: field(w3, RA_RPT_W3_MD_SEL) as u8,
+                giltf: field(w3, RA_RPT_W3_GILTF) as u8,
+                bw: field(w3, RA_RPT_W3_BW) as u8,
+            }
+        }))
+    }
+}
+
 /// What one RX buffer holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Packet<'a> {

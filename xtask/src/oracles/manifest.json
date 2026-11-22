@@ -2637,6 +2637,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "ra_ba_cam_and_report_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/ra/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RA_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RA, BA CAM and RA report C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",
