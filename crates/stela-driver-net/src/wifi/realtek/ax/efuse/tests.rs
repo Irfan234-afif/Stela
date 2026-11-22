@@ -85,7 +85,8 @@ impl Case {
 /// and answering it.
 pub(crate) struct Model {
     memory: Vec<u8>,
-    xtal: [u8; 256],
+    /// The XTAL SI registers.
+    pub(crate) xtal: [u8; 256],
     ddv: Vec<u8>,
     dav: Vec<u8>,
     ddv_late: u32,
@@ -306,7 +307,7 @@ pub(crate) fn mailbox() -> Mailbox {
 /// The C harness's `encode`: one block per 8 logical bytes that hold anything
 /// but 0xff, each word enabled where it does, written from physical byte
 /// `at`. Returns the next free byte.
-fn encode_blocks(map: &mut [u8], mut at: usize, logical: &[u8]) -> usize {
+pub(crate) fn encode_blocks(map: &mut [u8], mut at: usize, logical: &[u8]) -> usize {
     for (blk, words) in logical.chunks(8).enumerate() {
         let mut word_en = 0xf;
         for i in 0..4 {
@@ -333,7 +334,7 @@ fn encode_blocks(map: &mut [u8], mut at: usize, logical: &[u8]) -> usize {
 /// The synthetic board: MAC 02:00:00:00:00:01, RFE type 1, crystal cap 0x3c,
 /// country "US", thermal values, TSSI offsets and RX gain offsets, as the C
 /// oracle's `fill_valid` programs them.
-fn synthetic_logical() -> Vec<u8> {
+pub(crate) fn synthetic_logical() -> Vec<u8> {
     let mut log = vec![0xff; LOGICAL_EFUSE_SIZE];
     log[E_MAC_ADDR..E_MAC_ADDR + 6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
     log[RFE_TYPE] = 1;
@@ -360,7 +361,7 @@ fn synthetic_logical() -> Vec<u8> {
 }
 
 /// The C oracle's `phycap_programmed`.
-fn program_phycap(ddv: &mut [u8], power_k: u8) {
+pub(crate) fn program_phycap(ddv: &mut [u8], power_k: u8) {
     ddv[0x5e9] = power_k;
     for j in 0..8 {
         ddv[0x5d6 - j] = 0x01 + j as u8;

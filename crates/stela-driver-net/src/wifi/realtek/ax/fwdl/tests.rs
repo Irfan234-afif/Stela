@@ -252,7 +252,7 @@ unsafe impl Io for &Chip {
 
 /// One section of a synthetic image: its type, size, whether a checksum
 /// follows, and its MSS signature count.
-struct Synthetic {
+pub(crate) struct Synthetic {
     kind: u8,
     size: u32,
     checksum: bool,
@@ -270,7 +270,7 @@ const fn section(kind: u8, size: u32, checksum: bool, mssc: u32) -> Synthetic {
 
 /// Image A: three parts, one exactly full with its checksum, none, and a
 /// security section with one signature, behind a dynamic header.
-const SYN_A: [Synthetic; 4] = [
+pub(crate) const SYN_A: [Synthetic; 4] = [
     section(2, 4041, false, 0),
     section(1, 2012, true, 0),
     section(3, 0, false, 0),
@@ -285,7 +285,7 @@ fn put32(bytes: &mut [u8], at: usize, value: u32) {
 
 /// The C oracle's `synthetic`: a legacy single image of header version 0
 /// whose part size field is not 2020.
-fn synthetic(seed: u8, sections: &[Synthetic], dynamic: u32) -> Vec<u8> {
+pub(crate) fn synthetic(seed: u8, sections: &[Synthetic], dynamic: u32) -> Vec<u8> {
     let n = sections.len() as u32;
     let base = 32 + 16 * n;
     let hdr = base + dynamic;

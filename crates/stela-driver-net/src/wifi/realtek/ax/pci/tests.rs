@@ -188,6 +188,9 @@ struct State {
     config: Vec<u8>,
     mdio: [[u16; 32]; 4],
     log: Vec<Access>,
+    /// Whether accesses are logged; [`Model::logging`] turns it off for
+    /// long polls.
+    logging: bool,
     faults: Faults,
     waited_us: u64,
 }
@@ -205,6 +208,11 @@ fn overlaps(register: u32, width: u32, at: u32, bytes: u32) -> bool {
 }
 
 impl State {
+    fn record(&mut self, access: Access) {
+        if self.logging {
+            self.log.push(access);
+        }
+    }
     fn get(&self, register: u32, width: u32) -> u32 {
         let at = register as usize;
         let mut bytes = [0; 4];
@@ -282,7 +290,7 @@ impl State {
                 value |= RXQ_BUSY;
             }
         }
-        self.log.push(Access::Read {
+        self.record(Access::Read {
             width,
             register,
             value,
@@ -291,7 +299,7 @@ impl State {
     }
     fn write(&mut self, register: u32, width: u32, value: u32) {
         Self::check(register, width);
-        self.log.push(Access::Write {
+        self.record(Access::Write {
             width,
             register,
             value,
@@ -343,6 +351,7 @@ impl Model {
             config,
             mdio,
             log: Vec::new(),
+            logging: true,
             faults,
             waited_us: 0,
         }))
@@ -358,6 +367,14 @@ impl Model {
     }
     pub(crate) fn set(&self, register: u32, width: u32, value: u32) {
         self.0.borrow_mut().set(register, width, value);
+    }
+    /// What the register file holds, without an access.
+    pub(crate) fn get(&self, register: u32, width: u32) -> u32 {
+        self.0.borrow().get(register, width)
+    }
+    /// Whether later accesses are logged.
+    pub(crate) fn logging(&self, on: bool) {
+        self.0.borrow_mut().logging = on;
     }
     fn count(&self, access: Access) -> usize {
         self.0
@@ -395,7 +412,7 @@ unsafe impl Io for &Model {
     fn delay_us(&mut self, microseconds: u64) {
         let mut state = self.0.borrow_mut();
         state.waited_us += microseconds;
-        state.log.push(Access::Delay(microseconds));
+        state.record(Access::Delay(microseconds));
     }
 }
 
@@ -408,14 +425,14 @@ impl ConfigSpace for &Model {
         let mut state = self.0.borrow_mut();
         assert!(usize::from(offset) < CONFIG, "{offset:#x}");
         if state.faults.config_fails {
-            state.log.push(Access::ConfigRead {
+            state.record(Access::ConfigRead {
                 offset,
                 value: None,
             });
             return Err(refused(offset, 1));
         }
         let value = state.config[usize::from(offset)];
-        state.log.push(cr(offset, value));
+        state.record(cr(offset, value));
         Ok(value)
     }
     fn read16(&self, offset: u16) -> Result<u16, ConfigError> {
@@ -428,7 +445,7 @@ impl ConfigSpace for &Model {
         let mut state = self.0.borrow_mut();
         assert!(usize::from(offset) < CONFIG, "{offset:#x}");
         if state.faults.config_fails {
-            state.log.push(Access::ConfigWrite {
+            state.record(Access::ConfigWrite {
                 offset,
                 value,
                 accepted: false,
@@ -436,7 +453,7 @@ impl ConfigSpace for &Model {
             return Err(refused(offset, 1));
         }
         state.config[usize::from(offset)] = value;
-        state.log.push(cw(offset, value));
+        state.record(cw(offset, value));
         Ok(())
     }
     fn write16(&mut self, offset: u16, _: u16) -> Result<(), ConfigError> {

@@ -14,12 +14,14 @@
 //! ([`c2h`]), the firmware download ([`fwdl`]), the firmware features
 //! rtw89 expects by version ([`features`]), and the efuse and phycap read
 //! once the firmware runs ([`efuse`], [`rtw8852b::efuse`]) over the register
-//! mailbox ([`h2creg`]) are the first slices. Powering the chip on,
+//! mailbox ([`h2creg`]) are the first slices, and [`bootstrap`] composes
+//! them in rtw89's probe order into one power cycle. Powering the chip on,
 //! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
 //! its polled bits answered, the ring addresses were written and the command
 //! BDs were filled; a download that returns proves that the firmware
 //! reported FREERTOS_DONE, nothing about its radio; an efuse read proves
 //! that every byte was answered, not what the bytes mean.
+pub mod bootstrap;
 pub mod c2h;
 pub mod dle;
 pub mod efuse;
@@ -28,6 +30,8 @@ pub mod fwdl;
 pub mod h2c;
 pub mod h2creg;
 pub mod io;
+#[cfg(test)]
+mod model;
 pub mod pci;
 pub mod power;
 pub mod registers;

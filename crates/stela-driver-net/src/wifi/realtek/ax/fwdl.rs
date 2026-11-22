@@ -556,4 +556,4 @@ pub fn fail_dump<I: Io + ?Sized>(io: &mut I) -> Result<FailDump, io::Error> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

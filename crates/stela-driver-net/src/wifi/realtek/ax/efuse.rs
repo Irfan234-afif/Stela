@@ -279,12 +279,25 @@ pub fn info_setup<I: Io + ?Sized>(
     mailbox: &mut Mailbox,
 ) -> Result<Info, Error> {
     let mut info = Info::probe();
-    parse_efuse_map(io, cut, &mut info)?;
-    parse_phycap_map(io, cut, &mut info)?;
+    info_setup_into(io, cut, mailbox, &mut info)?;
+    Ok(info)
+}
+
+/// [`info_setup`] over `info`, as rtw89 fills `rtwdev`: what each step read
+/// stays when a later one fails. The power-off rtw89 makes after a failure
+/// reads the RFE type ([`Efuse::rfe_type`]) the efuse map gave by then.
+pub fn info_setup_into<I: Io + ?Sized>(
+    io: &mut I,
+    cut: u8,
+    mailbox: &mut Mailbox,
+    info: &mut Info,
+) -> Result<(), Error> {
+    parse_efuse_map(io, cut, info)?;
+    parse_phycap_map(io, cut, info)?;
     setup_phycap(io, mailbox, &mut info.hal)?;
     core_setup_phycap(cut, &mut info.hal);
     pci::mac_pre_deinit(io)?;
-    Ok(info)
+    Ok(())
 }
 
 /// `rtw89_parse_efuse_map_ax` on an RTL8852BE: [`Efuse::valid`] from the
