@@ -402,6 +402,7 @@ fn h2c_headers_match_unchanged_c() {
             seq: (j * 0x321 + 7) as u16,
             agg_en: j % 3 == 0,
             bk: j % 3 == 1,
+            ..DescInfo::default()
         };
         for (k, dword) in desc.dwords().into_iter().enumerate() {
             push(&mut expected, 112, k as u32, dword);

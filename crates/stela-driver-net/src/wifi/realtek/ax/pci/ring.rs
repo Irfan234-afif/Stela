@@ -17,7 +17,18 @@
 //!   `rtw89_pci_release_fwcmd` empties ([`FwCmdQueue`]);
 //! - [`Rings`]: the part of `rtw89_pci_alloc_trx_rings` this step needs, and
 //!   `rtw89_pci_ops_reset` with `rtw89_pci_reset_trx_rings`, which the PCIe
-//!   pre-init ([`super::mac_pre_init`]) calls.
+//!   pre-init ([`super::mac_pre_init`]) calls;
+//! - the data path: `rtw89_pci_alloc_tx_wd_ring` ([`Rings::alloc_tx_wd`]),
+//!   `rtw89_pci_ops_tx_write` with `rtw89_pci_txbd_submit`,
+//!   `rtw89_pci_txwd_submit` and RTL885xB's `rtw89_pci_fill_txaddr_info`
+//!   ([`Rings::tx_write`], over [`txbd_submit`], [`txwd_page`] and
+//!   [`AddrInfo`]), `rtw89_pci_ops_tx_kick_off` ([`Rings::tx_kick_off`]),
+//!   and the release: `rtw89_pci_poll_rpq_dma`'s ring work with
+//!   `rtw89_pci_release_tx`, `rtw89_pci_release_tx_skbs` and
+//!   `rtw89_pci_release_rpp` ([`Rings::poll_rpq`]), `rtw89_pci_reclaim_txbd`
+//!   ([`Rings::reclaim_txbd`]) and `rtw89_pci_check_and_reclaim_tx_resource`
+//!   ([`Rings::check_and_reclaim_tx_resource`]), over the WD pages and
+//!   reports of [`super::release`].
 //!
 //! [`Rings::new`] allocates what rtw89 allocates for the rings, laid out as
 //! rtw89 lays it out, so the addresses and sizes the pre-init programs are
@@ -31,10 +42,22 @@
 //! such as this AMD host's.
 //!
 //! What this leaves out, and why:
-//! - The TX data channels' WD pages (`rtw89_pci_alloc_tx_wd_ring`) and their
-//!   submission, release and RPP handling: the data path is a later step.
-//!   Their BD rings are allocated and programmed already, as rtw89 programs
-//!   them, and stay stopped until the full MAC init enables them.
+//! - When the WD pages are allocated: rtw89 allocates them with the rings at
+//!   probe, Stela when the data path starts ([`Rings::alloc_tx_wd`]), after
+//!   every RX buffer, so the allocations the pre-init programs stay where
+//!   they were. Their BD rings are allocated and programmed with the others
+//!   and stay stopped until the full MAC init enables them.
+//! - `rtw89_pci_txwd_submit`'s mapping: a frame comes mapped ([`Buffer`]),
+//!   so the page rtw89 puts back on a failed mapping is never taken. The WD
+//!   page is written whole at submission, which leaves the bytes rtw89's
+//!   zeroing at enqueue and its writes leave.
+//! - `hci.paused`, its kick map and the no-I/O resource check: Stela never
+//!   pauses the interface. Low power mode, never entered.
+//! - Hardware indices outside a ring, where rtw89 would go on: refused
+//!   ([`Error::Index`]) before anything moves, as for the command ring.
+//! - An RPQ buffer the release cannot walk (a stale tag, or not FS and LS)
+//!   is synced back for the device before the rest are skipped, where rtw89
+//!   skips the sync for the latter.
 //! - RX reassembly across segments (`fs`/`ls`), RX descriptor parsing and
 //!   `diliver_skb`/`diliver_desc`: [`Rings::deliver`] hands each filled
 //!   buffer, with its decoded info, to the caller.
@@ -47,6 +70,10 @@
 use super::super::{
     io::{self, Io, field, prep},
     registers::*,
+};
+use super::{
+    super::txwd::DescInfo,
+    release::{self, Completion, RppInfo, WdRing},
 };
 use crate::bus::dma::{
     mapping::{Direction, DmaDomain, DmaError, DmaMapping},
@@ -606,6 +633,16 @@ pub enum Error {
     /// A hardware index outside the ring, where rtw89 would go on to reuse
     /// buffers it never handed over. The ring is left as it was.
     Index(u32),
+    /// `rtw89_pci_txbd_submit`'s "no available TXWD": every WD page of the
+    /// ring carries a frame.
+    NoTxWd,
+    /// A data channel whose WD pages [`Rings::alloc_tx_wd`] has not
+    /// allocated.
+    NoWdRing(TxChannel),
+    /// A frame's `ch_dma` that names no ring, or CH12, which
+    /// `rtw89_pci_tx_write` keeps for firmware commands ("only fw cmd uses
+    /// dma channel 12").
+    Channel(u8),
 }
 
 impl From<MemoryError> for Error {
@@ -870,6 +907,8 @@ pub struct Rings {
     tx: [Option<TxRing>; TXCH_NUM],
     rx: [RxRing; RXCH_NUM],
     fwcmd: FwCmdQueue<Buffer>,
+    /// The data channels' WD pages, once [`Self::alloc_tx_wd`] ran.
+    wd: [Option<TxWd>; TXCH_NUM],
 }
 
 impl Rings {
@@ -958,6 +997,7 @@ impl Rings {
             tx,
             rx,
             fwcmd: FwCmdQueue::new()?,
+            wd: core::array::from_fn(|_| None),
         })
     }
 
@@ -1017,9 +1057,11 @@ impl Rings {
     }
 
     /// `rtw89_pci_ops_reset`: `rtw89_pci_reset_trx_rings` programs every
-    /// ring's count, BD RAM share and base and zeroes its indices, then the
-    /// command buffers are all released. The data channels have no WD
-    /// pages yet, so their release finds nothing.
+    /// ring's count, BD RAM share and base and zeroes its indices, then each
+    /// data channel's WD pages are released (`rtw89_pci_release_tx_ring`:
+    /// a frame still held is unmapped and counted as `RTW89_TX_MACID_DROP`)
+    /// and the command buffers are all released. At the pre-init no data
+    /// channel has WD pages yet, so their release finds nothing.
     ///
     /// # Safety
     /// The chip's DMA is stopped and idle, as `rtw89_pci_ops_mac_pre_init_ax`
@@ -1062,6 +1104,15 @@ impl Rings {
                 io.write32(bd_ring.addr.desa_l, bd_ring.dma as u32)?;
                 io.write32(bd_ring.addr.desa_l + 4, (bd_ring.dma >> 32) as u32)?;
             }
+        }
+        // rtw89_pci_release_tx_ring for every data channel with WD pages.
+        for wd in self.wd.iter_mut().flatten() {
+            wd.ring.release_ring(|_, mut frame| {
+                // SAFETY: the caller stopped the chip's DMA and saw it idle,
+                // so no frame is read any more. A frame whose unmap fails
+                // stays published and is kept for good.
+                let _ = unsafe { frame.release() };
+            });
         }
         let queued = self.fwcmd.queued() as u32;
         self.fwcmd.release(queued, true, |buffer| {
@@ -1193,6 +1244,14 @@ impl Rings {
     /// # Safety
     /// The chip's DMA is stopped and drained, and no access can start again.
     pub unsafe fn release_after_stop(&mut self) -> Result<(), Error> {
+        for wd in self.wd.iter_mut().flatten() {
+            for frame in wd.ring.frames_mut() {
+                // SAFETY: covered by this function's contract.
+                unsafe { frame.release()? };
+            }
+            // SAFETY: covered by this function's contract.
+            unsafe { wd.pages.release()? };
+        }
         for buffer in self.fwcmd.all() {
             // SAFETY: covered by this function's contract.
             unsafe { buffer.release()? };
@@ -1209,5 +1268,428 @@ impl Rings {
             self.tx_pool.release()?;
         }
         Ok(())
+    }
+}
+
+/// `RTW89_PCI_TXWD_NUM_MAX`: the WD pages of every data channel.
+pub const TXWD_NUM_MAX: usize = 512;
+/// `RTW89_PCI_TXWD_PAGE_SIZE`.
+pub const TXWD_PAGE_SIZE: usize = 128;
+/// `RTW89_PCI_TXWP_VALID`: set beside the page's sequence in its WP info.
+pub const TXWP_VALID: u16 = 1 << 15;
+/// `sizeof(struct rtw89_pci_tx_wp_info)`: four 16-bit sequences.
+pub const WP_INFO_SIZE: usize = 8;
+/// The `struct rtw89_pci_tx_addr_info_32` option: `RTW89_PCI_ADDR_MSDU_LS`,
+/// `RTW89_PCI_ADDR_LS`, `RTW89_PCI_ADDR_HIGH_MASK` and the mask of
+/// `RTW89_PCI_ADDR_NUM`.
+pub const ADDR_MSDU_LS: u16 = 1 << 15;
+pub const ADDR_LS: u16 = 1 << 14;
+pub const ADDR_HIGH_MASK: u16 = 0x3fc0;
+pub const ADDR_NUM_MASK: u16 = 0x003f;
+
+/// `struct rtw89_pci_tx_addr_info_32`, eight little-endian bytes behind the
+/// WP info: the frame's length, the option, then its low 32 bits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AddrInfo {
+    pub length: u16,
+    pub option: u16,
+    pub dma: u32,
+}
+
+impl AddrInfo {
+    pub const SIZE: usize = 8;
+
+    /// `rtw89_pci_fill_txaddr_info`, RTL8852BE's `fill_txaddr_info`: one
+    /// entry for the whole frame (`add_info_nr` 1), its last MSDU, the
+    /// address's upper bits in the option. rtw89 returns [`Self::SIZE`].
+    pub const fn fill(total_len: u32, dma: u64) -> Self {
+        Self {
+            length: total_len as u16,
+            option: ADDR_MSDU_LS
+                | (1 & ADDR_NUM_MASK)
+                | prep((dma >> 32) as u32 & 0xffff, ADDR_HIGH_MASK as u32) as u16,
+            dma: dma as u32,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut bytes = [0; Self::SIZE];
+        bytes[0..2].copy_from_slice(&self.length.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.option.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.dma.to_le_bytes());
+        bytes
+    }
+}
+
+/// A WD page as `rtw89_pci_txwd_submit` leaves it, zeroed before: the
+/// TXWD body (and info), the WP info naming the page, the address info,
+/// and `txwd->len`, how many of those bytes the BD hands over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxWdPage {
+    pub bytes: [u8; TXWD_PAGE_SIZE],
+    pub len: u32,
+}
+
+/// `rtw89_pci_txwd_submit` for page `seq` and a frame of `skb_len` bytes at
+/// `dma`: the WP info's first sequence is `seq` with `RTW89_PCI_TXWP_VALID`,
+/// the others 0, the address info is `rtw89_pci_fill_txaddr_info`'s, and
+/// `rtw89_core_fill_txdesc` writes the body and info in front.
+pub fn txwd_page(desc: &DescInfo, seq: u16, skb_len: u32, dma: u64) -> TxWdPage {
+    let (wd, txwd_len) = desc.wd();
+    let mut bytes = [0; TXWD_PAGE_SIZE];
+    bytes[..txwd_len].copy_from_slice(&wd[..txwd_len]);
+    bytes[txwd_len..txwd_len + 2].copy_from_slice(&(seq | TXWP_VALID).to_le_bytes());
+    let at = txwd_len + WP_INFO_SIZE;
+    bytes[at..at + AddrInfo::SIZE].copy_from_slice(&AddrInfo::fill(skb_len, dma).encode());
+    TxWdPage {
+        bytes,
+        len: (at + AddrInfo::SIZE) as u32,
+    }
+}
+
+/// One frame's submission: its WD page's sequence, the page, and the BD
+/// `rtw89_pci_txbd_submit` points at the page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Submitted {
+    pub seq: u16,
+    pub page: TxWdPage,
+    pub bd: TxBd,
+}
+
+/// `rtw89_pci_tx_write`'s ring work for a data channel, over its indices
+/// and WD pages: a free BD (`-ENOSPC`, [`Error::NoTxBd`]), a free page
+/// ([`Error::NoTxWd`]), that page filled for a frame of `skb_len` bytes at
+/// `dma` and the BD at the host index pointing at it. `store` writes both,
+/// at the BD's index, before anything moves; then `frame` is queued on the
+/// page, the page goes on the busy list and the host index moves on.
+/// Returns the page's sequence number, which the frame's report will name.
+pub fn txbd_submit<F, E: From<Error>>(
+    bd: &mut DmaRing,
+    wd: &mut WdRing<F>,
+    desc: &DescInfo,
+    skb_len: u32,
+    dma: u64,
+    frame: F,
+    store: impl FnOnce(u32, &Submitted) -> Result<(), E>,
+) -> Result<u16, E> {
+    if avail_txbd(bd) == 0 {
+        return Err(Error::NoTxBd.into());
+    }
+    let seq = wd.peek().ok_or(Error::NoTxWd)?;
+    let page = txwd_page(desc, seq, skb_len, dma);
+    let submitted = Submitted {
+        seq,
+        page,
+        bd: TxBd::last_segment(wd.page_dma(seq), page.len as u16),
+    };
+    store(bd.wp, &submitted)?;
+    match wd.submit(frame) {
+        Ok(taken) if taken == seq => {}
+        _ => return Err(Error::NoTxWd.into()),
+    }
+    tx_bd_ring_update(bd, 1);
+    Ok(seq)
+}
+
+/// One data channel's WD pages: their memory and their lists.
+struct TxWd {
+    pages: Buffer,
+    ring: WdRing<Buffer>,
+}
+
+/// `rtw89_pci_txbd_recalc`, refusing a hardware index outside the ring
+/// before the ring moves.
+fn recalc_tx<I: Io + ?Sized>(io: &mut I, ring: &mut DmaRing) -> Result<u32, Error> {
+    let mut bd = *ring;
+    let cnt = txbd_recalc(io, &mut bd)?;
+    if bd.rp >= bd.len {
+        return Err(Error::Index(bd.rp));
+    }
+    *ring = bd;
+    Ok(cnt)
+}
+
+/// `rtw89_pci_rxbd_recalc`, refusing a hardware index outside the ring
+/// before the ring moves.
+fn recalc_rx<I: Io + ?Sized>(io: &mut I, ring: &mut DmaRing) -> Result<u32, Error> {
+    let mut bd = *ring;
+    let cnt = rxbd_recalc(io, &mut bd)?;
+    if bd.rp >= bd.len {
+        return Err(Error::Index(bd.rp));
+    }
+    *ring = bd;
+    Ok(cnt)
+}
+
+/// `rtw89_pci_release_rpp` for one report: parsed, dropped where rtw89
+/// warns (or where the named ring has no WD pages), else its page released
+/// (`rtw89_pci_release_txwd_skb`), the frame unmapped as rtw89 unmaps it,
+/// and handed to `released`.
+fn release_rpp<I: Io + ?Sized>(
+    tx: &mut [Option<TxRing>; TXCH_NUM],
+    wd: &mut [Option<TxWd>; TXCH_NUM],
+    io: &mut I,
+    dword: u32,
+    released: &mut impl FnMut(Completion),
+) -> Result<(), Error> {
+    let info = RppInfo::parse(dword);
+    let Some((txch, seq)) = info.target() else {
+        return Ok(());
+    };
+    let (Some(ring), Some(pages)) = (tx[txch as usize].as_mut(), wd[txch as usize].as_mut()) else {
+        return Ok(());
+    };
+    let status = info.status();
+    let frame = pages
+        .ring
+        .release(seq, status, || recalc_tx(io, &mut ring.bd))?;
+    if let Some(mut frame) = frame {
+        // SAFETY: the chip's report released the frame, so its DMA read it
+        // for the last time, which is where rtw89 unmaps it. A frame whose
+        // unmap fails stays published and is kept for good.
+        let _ = unsafe { frame.release() };
+        released(Completion { txch, seq, status });
+    }
+    Ok(())
+}
+
+impl Rings {
+    /// `rtw89_pci_alloc_tx_wd_ring` for every data channel the chip has
+    /// (not CH12, whose commands carry their own body): 512 pages of 128
+    /// bytes in one zeroed allocation below 4 GiB, each free in sequence
+    /// order. A channel that has its pages keeps them.
+    pub fn alloc_tx_wd(
+        &mut self,
+        source: &dyn PageSource,
+        domain: Arc<dyn DmaDomain>,
+    ) -> Result<(), Error> {
+        for txch in TxChannel::ALL {
+            if !txch.present() || txch == TxChannel::Ch12 || self.wd[txch as usize].is_some() {
+                continue;
+            }
+            let pages = Buffer::new(
+                source,
+                domain.clone(),
+                TXWD_NUM_MAX * TXWD_PAGE_SIZE,
+                Direction::ToDevice,
+            )?;
+            let ring = WdRing::new(u64::from(pages.address()))?;
+            self.wd[txch as usize] = Some(TxWd { pages, ring });
+        }
+        Ok(())
+    }
+
+    /// The WD pages of `txch`, once allocated: free count, busy list,
+    /// counters.
+    pub fn wd_ring(&self, txch: TxChannel) -> Option<&WdRing<Buffer>> {
+        self.wd[txch as usize].as_ref().map(|wd| &wd.ring)
+    }
+
+    /// `rtw89_pci_ops_tx_write` for one frame: the first `length` bytes of
+    /// `frame` go on the ring `desc.ch_dma` names, behind the next free WD
+    /// page, which [`txbd_submit`] fills from `desc` and points the next BD
+    /// at; the host index moves on and [`Self::tx_kick_off`] hands it to
+    /// the chip. Returns the page's sequence number, which the frame's
+    /// [`Completion`] names. A frame the ring could not take is dropped,
+    /// unmapped; one that may have reached a BD is kept for good when a
+    /// later step fails.
+    pub fn tx_write(
+        &mut self,
+        desc: &DescInfo,
+        mut frame: Buffer,
+        length: u16,
+    ) -> Result<u16, Error> {
+        let txch = TxChannel::ALL
+            .get(usize::from(desc.ch_dma))
+            .copied()
+            .ok_or(Error::Channel(desc.ch_dma))?;
+        // check the tx type and dma channel for fw cmd queue
+        if txch == TxChannel::Ch12 {
+            return Err(Error::Channel(desc.ch_dma));
+        }
+        if usize::from(length) > frame.bytes() {
+            return Err(Error::Length {
+                length: length.into(),
+                bytes: frame.bytes(),
+            });
+        }
+        let ring = self.tx[txch as usize].as_mut().ok_or(Error::NoRing(txch))?;
+        let TxWd { pages, ring: wd } = self.wd[txch as usize]
+            .as_mut()
+            .ok_or(Error::NoWdRing(txch))?;
+        if avail_txbd(&ring.bd) == 0 {
+            return Err(Error::NoTxBd);
+        }
+        if wd.peek().is_none() {
+            return Err(Error::NoTxWd);
+        }
+        frame.sync_for_device(0..usize::from(length))?;
+        let dma = u64::from(frame.address());
+        frame.publish();
+        let (tx_pool, offset) = (&self.tx_pool, ring.offset);
+        txbd_submit(
+            &mut ring.bd,
+            wd,
+            desc,
+            length.into(),
+            dma,
+            frame,
+            |index, submitted: &Submitted| {
+                let at = usize::from(submitted.seq) * TXWD_PAGE_SIZE;
+                pages.publish();
+                pages.write(at, &submitted.page.bytes)?;
+                pages.sync_for_device(at..at + TXWD_PAGE_SIZE)?;
+                let at = offset + index as usize * TxBd::SIZE;
+                tx_pool.write(at, &submitted.bd.encode())?;
+                tx_pool.sync_for_device(at..at + TxBd::SIZE)
+            },
+        )
+    }
+
+    /// `rtw89_pci_reclaim_txbd` for `txch`: the BDs the hardware read
+    /// (`rtw89_pci_txbd_recalc`) take their pages off the busy list, and
+    /// those already reported go back free. Returns how many it read.
+    pub fn reclaim_txbd<I: Io + ?Sized>(
+        &mut self,
+        io: &mut I,
+        txch: TxChannel,
+    ) -> Result<u32, Error> {
+        let ring = self.tx[txch as usize].as_mut().ok_or(Error::NoRing(txch))?;
+        let wd = self.wd[txch as usize]
+            .as_mut()
+            .ok_or(Error::NoWdRing(txch))?;
+        let cnt = recalc_tx(io, &mut ring.bd)?;
+        wd.ring.reclaim(cnt);
+        Ok(cnt)
+    }
+
+    /// `rtw89_pci_poll_rpq_dma`'s ring work: the RPQ buffers the hardware
+    /// filled (`rtw89_pci_rxbd_recalc`), all of them, released by
+    /// `rtw89_pci_release_tx`; each frame a report releases is unmapped and
+    /// handed to `released`. Returns how many buffers were consumed.
+    pub fn poll_rpq<I: Io + ?Sized>(
+        &mut self,
+        io: &mut I,
+        mut released: impl FnMut(Completion),
+    ) -> Result<u32, Error> {
+        let cnt = recalc_rx(io, &mut self.rx[RxChannel::Rpq as usize].bd)?;
+        if cnt == 0 {
+            return Ok(0);
+        }
+        self.release_tx(io, cnt, &mut released)?;
+        Ok(cnt)
+    }
+
+    /// `rtw89_pci_release_tx`: `cnt` RPQ buffers, one at a time; one that
+    /// releases nothing skips the rest ("failed to release TX skbs"). Then
+    /// the host index.
+    fn release_tx<I: Io + ?Sized>(
+        &mut self,
+        io: &mut I,
+        mut cnt: u32,
+        released: &mut impl FnMut(Completion),
+    ) -> Result<(), Error> {
+        while cnt > 0 {
+            let release_cnt = self.release_tx_skbs(io, released)?;
+            if release_cnt == 0 {
+                // skip the rest RXBD bufs
+                rxbd_increase(&mut self.rx[RxChannel::Rpq as usize].bd, cnt);
+                break;
+            }
+            cnt -= release_cnt;
+        }
+        let bd = &self.rx[RxChannel::Rpq as usize].bd;
+        fence(Ordering::Release);
+        Ok(io.write16(bd.addr.idx, bd.wp as u16)?)
+    }
+
+    /// `rtw89_pci_release_tx_skbs`: the RPQ buffer at the host index synced
+    /// for the CPU and its tag checked, its reports walked
+    /// ([`release::reports`]) and each released (`rtw89_pci_release_rpp`),
+    /// then synced back and the host index moved on. Returns 1, or 0 for a
+    /// buffer whose tag stayed stale or that is not FS and LS.
+    fn release_tx_skbs<I: Io + ?Sized>(
+        &mut self,
+        io: &mut I,
+        released: &mut impl FnMut(Completion),
+    ) -> Result<u32, Error> {
+        let Self { tx, wd, rx, .. } = self;
+        let ring = &mut rx[RxChannel::Rpq as usize];
+        let buffer = ring
+            .buffers
+            .get(ring.bd.wp as usize)
+            .ok_or(Error::Index(ring.bd.wp))?;
+        let checked = sync_and_validate(&mut ring.target_rx_tag, CHECK_RX_TAG, || {
+            // SAFETY: the hardware index moved past this BD, so the chip
+            // finished writing its buffer and gets it back only when the
+            // host index passes it.
+            unsafe { buffer.sync_for_cpu(0..RX_BUF_SIZE) }?;
+            Ok::<_, Error>(RxBdInfo::decode(buffer.read_u32(0)?))
+        })?;
+        let Ok(info) = checked else {
+            // failed to update RXBD info
+            buffer.sync_for_device(0..RX_BUF_SIZE)?;
+            return Ok(0);
+        };
+        let pointer = buffer.cpu.address(0, RX_BUF_SIZE)?;
+        // SAFETY: the buffer is the CPU's until the host index passes it,
+        // and the borrow ends before it is synced back.
+        let data = unsafe { core::slice::from_raw_parts(pointer.as_ptr(), RX_BUF_SIZE) };
+        let mut outcome = Ok(1);
+        match release::reports(info, data) {
+            Ok(reports) => {
+                for dword in reports {
+                    if let Err(error) = release_rpp(tx, wd, io, dword, released) {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            // cannot process RP frame not set FS/LS
+            Err(_) => outcome = Ok(0),
+        }
+        buffer.sync_for_device(0..RX_BUF_SIZE)?;
+        let cnt = outcome?;
+        if cnt == 1 {
+            rxbd_increase(&mut ring.bd, 1);
+        }
+        Ok(cnt)
+    }
+
+    /// `rtw89_pci_check_and_reclaim_tx_resource` for `txch`: how many frames
+    /// it can take now. CH12 reclaims its commands' buffers
+    /// (`__rtw89_pci_check_and_reclaim_tx_fwcmd_resource`) and counts free
+    /// BDs. A data channel short of BDs or pages first releases what RPQ
+    /// holds (`rtw89_pci_release_tx`, frames handed to `released`), then,
+    /// still short of BDs, reclaims those the hardware read; it counts the
+    /// lesser of free BDs and free pages.
+    pub fn check_and_reclaim_tx_resource<I: Io + ?Sized>(
+        &mut self,
+        io: &mut I,
+        txch: TxChannel,
+        mut released: impl FnMut(Completion),
+    ) -> Result<u32, Error> {
+        if txch == TxChannel::Ch12 {
+            self.reclaim_fwcmd(io)?;
+            return self.avail_txbd(txch);
+        }
+        let free = |rings: &Self| -> Result<(u32, u32), Error> {
+            let wd = rings.wd_ring(txch).ok_or(Error::NoWdRing(txch))?;
+            Ok((rings.avail_txbd(txch)?, wd.curr_num()))
+        };
+        let (bd_cnt, wd_cnt) = free(self)?;
+        if wd_cnt == 0 || bd_cnt == 0 {
+            let cnt = recalc_rx(io, &mut self.rx[RxChannel::Rpq as usize].bd)?;
+            if cnt != 0 {
+                self.release_tx(io, cnt, &mut released)?;
+            } else if wd_cnt == 0 {
+                return Ok(0);
+            }
+            if self.avail_txbd(txch)? == 0 {
+                self.reclaim_txbd(io, txch)?;
+            }
+        }
+        let (bd_cnt, wd_cnt) = free(self)?;
+        Ok(bd_cnt.min(wd_cnt))
     }
 }

@@ -45,6 +45,7 @@ fn every_body_field_lands_where_txrx_h_puts_it() {
         seq: 0xffff,
         hw_ssn_sel: 0xff,
         hw_seq_mode: 0xff,
+        ..DescInfo::default()
     };
     assert_eq!(
         desc.body0(),

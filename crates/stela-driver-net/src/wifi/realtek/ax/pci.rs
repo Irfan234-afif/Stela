@@ -63,6 +63,7 @@ use super::io::{self, Io, Registers, prep};
 use super::registers::*;
 use crate::bus::pci::ConfigSpace;
 
+pub mod release;
 pub mod ring;
 
 use ring::Rings;
