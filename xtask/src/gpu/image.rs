@@ -286,9 +286,6 @@ fn link(
     lazy: &[Unit],
 ) -> Result<PathBuf> {
     let archive = directory.join("libimage-lazy.a");
-    if archive.is_file() {
-        fs::remove_file(&archive)?;
-    }
     super::support::archive(
         &toolchain.archiver,
         &archive,

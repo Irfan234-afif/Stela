@@ -183,12 +183,10 @@ fn archive(toolchain: &Toolchain, archive: &Path, units: &[Unit]) -> Result<()> 
     if current.is_some() && units.iter().all(|unit| built(&unit.output) < current) {
         return Ok(());
     }
-    if archive.is_file() {
-        fs::remove_file(archive)?;
-    }
     super::support::archive(
         &toolchain.archiver,
         archive,
         units.iter().map(|unit| &unit.output),
-    )
+    )?;
+    Ok(())
 }

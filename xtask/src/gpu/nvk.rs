@@ -796,6 +796,12 @@ fn include_flags(clang: &Path, libc: &Path) -> Result<Vec<String>> {
 /// saw the build host's, which lays out its types differently.
 fn bindings(build: &Path, path: &Path, flags: &[String], libclang: &Path) -> Result<()> {
     let plan = fs::read_to_string(build.join("build.ninja"))?;
+    // Bindgen's new outputs and the kept ones are made here, outside the
+    // build directories `stela-mesa`'s build watches whole.
+    let copies = build.with_file_name("bindings");
+    fs::create_dir_all(&copies)?;
+    let copy = |target: &Path, kind: &str| super::support::copy_in(&copies, build, target, kind);
+    let mut made = Vec::new();
     for command in plan
         .lines()
         .filter_map(|line| line.strip_prefix(" COMMAND = "))
@@ -812,9 +818,32 @@ fn bindings(build: &Path, path: &Path, flags: &[String], libclang: &Path) -> Res
                 .context("bindgen flags")?
                 + 1,
         );
+        // Bindgen writes a new copy of its output. Ninja's run above makes
+        // the output again from Meson's command each time, so ours is put
+        // back with the time it had when its bindings last changed, and the
+        // Mesa crates that compile it stay fresh
+        // (`support::restore_if_unchanged`).
+        let mut ours = ours.to_vec();
+        let mut outputs = Vec::new();
+        for flag in 0..ours.len() {
+            // Bindgen gives the file of its static functions' wrappers a `.c`
+            // extension of its own, so that new copy's name ends in one.
+            let extension = match ours[flag].as_str() {
+                "-o" | "--output" => "",
+                "--wrap-static-fns-path" => ".c",
+                _ => continue,
+            };
+            let Some(path) = ours.get_mut(flag + 1) else {
+                continue;
+            };
+            let output = build.join(&*path);
+            let fresh = PathBuf::from(format!("{}{extension}", copy(&output, "new").display()));
+            *path = fresh.display().to_string();
+            outputs.push((fresh, output));
+        }
         exec(
             Command::new(program)
-                .args(ours)
+                .args(&ours)
                 .args(flags)
                 .args(["-nostdinc", "-U__CYGWIN__", "-D__linux__", "-U__unix__"])
                 .arg("-DSTELA_LIBC")
@@ -828,11 +857,30 @@ fn bindings(build: &Path, path: &Path, flags: &[String], libclang: &Path) -> Res
                 .env("LIBCLANG_PATH", libclang)
                 .env("PATH", path),
         )?;
+        for (fresh, output) in outputs {
+            super::support::restore_if_unchanged(&fresh, &output, &copy(&output, "kept"))?;
+            made.push(output);
+        }
     }
-    fs::copy(
-        build.join("src/compiler/rust/bindings.rs"),
-        build.join("src/compiler/rust/libcompiler.rlib.p/structured/bindings.rs"),
-    )?;
+    // Ninja copies some of them into a crate's structured sources, as the
+    // compiler's bindings and wrappers, and makes those copies again too:
+    // each takes ours back the same way.
+    for line in plan.lines() {
+        let Some((target, source)) = line
+            .strip_prefix("build ")
+            .and_then(|rest| rest.split_once(": COPY_FILE "))
+        else {
+            continue;
+        };
+        let source = build.join(source.split(" || ").next().unwrap_or(source).trim());
+        if !made.contains(&source) {
+            continue;
+        }
+        let target = build.join(target);
+        let fresh = copy(&target, "new");
+        fs::copy(&source, &fresh)?;
+        super::support::restore_if_unchanged(&fresh, &target, &copy(&target, "kept"))?;
+    }
     Ok(())
 }
 
@@ -1303,9 +1351,9 @@ pub fn build(jobs: u16) -> Result<()> {
     let build = directory.join("build");
     let (_, path, host) = paths(&directory)?;
     fs::create_dir_all(&directory)?;
-    // The list names what the archives hold, so it goes until they are made.
+    // The list names what the archives hold. A build that fails before they
+    // change leaves both as they were, so the list stays until then.
     let linked = directory.join(LINKED);
-    let _ = fs::remove_file(&linked);
     super::llvm::build(&toolchain, jobs, false)?;
     let sysroot = Sysroot::build(&toolchain, &directory, jobs)?;
     let choice = Choice::new(
@@ -1341,20 +1389,37 @@ pub fn build(jobs: u16) -> Result<()> {
                 .to_string_lossy(),
         )
     });
+    // Each archive is made beside the one in place and replaces it only when
+    // their bytes differ, so an unchanged one keeps its modification time and
+    // `stela-mesa`'s build, which watches it, stays fresh. The list goes
+    // before either archive changes and is written again, only when it
+    // differs, once both are in place: `stela-driver-gpu`'s build watches it,
+    // and a new list there compiles all of amdgpu, nouveau and xe again.
     let archive = directory.join("libstela-nvk.a");
+    let mut made = Vec::new();
     for (name, members) in [("libstela-vulkan.a", &whole), ("libstela-nvk.a", &lazy)] {
         let archive = directory.join(name);
-        if archive.is_file() {
-            fs::remove_file(&archive)?;
-        }
-        super::support::archive(
+        let fresh = super::support::fresh(&archive);
+        super::support::make_archive(
             &toolchain.archiver,
-            &archive,
+            &fresh,
             members.iter().map(|unit| &unit.output),
         )?;
+        let same = super::support::same_bytes(&fresh, &archive)?;
+        made.push((fresh, archive, same));
+    }
+    if made.iter().any(|(_, _, same)| !same) {
+        let _ = fs::remove_file(&linked);
+    }
+    for (fresh, archive, same) in made {
+        if same {
+            fs::remove_file(&fresh)?;
+        } else {
+            fs::rename(&fresh, &archive)?;
+        }
     }
     let names: Vec<&str> = choice.drivers.iter().map(|driver| driver.name).collect();
-    fs::write(&linked, names.join("\n") + "\n")?;
+    super::support::write_if_changed(&linked, (names.join("\n") + "\n").as_bytes())?;
     println!(
         "{} objects of Vulkan drivers {} in {}",
         units.len(),

@@ -491,9 +491,6 @@ pub(super) fn build(toolchain: &Toolchain, jobs: u16, test: bool) -> Result<()> 
 
     let archive = build_directory("nvk").join("libstela-llvm.a");
     fs::create_dir_all(archive.parent().context("the archive's directory")?)?;
-    if archive.is_file() {
-        fs::remove_file(&archive)?;
-    }
     super::support::archive(
         &toolchain.archiver,
         &archive,
