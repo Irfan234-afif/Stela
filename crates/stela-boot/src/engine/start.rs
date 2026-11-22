@@ -1530,7 +1530,6 @@ fn open_gpus(
     let tsc_hz = handoff.tsc_hz;
     #[cfg(feature = "nvk")]
     let heap_bytes = heap.end - heap.start;
-    crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
         mmio.verified_framebuffer()
     } else {
@@ -2808,7 +2807,9 @@ fn start_platform(
         Err(error) => output::arguments(format_args!("NATIVE IRQ unavailable: {error:?}\n")),
     }
     takeover_part("clocks", &CLOCKS);
-    let clock = if options.boots_macos() {
+    // The GPU check starts the GPUs as a macOS boot does, and their Linux
+    // runs on this clock: without it no GPU is opened.
+    let clock = if options.boots_macos() || options.gpu_check {
         // SAFETY: this BSP owns the existing timer/IDT before any driver,
         // and the HPET only after its whole-controller handoff above.
         unsafe { service_clock(handoff, host_owner, native_mmio) }
@@ -3355,6 +3356,12 @@ fn start_devices(
             }
             // The GPU check starts them as a macOS boot does.
             let starts_gpus = options.boots_macos() || options.gpu_check;
+            // The step begins before anything that keeps the GPUs off, so
+            // the warning that ends it is shown and logged: one with no
+            // step running is dropped (`status::warn`).
+            if starts_gpus {
+                crate::status::begin("Starting the GPU");
+            }
             let work = kernel_work.inspect_err(|reason| {
                 if starts_gpus {
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
