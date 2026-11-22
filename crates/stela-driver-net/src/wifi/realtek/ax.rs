@@ -31,6 +31,7 @@
 pub mod attach;
 pub mod bootstrap;
 pub mod c2h;
+pub mod coex;
 pub mod dle;
 pub mod efuse;
 pub mod elements;

@@ -380,5 +380,27 @@ impl<'s> Channel<'s> {
     }
 }
 
+impl Channel<'_> {
+    /// A command of any category: `rtw89_h2c_pkt_set_hdr` with `function`
+    /// over `payload`, sent without FW_DL. [`Self::command`] is this for
+    /// `H2C_CAT_MAC`.
+    pub fn command_for<'p>(
+        &mut self,
+        function: Function,
+        rack: bool,
+        dack: bool,
+        payload: &'p [u8],
+    ) -> Packet<'p> {
+        Packet {
+            header: Some(
+                self.sequence
+                    .set_hdr(function, rack, dack, payload.len() as u32),
+            ),
+            payload,
+            fwdl: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

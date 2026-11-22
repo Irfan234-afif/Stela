@@ -1217,3 +1217,85 @@ pub const RR_LUTWA: u32 = 0x0033;
 pub const RR_LUTWA_M2: u32 = 0x001f;
 pub const RR_LUTWD0: u32 = 0x003f;
 pub const RR_LUTWD0_LB: u32 = 0x003f;
+/// The BT coexistence (BTC) registers rtw89's WL-only init reaches:
+/// `R_AX_GPIO_MUXCFG` with `B_AX_ENBT` and `B_AX_BTMODE_MASK`
+/// (`MAC_AX_BT_MODE_0_3`), the PTA's TX enable, priority masks and break
+/// table, the coex configuration and counter registers, and the LTE
+/// indirect access (`R_AX_LTE_CTRL`, its data registers, the ready bit
+/// `rtw89_mac_read_lte` polls in byte 3, and the LTE space's
+/// `R_AX_LTE_SW_CFG_1`, which holds the grants, and `R_AX_LTE_SW_CFG_2`).
+pub const GPIO_MUXCFG: u32 = 0x0040;
+pub const ENBT: u8 = 1 << 5;
+pub const BTMODE_MASK: u32 = 0x0000_00c0;
+pub const BT_MODE_0_3: u32 = 0;
+pub const LTE_SW_CFG_1: u32 = 0x0038;
+pub const LTE_SW_CFG_2: u32 = 0x003c;
+pub const WL_RX_CTRL: u32 = 1 << 8;
+pub const WL_PRI_MSK: u32 = 0xda10;
+pub const PTA_WL_PRI_MASK_BCNQ: u32 = 1 << 8;
+pub const BTC_FUNC_EN: u32 = 0xda20;
+pub const PTA_WL_TX_EN: u8 = 1 << 1;
+pub const BTC_BREAK_TABLE: u32 = 0xda2c;
+pub const BTC_BREAK_PARAM: u32 = 0xf0ff_ffff;
+pub const BTC_BT_COEX_MSK_TABLE: u32 = 0xda30;
+pub const BTC_PRI_MASK_TX_RESP_V1: u32 = 1 << 3;
+pub const BT_COEX_CFG_2: u32 = 0xda34;
+pub const GNT_BT_POLARITY: u32 = 1 << 8;
+pub const CSR_MODE: u32 = 0xda40;
+pub const STATIS_BT_EN: u32 = 1 << 2;
+pub const WL_ACT_MSK: u32 = 1 << 3;
+pub const BT_CNT_RST: u32 = 1 << 16;
+pub const TDMA_MODE: u32 = 0xda4c;
+pub const RTK_BT_ENABLE: u8 = 1 << 0;
+pub const BT_COEX_CFG_5: u32 = 0xda6c;
+pub const BT_RPT_SAMPLE_RATE_MASK: u32 = 0x0000_003f;
+pub const RTK_RATE: u32 = 5;
+pub const BTCCA_BRK_TXOP_EN: u32 = 1 << 9;
+pub const LTE_CTRL: u32 = 0xdaf0;
+pub const LTE_WDATA: u32 = 0xdaf4;
+pub const LTE_RDATA: u32 = 0xdaf8;
+pub const LTE_CTRL_READY: u8 = 1 << 5;
+pub const LTE_CTRL_WRITE: u32 = 0xc00f_0000;
+pub const LTE_CTRL_READ: u32 = 0x800f_0000;
+/// `R_AX_SYS_SDIO_CTRL`'s `B_AX_LTE_MUX_CTRL_PATH`: set, WLAN owns the PTA.
+pub const LTE_MUX_CTRL_PATH: u32 = 1 << 26;
+/// `R_AX_LTE_SW_CFG_1`'s software grants, per RF path: the BT and WL
+/// grants to the RF control and the BB, each a value and its software
+/// control bit.
+pub const GNT_BT_RFC_S0_SW_VAL: u32 = 1 << 15;
+pub const GNT_BT_RFC_S0_SW_CTRL: u32 = 1 << 14;
+pub const GNT_WL_RFC_S0_SW_VAL: u32 = 1 << 13;
+pub const GNT_WL_RFC_S0_SW_CTRL: u32 = 1 << 12;
+pub const GNT_BT_BB_S0_SW_VAL: u32 = 1 << 11;
+pub const GNT_BT_BB_S0_SW_CTRL: u32 = 1 << 10;
+pub const GNT_WL_BB_S0_SW_VAL: u32 = 1 << 9;
+pub const GNT_WL_BB_S0_SW_CTRL: u32 = 1 << 8;
+pub const GNT_BT_RFC_S1_SW_VAL: u32 = 1 << 31;
+pub const GNT_BT_RFC_S1_SW_CTRL: u32 = 1 << 30;
+pub const GNT_WL_RFC_S1_SW_VAL: u32 = 1 << 29;
+pub const GNT_WL_RFC_S1_SW_CTRL: u32 = 1 << 28;
+pub const GNT_BT_BB_S1_SW_VAL: u32 = 1 << 27;
+pub const GNT_BT_BB_S1_SW_CTRL: u32 = 1 << 26;
+pub const GNT_WL_BB_S1_SW_VAL: u32 = 1 << 25;
+pub const GNT_WL_BB_S1_SW_CTRL: u32 = 1 << 24;
+/// CMAC0's BT polluter table, `R_AX_BT_PLT`: which grants a TX or RX
+/// counts as polluted under, and its enable.
+pub const BT_PLT: u32 = 0xc67c;
+pub const TX_PLT_GNT_WL: u16 = 1 << 0;
+pub const TX_PLT_GNT_BT_TX: u16 = 1 << 1;
+pub const TX_PLT_GNT_BT_RX: u16 = 1 << 2;
+pub const TX_PLT_GNT_LTE_RX: u16 = 1 << 3;
+pub const RX_PLT_GNT_WL: u16 = 1 << 4;
+pub const RX_PLT_GNT_BT_TX: u16 = 1 << 5;
+pub const RX_PLT_GNT_BT_RX: u16 = 1 << 6;
+pub const RX_PLT_GNT_LTE_RX: u16 = 1 << 7;
+pub const PLT_EN: u16 = 1 << 8;
+/// `R_AX_SCOREBOARD`'s fields as `rtw89_mac_cfg_sb` writes them: the
+/// toggle, the firmware's byte with `B_MAC_AX_BTGS1_NOTIFY` and the major
+/// notices, and the driver's 24 bits.
+pub const SB_TOGGLE: u32 = 1 << 31;
+pub const SB_FW_MASK: u32 = 0x7f00_0000;
+pub const SB_DRV_MASK: u32 = 0x00ff_ffff;
+pub const SB_BTGS1_NOTIFY: u32 = 1 << 0;
+pub const SB_NOTIFY_TP_MAJOR: u32 = 0x81;
+pub const SB_NOTIFY_PWR_MAJOR: u32 = 0x80;
