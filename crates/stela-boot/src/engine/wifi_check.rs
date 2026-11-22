@@ -1,5 +1,6 @@
 //! The Wi-Fi check (`--wifi-check`), once the host's devices have started:
-//! a line for each stage every RTL8852B reached in the probe
+//! a line for each stage every RTL8852B reached in the probe, stage 1's
+//! cut, firmware and efuse and stage 2's radio with what its listen heard
 //! (`stela_boot_core::wifi_check`), then the verdict, and the boot stops
 //! before the guest's storage is opened. The options that select the check
 //! also restart the PC at the stop (`stop::restart_at_stop`), so the log is

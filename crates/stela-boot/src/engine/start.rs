@@ -3222,6 +3222,10 @@ fn start_devices(
             let owned_preboot = options.preboot.clone();
             let owned_usb = options.usb_storage.clone();
             let owned_wifi = wifi_network(handoff, options);
+            // The option parser refused a channel the driver does not tune.
+            let wifi_channel = options
+                .wifi_check_channel
+                .and_then(stela_boot_core::options::WifiCheckChannel::channel);
             let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
                 stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
@@ -3271,6 +3275,7 @@ fn start_devices(
                             fdr: fdr_partition,
                             usb_disks: &owned_usb,
                             wifi: owned_wifi.as_ref(),
+                            wifi_channel,
                             external,
                             boot_disk: boot_disk.as_deref(),
                             device_skips,

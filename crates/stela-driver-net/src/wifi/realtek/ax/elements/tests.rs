@@ -9,7 +9,13 @@ const VER: [u8; 4] = [1, 2, 3, 4];
 
 /// A `struct rtw89_fw_element_hdr` and its body; `size` stands in for the
 /// body's length when given.
-fn element(id: u32, fixed: [u8; 8], body: &[u8], aid: u16, size: Option<u32>) -> Vec<u8> {
+pub(crate) fn element(
+    id: u32,
+    fixed: [u8; 8],
+    body: &[u8],
+    aid: u16,
+    size: Option<u32>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(&size.unwrap_or(body.len() as u32).to_le_bytes());
@@ -21,11 +27,11 @@ fn element(id: u32, fixed: [u8; 8], body: &[u8], aid: u16, size: Option<u32>) ->
     out
 }
 
-fn plain(id: Id, body: &[u8]) -> Vec<u8> {
+pub(crate) fn plain(id: Id, body: &[u8]) -> Vec<u8> {
     element(id as u32, [0; 8], body, 0, None)
 }
 
-fn pattern(n: usize, seed: u8) -> Vec<u8> {
+pub(crate) fn pattern(n: usize, seed: u8) -> Vec<u8> {
     (0..n)
         .map(|i| {
             (i as u8)
@@ -36,7 +42,7 @@ fn pattern(n: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-fn regs(n: u32, seed: u32) -> Vec<u8> {
+pub(crate) fn regs(n: u32, seed: u32) -> Vec<u8> {
     (0..n)
         .flat_map(|i| {
             let mut pair = (0x4000 + 4 * i + seed * 0x100).to_le_bytes().to_vec();
@@ -46,7 +52,7 @@ fn regs(n: u32, seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn radio(id: Id, idx: u8, n: u32, seed: u32) -> Vec<u8> {
+pub(crate) fn radio(id: Id, idx: u8, n: u32, seed: u32) -> Vec<u8> {
     element(
         id as u32,
         [idx, 0, 0, 0, 0, 0, 0, 0],
@@ -61,7 +67,7 @@ fn txpwr_fixed(rfe: u8, ent_sz: u8, num: u32) -> [u8; 8] {
     [0, 0, rfe, ent_sz, n[0], n[1], n[2], n[3]]
 }
 
-fn txpwr(id: Id, rfe: u8, ent_sz: u8, num: u32, seed: u8) -> Vec<u8> {
+pub(crate) fn txpwr(id: Id, rfe: u8, ent_sz: u8, num: u32, seed: u8) -> Vec<u8> {
     let body = pattern(num as usize * usize::from(ent_sz), seed);
     element(id as u32, txpwr_fixed(rfe, ent_sz, num), &body, 0, None)
 }
@@ -71,7 +77,7 @@ fn trk_fixed(bitmap: u32) -> [u8; 8] {
     [b[0], b[1], b[2], b[3], 0, 0, 0, 0]
 }
 
-fn trk(bitmap: u32, rows: usize) -> Vec<u8> {
+pub(crate) fn trk(bitmap: u32, rows: usize) -> Vec<u8> {
     element(18, trk_fixed(bitmap), &pattern(rows * 30, 99), 0, None)
 }
 
@@ -103,7 +109,7 @@ fn container(pieces: &[Vec<u8>]) -> Vec<u8> {
 
 /// Every element of RTL8852B's `needed_fw_elms`, RFE type 0, in the
 /// order [`NEEDED_ORDER`] names.
-fn required() -> Vec<Vec<u8>> {
+pub(crate) fn required() -> Vec<Vec<u8>> {
     vec![
         plain(Id::BbReg, &regs(4, 1)),
         radio(Id::RadioA, 0, 3, 2),

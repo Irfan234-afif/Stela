@@ -30,12 +30,20 @@ fn run_on<'c>(
     domain: &Arc<Domain>,
     catalog: &'c Catalog,
 ) -> (Outcome, Kept<'c, &'c Model>) {
+    let clock = Clock {
+        ticks_per_microsecond: 1,
+    };
     let inputs = Inputs {
         firmware: catalog,
         pages: &Source,
-        clock: Clock {
-            ticks_per_microsecond: 1,
-        },
+        clock,
+    };
+    let plan = radio::Plan {
+        channel: radio::Plan::default_channel(),
+        alpha2: None,
+        country: None,
+        listen_us: radio::LISTEN_US,
+        clock,
     };
     let mut config = chip;
     // SAFETY: the model, its DMA domain and these pages belong to this test
@@ -48,6 +56,7 @@ fn run_on<'c>(
             observed(DEVICE, CUT),
             Found::Off,
             &inputs,
+            &plan,
         )
     }
 }
@@ -125,12 +134,24 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
     assert!(!chip.on());
     assert!(kept.rings.is_some() && kept.channel.is_some());
     let Outcome::Reached {
-        power_off, timings, ..
+        power_off,
+        timings,
+        radio,
+        ..
     } = &mut outcome
     else {
         panic!("{outcome:?}")
     };
     assert_eq!(*power_off, Ok(()));
+    // The synthetic container carries no elements: stage 2 stops before
+    // it powers the chip on again.
+    let stage2 = radio.as_mut().unwrap();
+    assert!(matches!(
+        stage2.stopped,
+        Some((radio::Stage::Tables, radio::Error::Elements(_)))
+    ));
+    assert_eq!(stage2.power_off, None);
+    stage2.timings = radio::Timings::default();
     // Every stage began in order on the clock.
     let begun: Vec<u64> = timings.begun.iter().map(|at| at.unwrap()).collect();
     assert!(begun.windows(2).all(|pair| pair[0] <= pair[1]));
@@ -144,9 +165,18 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
              first attempt, FREERTOS_DONE 12 ms after the download began; secure boot off",
             "efuse: MAC 02:00:00:..:..:01 (unicast), RFE 1, crystal cap 0x3c, autoloaded; the firmware's \
              phycap: 2 TX and 2 RX streams, over the register mailbox (1 H2C, 1 C2H)",
-            "powered off after stage 1, so the next system finds it cold; no station driver here yet",
+            "powered off after stage 1, as rtw89's probe ends",
+            "stage 2 for channel 36 (80 MHz) stopped at tables: firmware elements 0x00076f34 are \
+             unrecognized: BB_REG RADIO_A RADIO_B RF_NCTL TXPWR_BYRATE TXPWR_LMT_2GHZ \
+             TXPWR_LMT_5GHZ TXPWR_LMT_RU_2GHZ TXPWR_LMT_RU_5GHZ TX_SHAPE_LMT TX_SHAPE_LMT_RU \
+             TXPWR_TRK",
+            "stage 2 RX before listening: buffers=0 wifi=0 mgmt=0 ctrl=0 data=0 ext=0 runt=0 \
+             beacons=0 probe_resp=0 matched_ppdu=0 crc32_err=0 icv_err=0 c2h=0 ppdu=0 \
+             ppdu_valid=0 other=0 segmented=0 truncated=0",
+            "stage 2 never powered it on",
         ]
     );
+    let summary_radio = outcome.summary().radio;
     assert_eq!(
         outcome.summary(),
         Summary {
@@ -169,9 +199,22 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
                 mailbox: (1, 1),
             }),
             stopped: None,
+            radio: summary_radio.clone(),
         }
     );
-    assert_eq!(outcome.no_station(), None);
+    let radio = summary_radio.unwrap();
+    assert_eq!((radio.primary, radio.center, radio.width), (36, 42, 80));
+    assert_eq!(radio.heard, None);
+    assert_eq!(radio.stopped.unwrap().0, radio::Stage::Tables);
+    assert!(
+        outcome
+            .no_station()
+            .unwrap()
+            .0
+            .starts_with("RTL8852B stage 2 stopped at tables: firmware elements"),
+        "{:?}",
+        outcome.no_station()
+    );
 }
 
 #[test]
@@ -345,5 +388,70 @@ fn a_stage_lasts_until_the_next_one_begins_or_stage_1_ends() {
     assert_eq!(
         Masked(&[0x00, 0xe0, 0x4c, 0x12, 0x34, 0x56]).to_string(),
         "00:e0:4c:..:..:56"
+    );
+}
+
+#[test]
+fn a_listen_that_heard_the_ap_is_logged_with_the_plans_headline_and_each_bssid() {
+    let mut heard = Heard {
+        listened_us: Some(2_000_431),
+        ..Heard::default()
+    };
+    let counts = &mut heard.counts;
+    (counts.buffers, counts.wifi, counts.mgmt, counts.beacons) = (7, 3, 3, 3);
+    (counts.matched, counts.ppdu, counts.ppdu_valid, counts.c2h) = (3, 3, 3, 1);
+    heard.bss.push(Bss {
+        bssid: [0x90, 0xd2, 0x0b, 0xdf, 0xbd, 0xed],
+        ssid: b"DARAYA".to_vec(),
+        beacons: 3,
+        best: Some(-41),
+        a1: 3,
+        header_best: Some(-43),
+        channel: Some(36),
+        freq: 5180,
+    });
+    let report = radio::Report {
+        heard: Some(heard),
+        registers: vec![
+            radio::Read {
+                name: "RX_FLTR_OPT",
+                space: radio::Space::Mac,
+                address: RX_FLTR_OPT,
+                value: Ok(0x0300_4408),
+            },
+            radio::Read {
+                name: "RF A 0x18",
+                space: radio::Space::Rf(0),
+                address: 0x18,
+                value: Ok(0x1012a),
+            },
+        ],
+        ..radio::Report::default()
+    };
+    let outcome = radio::Outcome {
+        channel: radio::Plan::default_channel(),
+        report: Box::new(report),
+        stopped: None,
+        timings: radio::Timings::default(),
+        power_off: Some(Ok(())),
+    };
+    assert_eq!(
+        radio_lines(&outcome),
+        [
+            "rtw89: RTL8852B tuned to channel 36 (80 MHz), heard 3 beacons in 2 s, strongest -41 \
+             dBm from 90:d2:0b:..:..:ed; no station yet",
+            "stage 2 RX before listening: buffers=0 wifi=0 mgmt=0 ctrl=0 data=0 ext=0 runt=0 \
+             beacons=0 probe_resp=0 matched_ppdu=0 crc32_err=0 icv_err=0 c2h=0 ppdu=0 \
+             ppdu_valid=0 other=0 segmented=0 truncated=0",
+            "stage 2 RX while listening: buffers=7 wifi=3 mgmt=3 ctrl=0 data=0 ext=0 runt=0 \
+             beacons=3 probe_resp=0 matched_ppdu=3 crc32_err=0 icv_err=0 c2h=1 ppdu=3 \
+             ppdu_valid=3 other=0 segmented=0 truncated=0",
+            "stage 2 heard 90:d2:0b:..:..:ed ssid \"DARAYA\": 3 beacons, best -41 dBm (3 with an \
+             A1-matched PPDU status; the PHY status header alone -43 dBm), elements name channel \
+             36, received at 5180 MHz",
+            "stage 2 registers: RX_FLTR_OPT=0x3004408 RF A 0x18=0x1012a",
+            "powered off after stage 2, so the next system finds it cold; no station driver here \
+             yet",
+        ]
     );
 }

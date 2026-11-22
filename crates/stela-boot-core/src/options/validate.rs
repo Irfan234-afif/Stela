@@ -50,6 +50,9 @@ fn wifi(options: &System) -> Result<(), Error> {
     {
         return Err(Error::Constraint(Constraint::WifiDependency));
     }
+    if options.wifi_check_channel.is_some() && !options.wifi_check {
+        return Err(Error::Constraint(Constraint::WifiCheckChannelDependency));
+    }
     Ok(())
 }
 

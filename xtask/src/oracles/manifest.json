@@ -2597,6 +2597,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "rxdesc_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rxdesc/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_TRX_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 AX RX descriptor and PPDU status C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",

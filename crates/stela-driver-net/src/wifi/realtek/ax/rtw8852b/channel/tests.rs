@@ -895,3 +895,76 @@ fn the_band_notice_is_owed_on_the_first_switch_and_each_band_change() {
         .count();
     assert_eq!(marks, 5);
 }
+
+#[test]
+fn a_primary_and_width_name_the_plans_block_and_convert_for_rfk_and_tx_power() {
+    // 36/80 is the user's AP's channel: center 42, as rfk and TX power read it.
+    let ap = Channel::for_primary(36, Width::Mhz80).unwrap();
+    assert_eq!((ap.center(), ap.primary(), ap.width_mhz()), (42, 36, 80));
+    assert_eq!(ap.primary_freq(), 5180);
+    assert_eq!(
+        ap.rfk(),
+        rfk::Channel {
+            band: rfk::Band::Ghz5,
+            width: rfk::Bandwidth::Mhz80,
+            number: 42,
+        }
+    );
+    assert_eq!(
+        ap.txpower(),
+        txpower::Chan {
+            band: txpower::Band::Ghz5,
+            channel: 42,
+            primary: 36,
+            width: txpower::Width::Mhz80,
+        }
+    );
+    // Each primary of the block names the same center.
+    for primary in [36, 40, 44, 48] {
+        assert_eq!(
+            Channel::for_primary(primary, Width::Mhz80)
+                .unwrap()
+                .center(),
+            42
+        );
+    }
+    assert_eq!(
+        Channel::for_primary(149, Width::Mhz40).unwrap().center(),
+        151
+    );
+    assert_eq!(
+        Channel::for_primary(153, Width::Mhz40).unwrap().center(),
+        151
+    );
+    // At 2.4 GHz HT40+ where it fits, else HT40-.
+    let low = Channel::for_primary(1, Width::Mhz40).unwrap();
+    assert_eq!((low.center(), low.primary_freq()), (3, 2412));
+    assert_eq!(
+        low.rfk(),
+        rfk::Channel {
+            band: rfk::Band::Ghz2,
+            width: rfk::Bandwidth::Mhz40,
+            number: 3,
+        }
+    );
+    assert_eq!(Channel::for_primary(11, Width::Mhz40).unwrap().center(), 9);
+    let six = Channel::for_primary(6, Width::Mhz20).unwrap();
+    assert_eq!(
+        six.txpower(),
+        txpower::Chan {
+            band: txpower::Band::Ghz2,
+            channel: 6,
+            primary: 6,
+            width: txpower::Width::Mhz20,
+        }
+    );
+    // UNII-4's block holds 165.
+    assert_eq!(
+        Channel::for_primary(165, Width::Mhz80).unwrap().center(),
+        171
+    );
+    // No block holds them.
+    assert!(Channel::for_primary(6, Width::Mhz80).is_err());
+    assert!(Channel::for_primary(14, Width::Mhz40).is_err());
+    assert!(Channel::for_primary(37, Width::Mhz20).is_err());
+}

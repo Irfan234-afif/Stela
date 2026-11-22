@@ -46,6 +46,7 @@ pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
+pub const WIFI_CHECK_CHANNEL: &str = "--wifi-check-channel";
 pub const USB4_APPROVE: &str = "--usb4-approve";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
@@ -316,6 +317,9 @@ pub struct System {
     /// storage is opened, restarting the PC as `--restart-at-stop` does
     /// (`--wifi-check`).
     pub wifi_check: bool,
+    /// The channel the Wi-Fi check listens on, channel 36 at 80 MHz without
+    /// it (`--wifi-check-channel PRIMARY[/WIDTH]`).
+    pub wifi_check_channel: Option<WifiCheckChannel>,
     /// Check exclusively owned conventional HDA after ExitBootServices.
     pub audio_check: Option<AudioCheck>,
     /// Explicit whole-controller handoff for the audio check's physical clock.
@@ -421,6 +425,7 @@ impl Default for System {
             gpu_check: false,
             restart_at_stop: false,
             wifi_check: false,
+            wifi_check_channel: None,
             audio_check: None,
             audio_own_hpet: false,
             native_pci_own_ioapic: false,
@@ -487,6 +492,51 @@ impl StaticIpv4 {
 impl fmt::Display for StaticIpv4 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.address, self.prefix)
+    }
+}
+
+/// A `--wifi-check-channel` word: a primary 20 MHz channel and a width of
+/// 20, 40 or 80 MHz, as `36/80` or `6` (20 MHz), that an RTL8852B tunes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiCheckChannel {
+    pub primary: u8,
+    /// In MHz.
+    pub width: u8,
+}
+
+impl WifiCheckChannel {
+    /// `PRIMARY[/WIDTH]`, a channel [`Self::channel`] gives.
+    pub fn parse(word: &str) -> Option<Self> {
+        let (primary, width) = match word.split_once('/') {
+            Some((primary, width)) => (primary, width.parse().ok()?),
+            None => (word, 20),
+        };
+        let parsed = Self {
+            primary: primary.parse().ok()?,
+            width,
+        };
+        parsed.channel().map(|_| parsed)
+    }
+
+    /// The channel the driver tunes: at 5 GHz the 802.11 plan's 40 or 80 MHz
+    /// block that holds the primary, at 2.4 GHz HT40+ where it fits.
+    pub fn channel(
+        self,
+    ) -> Option<stela_drivers::net::wifi::realtek::ax::rtw8852b::channel::Channel> {
+        use stela_drivers::net::wifi::realtek::ax::rtw8852b::channel::{Channel, Width};
+        let width = match self.width {
+            20 => Width::Mhz20,
+            40 => Width::Mhz40,
+            80 => Width::Mhz80,
+            _ => return None,
+        };
+        Channel::for_primary(self.primary, width).ok()
+    }
+}
+
+impl fmt::Display for WifiCheckChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.primary, self.width)
     }
 }
 
@@ -884,6 +934,7 @@ impl fmt::Display for System {
         line.flag("--gpu-check", self.gpu_check)?;
         line.flag("--restart-at-stop", self.restart_at_stop)?;
         line.flag("--wifi-check", self.wifi_check)?;
+        line.value(WIFI_CHECK_CHANNEL, self.wifi_check_channel)?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
         line.flag("--native-pci-own-ioapic", self.native_pci_own_ioapic)?;

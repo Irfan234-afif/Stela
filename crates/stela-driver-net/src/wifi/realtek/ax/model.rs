@@ -32,16 +32,24 @@
 //! FREERTOS_DONE (`RTW89_FWDL_WCPU_FW_INIT_RDY`) unless the script says
 //! otherwise.
 //!
+//! For stage 2 ([`super::radio`]) it also answers the radio's accesses as
+//! a chip whose radio idles: the ring index clears of the PCIe pre-init
+//! reset CH12's and RXQ's indices, SWSI reads complete at once (the RF data
+//! being what the SWSI register holds), the LTE indirect access is always
+//! ready and keeps its own registers, and packets queued with
+//! [`Chip::queue_rx`] are written into RXQ's next buffers, as the chip's DMA
+//! would, before the host next reads RXQ's index.
+//!
 //! It checks nothing the firmware would check (no checksum, no cut) and
-//! sends no C2H on RXQ: stage 1 asks for none. Delays take no time.
+//! sends no C2H on RXQ by itself. Delays take no time.
 use super::{
     efuse::tests::{Case, Model as Efuse},
     fwdl::{FW_HDR_W7_PART_SIZE, FWDL_WCPU_FW_INIT_RDY},
     h2c::{H2C_DESC_SIZE, HEADER_LEN},
     h2creg::C2H_REGS,
-    io::{self, Io, prep},
+    io::{self, CR_BASE, Io, prep},
     pci::{
-        ring::{TXBD_NUM_MAX, TxBd},
+        ring::{RXBD_NUM_MAX, RxBd, RxBdInfo, TXBD_NUM_MAX, TxBd},
         tests::{Access, Domain, Model as Bus},
     },
     registers::*,
@@ -65,6 +73,9 @@ const EFUSE_REGISTERS: [(u32, u32); 8] = [
 
 /// The registers given behavior here, each reached 32 bits at a time.
 const WIDE: [u32; 4] = [SYS_PW_CTRL, IC_PWR_STATE, WDE_INI_STATUS, PLE_INI_STATUS];
+/// The LTE access's ready byte and SWSI's status, as MAC addresses.
+const LTE_CTRL_BYTE3: u32 = LTE_CTRL + 3;
+const SWSI: u32 = CR_BASE + SWSI_V1;
 
 fn overlaps(register: u32, width: u32, at: u32, bytes: u32) -> bool {
     register < at + bytes && at < register + width
@@ -83,6 +94,12 @@ struct State {
     expected: Option<usize>,
     /// The next CH12 BD the chip reads.
     host: u32,
+    /// The next RXQ BD the chip fills, and the packets waiting for one.
+    rx_hw: u32,
+    rx_queue: Vec<Vec<u8>>,
+    rx_tag: u16,
+    /// The LTE indirect access's registers, by word.
+    lte: [u32; 64],
 }
 
 pub(crate) struct Chip {
@@ -113,6 +130,10 @@ impl Chip {
                 attempts: Vec::new(),
                 expected: None,
                 host: 0,
+                rx_hw: 0,
+                rx_queue: Vec::new(),
+                rx_tag: 0,
+                lte: [0; 64],
             }),
             domain,
         }
@@ -149,6 +170,46 @@ impl Chip {
     /// Every attempt's frames, oldest first.
     pub(crate) fn attempts(&self) -> Vec<Vec<Vec<u8>>> {
         self.state.borrow().attempts.clone()
+    }
+
+    /// Packets for RXQ, each what follows the `rxbd_info` dword (the RX
+    /// descriptor, driver info and packet), written into the next buffers
+    /// before the host next reads RXQ's index.
+    pub(crate) fn queue_rx(&self, packets: impl IntoIterator<Item = Vec<u8>>) {
+        self.state.borrow_mut().rx_queue.extend(packets);
+    }
+
+    /// The packets still queued for RXQ.
+    pub(crate) fn rx_queued(&self) -> usize {
+        self.state.borrow().rx_queue.len()
+    }
+
+    /// Write the queued packets into RXQ's buffers from the next BD on, as
+    /// the chip's DMA would, and move RXQ's hardware index past them.
+    fn deliver_rx(&self) {
+        let state = &mut *self.state.borrow_mut();
+        let base = u64::from(self.bus.get(RXQ_RXBD_DESA_L, 4))
+            | u64::from(self.bus.get(RXQ_RXBD_DESA_H, 4)) << 32;
+        if base == 0 || state.rx_queue.is_empty() {
+            return;
+        }
+        for packet in state.rx_queue.drain(..) {
+            let at = base + u64::from(state.rx_hw) * RxBd::SIZE as u64;
+            let bytes = self.domain.device_read(at, RxBd::SIZE);
+            let bd = RxBd::decode(bytes.as_slice().try_into().unwrap());
+            let info = RxBdInfo {
+                fs: true,
+                ls: true,
+                len: (4 + packet.len()) as u16,
+                tag: state.rx_tag,
+            };
+            let mut buffer = info.encode().to_le_bytes().to_vec();
+            buffer.extend_from_slice(&packet);
+            self.domain.device_write(bd.dma.into(), &buffer);
+            state.rx_tag = state.rx_tag.wrapping_add(1) & 0x1fff;
+            state.rx_hw = (state.rx_hw + 1) % RXBD_NUM_MAX;
+        }
+        self.bus.set(RXQ_RXBD_IDX + 2, 2, state.rx_hw);
     }
 
     fn efuse_register(register: u32, width: u32) -> bool {
@@ -198,6 +259,8 @@ impl Chip {
                     | prep(u32::from(state.on) * MAC_AX_MAC_ON, WLMAC_PWR_STE_MASK),
             ),
             (WDE_INI_STATUS, _) => Some(stored | WDE_MGN_INI_RDY),
+            (LTE_CTRL_BYTE3, 1) => Some(stored | u32::from(LTE_CTRL_READY)),
+            (SWSI, 4) => Some((stored & !(SWSI_W_BUSY_V1 | SWSI_R_BUSY_V1)) | SWSI_R_DATA_DONE_V1),
             (PLE_INI_STATUS, _) => Some(stored | PLE_MGN_INI_RDY),
             (SS_CTRL, 4) => Some(stored | SS_INIT_DONE_1),
             (PUB_PAGE_INFO1, 4) => Some(stored & !(G0_USE_PG_MASK | G1_USE_PG_MASK)),
@@ -224,6 +287,9 @@ impl Chip {
 
     fn read(&self, register: u32, width: u32) -> u32 {
         Self::check(register, width);
+        if (register, width) == (RXQ_RXBD_IDX, 4) {
+            self.deliver_rx();
+        }
         if let Some(value) = self.answer(register, width) {
             self.bus.set(register, width, value);
         }
@@ -260,6 +326,25 @@ impl Chip {
             _ => {}
         }
         let state = &mut *self.state.borrow_mut();
+        match (register, width) {
+            (TXBD_RWPTR_CLR1, 4) if value & CLR_CH12_IDX != 0 => {
+                state.host = 0;
+                self.bus.set(CH12_TXBD_IDX + 2, 2, 0);
+            }
+            (RXBD_RWPTR_CLR, 4) if value & CLR_RXQ_IDX != 0 => {
+                state.rx_hw = 0;
+                self.bus.set(RXQ_RXBD_IDX + 2, 2, 0);
+            }
+            (LTE_CTRL, 4) => {
+                let word = ((value & 0xffff) as usize / 4) % state.lte.len();
+                match value & 0xffff_0000 {
+                    LTE_CTRL_WRITE => state.lte[word] = self.bus.get(LTE_WDATA, 4),
+                    LTE_CTRL_READ => self.bus.set(LTE_RDATA, 4, state.lte[word]),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
         if register == SYS_PW_CTRL {
             let mut stored = value;
             if value & APFN_ONMAC != 0 {

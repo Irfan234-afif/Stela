@@ -8,7 +8,14 @@
 //! stages its driver reaches; [`DRIVEN`] is the last of them. This image's
 //! driver runs stage 1 (`ax::attach`): it powers the chip on, downloads its
 //! firmware until it reports FREERTOS_DONE, reads its efuse, and powers it
-//! off again.
+//! off again; then stage 2 (`ax::radio`): it powers the chip on again as
+//! rtw89's interface start does, tunes one channel, listens for beacons,
+//! and powers it off.
+//!
+//! The radio stage passes once the listen heard a beacon; one that heard
+//! none fails the check, with every line it would print otherwise: what RXQ
+//! held by kind, each BSSID heard, so a silent radio can be told from a
+//! deaf one.
 //!
 //! A cut of 0 (CAV) fails the check: linux-firmware's RTL8852B container
 //! holds images for cuts 1 and 2, and rtw89 takes the newest image whose cut
@@ -23,7 +30,10 @@
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 use stela_contracts::masked::Mac;
-use stela_drivers::net::wifi::realtek::ax::attach::Summary;
+use stela_drivers::net::wifi::realtek::ax::{
+    attach::{RadioRan, Ssid, Summary},
+    listen::Counts,
+};
 
 /// A stage of the Wi-Fi check, in the order a driver reaches them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -34,6 +44,7 @@ pub enum Stage {
     Firmware,
     /// The efuse and the firmware's phycap read.
     Efuse,
+    /// Stage 2 tuned a channel and heard a beacon on it.
     Radio,
     Station,
     Lease,
@@ -53,7 +64,7 @@ impl Stage {
 }
 
 /// The last stage this image's driver reaches.
-pub const DRIVEN: Stage = Stage::Efuse;
+pub const DRIVEN: Stage = Stage::Radio;
 
 /// What the boot learned of one RTL8852B function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +106,7 @@ pub fn report<'a, L: fmt::Display>(
     let mut unread = 0usize;
     let mut cav = 0usize;
     let mut stopped = 0usize;
+    let mut silent = Vec::new();
     for (location, reached) in functions {
         found += 1;
         match reached {
@@ -121,8 +133,16 @@ pub fn report<'a, L: fmt::Display>(
                     line.push_str(": linux-firmware has no RTL8852B image for this cut");
                 }
                 lines.push(line);
-                if !stage_1(&location, stage1, &mut lines) {
-                    stopped += 1;
+                let efuse = stage_1(&location, stage1, &mut lines);
+                match stage1 {
+                    Some(summary) if efuse => {
+                        match radio(&location, summary.radio.as_ref(), &mut lines) {
+                            Heard::Beacons => {}
+                            Heard::Stopped => stopped += 1,
+                            Heard::Nothing(tuned) => silent.push(tuned),
+                        }
+                    }
+                    _ => stopped += 1,
                 }
             }
         }
@@ -145,9 +165,14 @@ pub fn report<'a, L: fmt::Display>(
             "{stopped} of {found} RTL8852B did not reach {}, the last stage this image drives",
             DRIVEN.name()
         ))
+    } else if let Some(tuned) = silent.first() {
+        Verdict::Failed(format!(
+            "{} of {found} RTL8852B heard no beacon on {tuned}",
+            silent.len()
+        ))
     } else {
         lines.push(format!(
-            "WIFI CHECK passed: every RTL8852B reached {}, the last stage this image drives",
+            "WIFI CHECK reached {}, the last stage this image drives; restarting",
             DRIVEN.name()
         ));
         Verdict::Passed
@@ -155,8 +180,112 @@ pub fn report<'a, L: fmt::Display>(
     Report { lines, verdict }
 }
 
+/// What stage 2 gave one function.
+enum Heard {
+    /// The listen heard a beacon.
+    Beacons,
+    /// Stage 2 did not run or stopped before the listen ended.
+    Stopped,
+    /// The listen ran and heard no beacon on this channel.
+    Nothing(String),
+}
+
+/// The radio stage's lines: the plan's `stage=radio` line once the listen
+/// ran, each BSSID heard, what RXQ held by kind, or where stage 2 stopped.
+fn radio(location: &dyn fmt::Display, radio: Option<&RadioRan>, lines: &mut Vec<String>) -> Heard {
+    let Some(radio) = radio else {
+        lines.push(format!(
+            "WIFI CHECK {location} stopped before stage={}: stage 2 did not run",
+            Stage::Radio.name()
+        ));
+        return Heard::Stopped;
+    };
+    let tuned = format!("channel {} ({} MHz)", radio.primary, radio.width);
+    lines.push(format!(
+        "WIFI CHECK {location} rx before listening {}",
+        counts(&radio.before.counts)
+    ));
+    let heard = match (&radio.stopped, &radio.heard) {
+        (None, Some(heard)) => heard,
+        (Some((stage, why)), _) => {
+            lines.push(format!(
+                "WIFI CHECK {location} stopped before stage={}: {stage}: {why}",
+                Stage::Radio.name()
+            ));
+            return Heard::Stopped;
+        }
+        (None, None) => {
+            lines.push(format!(
+                "WIFI CHECK {location} stopped before stage={}: stage 2 said nothing more",
+                Stage::Radio.name()
+            ));
+            return Heard::Stopped;
+        }
+    };
+    let dbm =
+        |signal: Option<i8>| signal.map_or(String::from("none"), |signal| format!("{signal}"));
+    let strongest = match heard.strongest() {
+        Some(bss) => format!("strongest={} rssi={}", Mac(&bss.bssid), dbm(bss.best)),
+        None => String::from("strongest=none"),
+    };
+    lines.push(format!(
+        "WIFI CHECK {location} stage={} channel={} width={} beacons={} {strongest}",
+        Stage::Radio.name(),
+        radio.primary,
+        radio.width,
+        heard.beacons()
+    ));
+    for bss in &heard.bss {
+        lines.push(format!(
+            "WIFI CHECK {location} bss={} ssid=\"{}\" beacons={} rssi={} a1={} hdr_rssi={} ch={} \
+             freq={}",
+            Mac(&bss.bssid),
+            Ssid(&bss.ssid),
+            bss.beacons,
+            dbm(bss.best),
+            bss.a1,
+            dbm(bss.header_best),
+            bss.channel
+                .map_or(String::from("none"), |channel| format!("{channel}")),
+            bss.freq
+        ));
+    }
+    lines.push(format!(
+        "WIFI CHECK {location} rx while listening {}",
+        counts(&heard.counts)
+    ));
+    if heard.beacons() == 0 {
+        Heard::Nothing(tuned)
+    } else {
+        Heard::Beacons
+    }
+}
+
+/// What RXQ held, by kind.
+fn counts(counts: &Counts) -> String {
+    format!(
+        "buffers={} wifi={} mgmt={} ctrl={} data={} beacons={} probe_resp={} matched_ppdu={} \
+         crc32_err={} icv_err={} c2h={} ppdu={} ppdu_valid={} other={} dropped={}",
+        counts.buffers,
+        counts.wifi,
+        counts.mgmt,
+        counts.ctrl,
+        counts.data,
+        counts.beacons,
+        counts.probe_resps,
+        counts.matched,
+        counts.crc32_err,
+        counts.icv_err,
+        counts.c2h,
+        counts.ppdu,
+        counts.ppdu_valid,
+        counts.other,
+        counts.segmented + counts.truncated + counts.runt
+    )
+}
+
 /// The lines of stage 1's firmware and efuse stages, and of where it
-/// stopped: whether it reached [`DRIVEN`].
+/// stopped: whether it reached the efuse.
 fn stage_1(location: &dyn fmt::Display, stage1: Option<&Summary>, lines: &mut Vec<String>) -> bool {
     let Some(summary) = stage1 else {
         lines.push(format!(
@@ -232,6 +361,8 @@ mod tests {
     use stela_drivers::net::wifi::realtek::ax::{
         attach::{EfuseRead, FirmwareRan},
         bootstrap::Stage as Step,
+        listen::{Bss, Heard as Listened},
+        radio::Stage as Step2,
     };
 
     const AT: &str = "0000:03:00.0";
@@ -260,11 +391,59 @@ mod tests {
         }
     }
 
+    /// The user's AP: DARAYA on channel 36, its BSSID 90:d2:0b:df:bd:ed.
+    fn daraya(beacons: u32) -> Bss {
+        Bss {
+            bssid: [0x90, 0xd2, 0x0b, 0xdf, 0xbd, 0xed],
+            ssid: b"DARAYA".to_vec(),
+            beacons,
+            best: Some(-48),
+            a1: beacons,
+            header_best: Some(-50),
+            channel: Some(36),
+            freq: 5180,
+        }
+    }
+
+    fn listened(bss: Vec<Bss>) -> Listened {
+        let mut heard = Listened {
+            listened_us: Some(2_000_100),
+            ..Listened::default()
+        };
+        heard.counts.buffers = 40;
+        heard.counts.wifi = 30;
+        heard.counts.mgmt = 20;
+        heard.counts.data = 10;
+        heard.counts.beacons = bss.iter().map(|bss| bss.beacons).sum();
+        heard.counts.ppdu = 10;
+        heard.counts.ppdu_valid = 9;
+        heard.counts.matched = 18;
+        heard.bss = bss;
+        heard
+    }
+
+    fn radio(heard: Option<Listened>, stopped: Option<(Step2, String)>) -> RadioRan {
+        let mut before = Listened::default();
+        before.counts.buffers = 3;
+        before.counts.c2h = 3;
+        RadioRan {
+            primary: 36,
+            center: 42,
+            width: 80,
+            heard,
+            before,
+            stopped,
+            warnings: Vec::new(),
+            power_off: Some(Ok(())),
+        }
+    }
+
     fn reached() -> Summary {
         Summary {
             firmware: Some(firmware()),
             efuse: Some(efuse()),
             stopped: None,
+            radio: Some(radio(Some(listened(vec![daraya(17)])), None)),
         }
     }
 
@@ -293,11 +472,11 @@ mod tests {
             names,
             ["cut", "firmware", "efuse", "radio", "station", "lease"]
         );
-        assert_eq!(DRIVEN, Stage::Efuse);
+        assert_eq!(DRIVEN, Stage::Radio);
     }
 
     #[test]
-    fn a_chip_that_reached_the_efuse_passes_with_each_stage_in_its_words() {
+    fn a_chip_that_heard_a_beacon_passes_with_each_stage_in_its_words() {
         let summary = reached();
         let report = report([(AT, cut(1, Some(&summary)))]);
         assert_eq!(report.verdict, Verdict::Passed);
@@ -309,9 +488,91 @@ mod tests {
                  freertos_done=48 ms packets=165 retries=0 secure_boot=off",
                 "WIFI CHECK 0000:03:00.0 stage=efuse mac=00:e0:4c:..:..:56 unicast rfe=1 xtal=0x3c \
                  acv=2 autoload=yes mailbox=1/1",
-                "WIFI CHECK passed: every RTL8852B reached efuse, the last stage this image drives",
+                "WIFI CHECK 0000:03:00.0 rx before listening buffers=3 wifi=0 mgmt=0 ctrl=0 data=0 \
+                 beacons=0 probe_resp=0 matched_ppdu=0 crc32_err=0 icv_err=0 c2h=3 ppdu=0 \
+                 ppdu_valid=0 other=0 dropped=0",
+                "WIFI CHECK 0000:03:00.0 stage=radio channel=36 width=80 beacons=17 \
+                 strongest=90:d2:0b:..:..:ed rssi=-48",
+                "WIFI CHECK 0000:03:00.0 bss=90:d2:0b:..:..:ed ssid=\"DARAYA\" beacons=17 rssi=-48 \
+                 a1=17 hdr_rssi=-50 ch=36 freq=5180",
+                "WIFI CHECK 0000:03:00.0 rx while listening buffers=40 wifi=30 mgmt=20 ctrl=0 \
+                 data=10 beacons=17 probe_resp=0 matched_ppdu=18 crc32_err=0 icv_err=0 c2h=0 \
+                 ppdu=10 ppdu_valid=9 other=0 dropped=0",
+                "WIFI CHECK reached radio, the last stage this image drives; restarting",
             ]
         );
+    }
+
+    #[test]
+    fn a_silent_radio_fails_with_every_line_and_a_stopped_one_names_its_stage() {
+        // The listen ran and heard frames, but no beacon.
+        let silent = Summary {
+            radio: Some(radio(Some(listened(Vec::new())), None)),
+            ..reached()
+        };
+        let checked = report([(AT, cut(1, Some(&silent)))]);
+        assert_eq!(
+            checked.verdict,
+            Verdict::Failed(String::from(
+                "1 of 1 RTL8852B heard no beacon on channel 36 (80 MHz)"
+            ))
+        );
+        assert!(
+            checked.lines[4].ends_with("beacons=0 strongest=none"),
+            "{}",
+            checked.lines[4]
+        );
+        assert!(
+            checked.lines[5].starts_with("WIFI CHECK 0000:03:00.0 rx while listening buffers=40")
+        );
+        assert_eq!(checked.lines.len(), 6);
+
+        // Beacons without a matched PPDU status have no signal.
+        let mut quiet = daraya(2);
+        quiet.best = None;
+        let unsignalled = Summary {
+            radio: Some(radio(Some(listened(vec![quiet])), None)),
+            ..reached()
+        };
+        let checked = report([(AT, cut(1, Some(&unsignalled)))]);
+        assert_eq!(checked.verdict, Verdict::Passed);
+        assert!(checked.lines[4].ends_with("beacons=2 strongest=90:d2:0b:..:..:ed rssi=none"));
+
+        // Stage 2 stopped at the channel.
+        let stopped = Summary {
+            radio: Some(radio(
+                None,
+                Some((
+                    Step2::Channel,
+                    String::from("Timeout { register: 0x1174c, mask: 0x4000000 }"),
+                )),
+            )),
+            ..reached()
+        };
+        let checked = report([(AT, cut(1, Some(&stopped)))]);
+        assert_eq!(
+            checked.lines[4],
+            "WIFI CHECK 0000:03:00.0 stopped before stage=radio: channel: Timeout { register: \
+             0x1174c, mask: 0x4000000 }"
+        );
+        assert_eq!(
+            checked.verdict,
+            Verdict::Failed(String::from(
+                "1 of 1 RTL8852B did not reach radio, the last stage this image drives"
+            ))
+        );
+
+        // Stage 2 that never ran.
+        let unrun = Summary {
+            radio: None,
+            ..reached()
+        };
+        let checked = report([(AT, cut(1, Some(&unrun)))]);
+        assert_eq!(
+            checked.lines[3],
+            "WIFI CHECK 0000:03:00.0 stopped before stage=radio: stage 2 did not run"
+        );
+        assert!(matches!(checked.verdict, Verdict::Failed(_)));
     }
 
     #[test]
@@ -324,6 +585,7 @@ mod tests {
                 Step::Download,
                 String::from("every one of the 5 attempts failed: ChecksumFail x5"),
             )),
+            radio: None,
         };
         let failed = report([(AT, cut(1, Some(&download)))]);
         assert_eq!(
@@ -335,7 +597,7 @@ mod tests {
         assert_eq!(
             failed.verdict,
             Verdict::Failed(String::from(
-                "1 of 1 RTL8852B did not reach efuse, the last stage this image drives"
+                "1 of 1 RTL8852B did not reach radio, the last stage this image drives"
             ))
         );
 
@@ -344,6 +606,7 @@ mod tests {
             firmware: Some(firmware()),
             efuse: None,
             stopped: Some((Step::Efuse, String::from("Efuse(Io(Timeout { .. }))"))),
+            radio: None,
         };
         let passed = reached();
         let mixed = report([
@@ -371,6 +634,7 @@ mod tests {
         let refused = Summary {
             firmware: None,
             efuse: None,
+            radio: None,
             stopped: Some((
                 Step::Firmware,
                 String::from(

@@ -20,6 +20,9 @@
 //! ([`mac`]) is the first slice after that power cycle's firmware runs, and
 //! the BB, RF, TX power and regulation tables rtw89 takes from the
 //! firmware's elements ([`elements`]) are the first its radio needs.
+//! Stage 2 ([`radio`]) brings the chip up again as rtw89's interface start
+//! does, tunes it and listens ([`listen`]), reading what RXQ holds as
+//! rtw89 reads it ([`rxdesc`]).
 //! Powering the chip on,
 //! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
 //! its polled bits answered, the ring addresses were written and the command
@@ -40,14 +43,17 @@ pub mod fwdl;
 pub mod h2c;
 pub mod h2creg;
 pub mod io;
+pub mod listen;
 pub mod mac;
 #[cfg(test)]
 mod model;
 pub mod pci;
 pub mod phy;
 pub mod power;
+pub mod radio;
 pub mod regd;
 pub mod registers;
 pub mod rtw8852b;
+pub mod rxdesc;
 pub mod txpower;
 pub mod txwd;

@@ -74,6 +74,8 @@ pub enum Error {
     DuplicateGpuCheck,
     DuplicateRestartAtStop,
     DuplicateWifiCheck,
+    WifiCheckChannel,
+    DuplicateWifiCheckChannel,
     MissingEcid,
     Ecid,
     MissingStorage,
@@ -124,6 +126,7 @@ pub enum Constraint {
     RestoreConfiguration,
     UnexpectedRestoreInputs,
     WifiDependency,
+    WifiCheckChannelDependency,
     Ipv4Gateway,
     InstallSourceDependency,
     InstallConfiguration,
@@ -197,6 +200,11 @@ impl Error {
             Self::DuplicateGpuCheck => "duplicate GPU check",
             Self::DuplicateRestartAtStop => "duplicate restart at stop",
             Self::DuplicateWifiCheck => "duplicate Wi-Fi check",
+            Self::WifiCheckChannel => {
+                "--wifi-check-channel needs PRIMARY[/WIDTH], a width of 20, 40 or 80 MHz, \
+                 that an RTL8852B tunes"
+            }
+            Self::DuplicateWifiCheckChannel => "duplicate --wifi-check-channel",
             Self::MissingEcid => "missing ECID",
             Self::Ecid => "--ecid takes one nonzero ECID",
             Self::MissingStorage => "missing ANS storage partition",
@@ -242,6 +250,7 @@ impl Constraint {
             }
             Self::UnexpectedRestoreInputs => "restore inputs require explicit --restore-study",
             Self::WifiDependency => "--wifi-key and --wifi-country configure a --wifi network",
+            Self::WifiCheckChannelDependency => "--wifi-check-channel configures the --wifi-check",
             Self::Ipv4Gateway => "--ipv4-gateway needs --ipv4 and another address of its subnet",
             Self::InstallSourceDependency => {
                 "--install-source names the partition of an --install medium"

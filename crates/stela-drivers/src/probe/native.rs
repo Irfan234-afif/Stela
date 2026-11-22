@@ -637,9 +637,9 @@ pub(super) struct RealtekAx {
     pub(super) kept: Box<dyn Any>,
 }
 
-/// Take an RTL8852BE through stage 1 and leave it cold
-/// (`realtek_wifi::ax::attach`), over its requester's cold preparation, as
-/// the drivers that bus-master do.
+/// Take an RTL8852BE through stage 1 and stage 2 as `plan` asks and leave
+/// it cold (`realtek_wifi::ax::attach`), over its requester's cold
+/// preparation, as the drivers that bus-master do.
 ///
 /// Its identity is read first, as `rtw89_pci_probe` maps BAR2 and
 /// `rtw89_chip_info_setup` reads SYS_CFG1 in `rtw89_read_chip_ver` before
@@ -662,6 +662,7 @@ pub(super) unsafe fn realtek_ax_wifi(
     services: &dyn NativeServices,
     address: Address,
     inputs: realtek_wifi::ax::attach::Inputs<'static>,
+    plan: &realtek_wifi::ax::radio::Plan<'_>,
 ) -> Result<RealtekAx, Failure> {
     use crate::bus::pci::requester::preparation::BoundRequester;
     use realtek_wifi::{
@@ -773,8 +774,17 @@ pub(super) unsafe fn realtek_ax_wifi(
     // memory decoding and bus mastering on and MSI and INTx off; `owner`
     // keeps BAR2, and the function, attachment, rings and channel stay kept
     // below for the rest of the boot.
-    let (outcome, kept) =
-        unsafe { attach::run(io, function.config(), domain, observed, found, &inputs) };
+    let (outcome, kept) = unsafe {
+        attach::run(
+            io,
+            function.config(),
+            domain,
+            observed,
+            found,
+            &inputs,
+            plan,
+        )
+    };
     Ok(RealtekAx {
         unpowered,
         outcome,

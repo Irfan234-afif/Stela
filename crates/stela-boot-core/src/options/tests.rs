@@ -69,6 +69,78 @@ fn the_wifi_check_needs_a_network_round_trips_and_is_given_once() {
 }
 
 #[test]
+fn the_wifi_check_channel_names_a_tuned_channel_round_trips_and_needs_the_check() {
+    for (text, primary, width, center) in [
+        (
+            "--system --wifi home --wifi-check --wifi-check-channel 36/80",
+            36,
+            80,
+            42,
+        ),
+        (
+            "--system --wifi home --wifi-check --wifi-check-channel 6/20",
+            6,
+            20,
+            6,
+        ),
+        (
+            "--system --wifi home --wifi-check --wifi-check-channel 6",
+            6,
+            20,
+            6,
+        ),
+        (
+            "--system --wifi home --wifi-check --wifi-check-channel 149/40",
+            149,
+            40,
+            151,
+        ),
+        (
+            "--system --wifi home --wifi-check --wifi-check-channel 11/40",
+            11,
+            40,
+            9,
+        ),
+        (
+            "--system --wifi home --wifi-check --wifi-check-channel 48/80",
+            48,
+            80,
+            42,
+        ),
+    ] {
+        let options = System::parse(text).unwrap();
+        let channel = options.wifi_check_channel.unwrap();
+        assert_eq!((channel.primary, channel.width), (primary, width), "{text}");
+        assert_eq!(channel.channel().unwrap().center(), center, "{text}");
+        assert_eq!(System::parse(&options.to_string()), Ok(options), "{text}");
+    }
+    assert_eq!(System::default().wifi_check_channel, None);
+    for word in [
+        "", "36/160", "6/80", "14/40", "37", "36/", "/80", "x/20", "300/20", "36/30",
+    ] {
+        assert_eq!(
+            System::parse(&format!(
+                "--system --wifi home --wifi-check --wifi-check-channel {word}"
+            ))
+            .unwrap_err(),
+            Error::WifiCheckChannel,
+            "{word:?}"
+        );
+    }
+    assert_eq!(
+        System::parse(
+            "--system --wifi home --wifi-check --wifi-check-channel 36/80 --wifi-check-channel 6"
+        )
+        .unwrap_err(),
+        Error::DuplicateWifiCheckChannel
+    );
+    assert_eq!(
+        System::parse("--system --wifi home --wifi-check-channel 36/80").unwrap_err(),
+        Error::Constraint(Constraint::WifiCheckChannelDependency)
+    );
+}
+
+#[test]
 fn restart_at_stop_round_trips_beside_a_check_and_is_given_once() {
     for text in [
         "--system --restart-at-stop",

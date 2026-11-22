@@ -180,7 +180,8 @@ struct Faults {
     bdram_stuck: bool,
 }
 
-const MEMORY: usize = 0x1_0000;
+/// MAC space and, behind `io::CR_BASE`, the BB and direct RF windows.
+const MEMORY: usize = super::super::io::BAR_BYTES;
 const CONFIG: usize = 0x1000;
 
 struct State {

@@ -1351,6 +1351,9 @@ struct WifiInputs<'a> {
     observations: net::wifi::intel::platform::Observations,
     firmware: &'static dyn crate::firmware::Provider,
     network: &'a Network,
+    /// The channel an RTL8852BE's stage 2 listens on, when the boot named
+    /// one (`--wifi-check-channel`).
+    channel: Option<net::wifi::realtek::ax::rtw8852b::channel::Channel>,
 }
 
 /// Attach the Intel Wi-Fi function at `address` for `wifi.network`, reading
@@ -1385,6 +1388,7 @@ unsafe fn intel_wifi(
         observations,
         firmware,
         network,
+        ..
     } = *wifi;
     #[cfg(feature = "native-acpi")]
     {
@@ -1534,9 +1538,11 @@ unsafe fn realtek_wifi(
     unsafe { native::realtek_wifi(services, address, completion, inputs) }
 }
 
-/// Take the RTL8852BE at `address` through stage 1 and leave it cold. Stage
-/// 1 transmits nothing: the firmware goes over PCIe and the radio is never
-/// enabled, so unlike a station it needs no regulatory database.
+/// Take the RTL8852BE at `address` through stage 1, then stage 2 on
+/// `wifi.channel` (channel 36 at 80 MHz by default), and leave it cold.
+/// Stage 1 transmits nothing; stage 2's RF calibrations do, at the TX power
+/// the network's country gives in regulatory.db when both are there, and
+/// at rtw89's own bound otherwise, as rtw89 runs without regulatory.db.
 ///
 /// # Safety
 /// As for [`intel_wifi`].
@@ -1548,14 +1554,33 @@ unsafe fn realtek_ax_wifi(
     services: &dyn NativeServices,
     address: Address,
     wifi: &WifiInputs<'_>,
+    regulatory: &Option<
+        Result<
+            crate::net::wifi::regulatory::database::Database,
+            crate::net::wifi::regulatory::database::LoadError,
+        >,
+    >,
 ) -> Result<native::RealtekAx, native::Failure> {
+    use net::wifi::realtek::ax::radio::{LISTEN_US, Plan};
     let inputs = net::wifi::realtek::ax::attach::Inputs {
         firmware: wifi.firmware,
         pages: services.pages(),
         clock: wifi.clock,
     };
+    let alpha2 = wifi.network.country;
+    let country = match (alpha2, regulatory) {
+        (Some(alpha2), Some(Ok(database))) => database.clone().select(alpha2).ok(),
+        _ => None,
+    };
+    let plan = Plan {
+        channel: wifi.channel.unwrap_or_else(Plan::default_channel),
+        alpha2,
+        country: country.as_ref(),
+        listen_us: LISTEN_US,
+        clock: wifi.clock,
+    };
     // SAFETY: forwarded from the caller.
-    unsafe { native::realtek_ax_wifi(services, address, inputs) }
+    unsafe { native::realtek_ax_wifi(services, address, inputs, &plan) }
 }
 
 /// Attach the Broadcom PCIe Bluetooth function at `address` with its
@@ -1654,6 +1679,7 @@ pub unsafe fn probe_with_provider(
             firmware,
             services,
             wifi,
+            None,
             &mut Unobserved,
         )
     }
@@ -1720,12 +1746,18 @@ fn network_handoff(handoff: &Handoff) -> Handoff {
     }
 }
 
-/// [`probe_with_provider`], with `observer` told of each start.
+/// [`probe_with_provider`], with `observer` told of each start and an
+/// RTL8852BE's stage 2 listening on `wifi_channel` (channel 36 at 80 MHz
+/// when `None`).
 ///
 /// # Safety
 /// As for [`probe_with_provider`]; `observer` drives no device the probe
 /// holds while it is called, beyond those [`Observer::first_started`] hands
 /// it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the mount's inputs, the Wi-Fi network and its check's channel among them"
+)]
 pub unsafe fn probe_observed(
     handoff: &Handoff,
     captures: PlatformCaptures,
@@ -1733,6 +1765,7 @@ pub unsafe fn probe_observed(
     firmware: &'static dyn crate::firmware::Provider,
     services: Option<&dyn NativeServices>,
     wifi: Option<&Network>,
+    wifi_channel: Option<net::wifi::realtek::ax::rtw8852b::channel::Channel>,
     observer: &mut dyn Observer,
 ) -> Devices {
     let network_handoff = network_handoff(handoff);
@@ -1746,6 +1779,7 @@ pub unsafe fn probe_observed(
         observations: captures.wifi,
         firmware,
         network,
+        channel: wifi_channel,
     });
     // Broadcom PCIe Bluetooth functions, attached once the scan has found
     // every bridge of their segment.
@@ -2789,7 +2823,7 @@ unsafe fn attach_native(
                 return;
             };
             // SAFETY: as for tg3 below.
-            match unsafe { realtek_ax_wifi(services, address, wifi) } {
+            match unsafe { realtek_ax_wifi(services, address, wifi, &devices.regulatory) } {
                 Ok(found) => {
                     match found.outcome.no_station() {
                         None => devices.unsupported.push((
@@ -3725,6 +3759,7 @@ mod tests {
                     handoff_provider(&handoff),
                     Some(&services),
                     None,
+                    None,
                     &mut told,
                 )
             };
@@ -3824,6 +3859,7 @@ mod tests {
                 &mut dma,
                 handoff_provider(&handoff),
                 Some(&services),
+                None,
                 None,
                 &mut observer,
             )
@@ -4237,6 +4273,7 @@ mod tests {
                     observations: Default::default(),
                     firmware,
                     network: &network,
+                    channel: None,
                 },
                 &None,
                 &[],
@@ -4260,6 +4297,7 @@ mod tests {
                     observations: Default::default(),
                     firmware,
                     network: &network,
+                    channel: None,
                 },
                 &None,
                 &[],
@@ -4284,6 +4322,7 @@ mod tests {
                     observations: Default::default(),
                     firmware,
                     network: &network,
+                    channel: None,
                 },
                 &None,
             )
@@ -4335,7 +4374,9 @@ mod tests {
                     observations: Default::default(),
                     firmware: handoff_provider(&handoff),
                     network: &network,
+                    channel: None,
                 },
+                &None,
             )
         };
         assert!(matches!(

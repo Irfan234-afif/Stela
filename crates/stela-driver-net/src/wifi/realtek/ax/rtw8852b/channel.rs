@@ -82,12 +82,15 @@
 //! [`efuse`]: crate::wifi::realtek::ax::efuse
 //! [`Info::efuse_gain`]: crate::wifi::realtek::ax::efuse::Info::efuse_gain
 //! [`Info::hal`]: crate::wifi::realtek::ax::efuse::Info::hal
+use super::rfk;
 use crate::wifi::realtek::ax::{
     efuse::{EfuseGain, RF_B},
     h2creg::Mailbox,
     io::{self, CR_BASE, Io, Registers, prep},
     mac::{self, Cause},
+    phy,
     registers::*,
+    txpower,
 };
 
 /// `enum rtw89_band`: the bands an RTL8852B tunes.
@@ -465,8 +468,9 @@ pub fn set_channel<I: Io + ?Sized>(
     set_channel_rf(io, chan)
 }
 
-/// `rtw89_mac_cfg_ppdu_status_ax(rtwdev, RTW89_MAC_0, enable)`.
-fn cfg_ppdu_status<I: Io + ?Sized>(io: &mut I, enable: bool) -> Result<(), Cause> {
+/// `rtw89_mac_cfg_ppdu_status_ax(rtwdev, RTW89_MAC_0, enable)`, which
+/// `rtw89_core_start` also runs (`rtw89_mac_cfg_ppdu_status_bands`).
+pub fn cfg_ppdu_status<I: Io + ?Sized>(io: &mut I, enable: bool) -> Result<(), Cause> {
     // rtw89_mac_check_mac_en(rtwdev, 0, RTW89_CMAC_SEL)
     let value = io.read32(CMAC_FUNC_EN)?;
     if value == R32_EA || value == R32_DEAD || value & CMAC_EN != CMAC_EN {
@@ -1097,6 +1101,100 @@ fn set_rxbb_bw<I: Io + ?Sized>(io: &mut I, bw: Width, path: u8) -> Result<(), io
     // Its debug line's read.
     io.read_rf(path, RR_LUTWD0, RR_LUTWD0_LB)?;
     io.write_rf(path, RR_LUTWE2, RR_LUTWE2_RTXBW, 0)
+}
+
+impl Channel {
+    /// The channel of `width` whose primary 20 MHz channel is `primary`,
+    /// as mac80211 would build its chandef for a scan of that channel: at 5
+    /// GHz the 40 and 80 MHz block of the 802.11 plan that holds it, at 2.4
+    /// GHz HT40+ (the center two channels up) where that fits, else HT40-.
+    pub fn for_primary(primary: u8, width: Width) -> Result<Self, Invalid> {
+        let center = match width {
+            Width::Mhz20 => primary,
+            Width::Mhz40 if (1..=14).contains(&primary) => {
+                if primary + 2 <= 11 {
+                    primary + 2
+                } else {
+                    primary.wrapping_sub(2)
+                }
+            }
+            Width::Mhz40 => CENTERS_40_5G
+                .into_iter()
+                .find(|center| center.abs_diff(primary) == 2)
+                .unwrap_or(primary),
+            Width::Mhz80 => CENTERS_80_5G
+                .into_iter()
+                .find(|center| matches!(center.abs_diff(primary), 2 | 6))
+                .unwrap_or(primary),
+        };
+        Self::new(center, primary, width)
+    }
+
+    /// The width in MHz.
+    pub fn width_mhz(&self) -> u16 {
+        match self.width {
+            Width::Mhz20 => 20,
+            Width::Mhz40 => 40,
+            Width::Mhz80 => 80,
+        }
+    }
+
+    /// The primary channel's frequency in MHz, `chandef->chan->center_freq`.
+    pub fn primary_freq(&self) -> u32 {
+        frequency(self.band, self.primary)
+    }
+
+    /// What the RF calibrations read of it ([`rfk::Channel`]): the band,
+    /// the width and `chan->channel`, the center.
+    pub fn rfk(&self) -> rfk::Channel {
+        rfk::Channel {
+            band: match self.band {
+                Band::Ghz2 => rfk::Band::Ghz2,
+                Band::Ghz5 => rfk::Band::Ghz5,
+            },
+            width: match self.width {
+                Width::Mhz20 => rfk::Bandwidth::Mhz20,
+                Width::Mhz40 => rfk::Bandwidth::Mhz40,
+                Width::Mhz80 => rfk::Bandwidth::Mhz80,
+            },
+            number: self.center,
+        }
+    }
+
+    /// What the TX power steps read of it ([`txpower::Chan`]).
+    pub fn txpower(&self) -> txpower::Chan {
+        txpower::Chan {
+            band: match self.band {
+                Band::Ghz2 => txpower::Band::Ghz2,
+                Band::Ghz5 => txpower::Band::Ghz5,
+            },
+            channel: self.center,
+            primary: self.primary,
+            width: match self.width {
+                Width::Mhz20 => txpower::Width::Mhz20,
+                Width::Mhz40 => txpower::Width::Mhz40,
+                Width::Mhz80 => txpower::Width::Mhz80,
+            },
+        }
+    }
+}
+
+impl BbGain {
+    /// The 2.4 and 5 GHz gain bands and the two paths of the BB gain
+    /// table's values ([`phy::BbGain`], `rtwdev->bb_gain.ax`).
+    pub fn from_table(table: &phy::BbGain) -> Self {
+        let mut gain = Self::default();
+        for band in 0..BB_GAIN_BAND_2G_5G {
+            for path in 0..BB_PATH_NUM {
+                gain.lna_gain[band][path] = table.lna_gain[band][path];
+                gain.tia_gain[band][path] = table.tia_gain[band][path];
+                gain.rpl_ofst_20[band][path] = table.rpl_ofst_20[band][path];
+                gain.rpl_ofst_40[band][path] = table.rpl_ofst_40[band][path];
+                gain.rpl_ofst_80[band][path] = table.rpl_ofst_80[band][path];
+            }
+        }
+        gain
+    }
 }
 
 #[cfg(test)]

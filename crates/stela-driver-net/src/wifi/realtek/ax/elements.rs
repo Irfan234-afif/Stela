@@ -947,4 +947,4 @@ fn regd_entcpy(cursor: &[u8]) -> Regd {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
