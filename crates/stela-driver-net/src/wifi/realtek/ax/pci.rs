@@ -538,4 +538,4 @@ fn rst_bdram<I: Io + ?Sized>(io: &mut I) -> Result<(), io::Error> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

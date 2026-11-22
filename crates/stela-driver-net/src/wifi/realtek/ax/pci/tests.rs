@@ -28,7 +28,7 @@ use std::sync::Mutex;
 
 /// One access, as the C oracle's harness records it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Access {
+pub(crate) enum Access {
     Read {
         width: u32,
         register: u32,
@@ -52,42 +52,42 @@ enum Access {
     },
 }
 
-fn r8(register: u32, value: u32) -> Access {
+pub(crate) fn r8(register: u32, value: u32) -> Access {
     Access::Read {
         width: 1,
         register,
         value,
     }
 }
-fn r16(register: u32, value: u32) -> Access {
+pub(crate) fn r16(register: u32, value: u32) -> Access {
     Access::Read {
         width: 2,
         register,
         value,
     }
 }
-fn r32(register: u32, value: u32) -> Access {
+pub(crate) fn r32(register: u32, value: u32) -> Access {
     Access::Read {
         width: 4,
         register,
         value,
     }
 }
-fn w8(register: u32, value: u32) -> Access {
+pub(crate) fn w8(register: u32, value: u32) -> Access {
     Access::Write {
         width: 1,
         register,
         value,
     }
 }
-fn w16(register: u32, value: u32) -> Access {
+pub(crate) fn w16(register: u32, value: u32) -> Access {
     Access::Write {
         width: 2,
         register,
         value,
     }
 }
-fn w32(register: u32, value: u32) -> Access {
+pub(crate) fn w32(register: u32, value: u32) -> Access {
     Access::Write {
         width: 4,
         register,
@@ -109,12 +109,12 @@ fn cw(offset: u16, value: u8) -> Access {
 }
 
 /// The C oracle's record: tag, register, value, each a little-endian u32.
-fn push(trace: &mut Vec<u8>, tag: u32, register: u32, value: u32) {
+pub(crate) fn push(trace: &mut Vec<u8>, tag: u32, register: u32, value: u32) {
     for word in [tag, register, value] {
         trace.extend_from_slice(&word.to_le_bytes());
     }
 }
-fn encode(log: &[Access]) -> Vec<u8> {
+pub(crate) fn encode(log: &[Access]) -> Vec<u8> {
     let mut trace = Vec::new();
     for access in log {
         match *access {
@@ -198,7 +198,7 @@ struct State {
 /// RST_BDRAM dropped as it is written unless stuck. Shared references
 /// implement both [`Io`] and [`ConfigSpace`], so the pre-init can take one
 /// of each and both log to one trace.
-struct Model(RefCell<State>);
+pub(crate) struct Model(RefCell<State>);
 
 fn overlaps(register: u32, width: u32, at: u32, bytes: u32) -> bool {
     register < at + bytes && at < register + width
@@ -347,16 +347,16 @@ impl Model {
             waited_us: 0,
         }))
     }
-    fn zeroed(phy_rate: u8, l1_ctrl: u8, calib: bool) -> Self {
+    pub(crate) fn zeroed(phy_rate: u8, l1_ctrl: u8, calib: bool) -> Self {
         Self::new(Fill::Zeros, phy_rate, l1_ctrl, calib, Faults::default())
     }
-    fn log(&self) -> Vec<Access> {
+    pub(crate) fn log(&self) -> Vec<Access> {
         self.0.borrow().log.clone()
     }
-    fn take_log(&self) -> Vec<Access> {
+    pub(crate) fn take_log(&self) -> Vec<Access> {
         core::mem::take(&mut self.0.borrow_mut().log)
     }
-    fn set(&self, register: u32, width: u32, value: u32) {
+    pub(crate) fn set(&self, register: u32, width: u32, value: u32) {
         self.0.borrow_mut().set(register, width, value);
     }
     fn count(&self, access: Access) -> usize {
@@ -487,7 +487,7 @@ impl Drop for Pages {
     }
 }
 
-struct Source;
+pub(crate) struct Source;
 impl PageSource for Source {
     fn allocate(
         &self,
@@ -518,7 +518,7 @@ impl PageSource for Source {
 
 /// Where the domain places each mapping, by allocation order.
 #[derive(Clone, Copy, Debug)]
-enum Placement {
+pub(crate) enum Placement {
     /// The C oracle's addresses.
     Oracle,
     /// The oracle's, but mapping `index` at `address`.
@@ -537,26 +537,28 @@ struct DomainState {
     maps: usize,
     mappings: BTreeMap<u64, Mapped>,
     unmaps: usize,
+    /// The address of every mapping unmapped, in order.
+    unmapped: Vec<u64>,
     syncs_for_device: usize,
     syncs_for_cpu: usize,
 }
 
 /// A DMA domain that places mappings where [`Placement`] says and keeps a
 /// CPU view of each, so a test can play the device.
-struct Domain {
+pub(crate) struct Domain {
     placement: Placement,
     state: Mutex<DomainState>,
 }
 
 impl Domain {
-    fn new(placement: Placement) -> Arc<Self> {
+    pub(crate) fn new(placement: Placement) -> Arc<Self> {
         Arc::new(Self {
             placement,
             state: Mutex::new(DomainState::default()),
         })
     }
     /// Copy `bytes` into the mapping that holds `address`, as the device.
-    fn device_write(&self, address: u64, bytes: &[u8]) {
+    pub(crate) fn device_write(&self, address: u64, bytes: &[u8]) {
         let state = self.state.lock().unwrap();
         let (&base, mapped) = state.mappings.range(..=address).next_back().unwrap();
         let offset = (address - base) as usize;
@@ -569,10 +571,32 @@ impl Domain {
                 .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
         }
     }
-    fn unmaps(&self) -> usize {
+    /// Copy `length` bytes out of the mapping that holds `address`, as the
+    /// device reads them.
+    pub(crate) fn device_read(&self, address: u64, length: usize) -> Vec<u8> {
+        let state = self.state.lock().unwrap();
+        let (&base, mapped) = state.mappings.range(..=address).next_back().unwrap();
+        let offset = (address - base) as usize;
+        assert!(offset + length <= mapped.bytes);
+        assert_ne!(mapped.direction, Direction::FromDevice);
+        let mut bytes = vec![0; length];
+        // SAFETY: the range lies inside a live mapping this domain keeps,
+        // and the test plays the device while the CPU writes none of it.
+        unsafe {
+            bytes
+                .as_mut_ptr()
+                .copy_from_nonoverlapping((mapped.cpu + offset) as *const u8, length);
+        }
+        bytes
+    }
+    pub(crate) fn unmaps(&self) -> usize {
         self.state.lock().unwrap().unmaps
     }
-    fn live(&self) -> usize {
+    /// The addresses unmapped since the last call, in order.
+    pub(crate) fn take_unmapped(&self) -> Vec<u64> {
+        core::mem::take(&mut self.state.lock().unwrap().unmapped)
+    }
+    pub(crate) fn live(&self) -> usize {
         self.state.lock().unwrap().mappings.len()
     }
 }
@@ -625,6 +649,7 @@ unsafe impl DmaDomain for Domain {
     unsafe fn unmap(&self, mapping: DomainMapping) -> Result<(), DmaError> {
         let mut state = self.state.lock().unwrap();
         state.unmaps += 1;
+        state.unmapped.push(mapping.id);
         state
             .mappings
             .remove(&mapping.id)
@@ -658,11 +683,11 @@ unsafe impl DmaDomain for Domain {
     }
 }
 
-fn new_rings(domain: &Arc<Domain>) -> Rings {
+pub(crate) fn new_rings(domain: &Arc<Domain>) -> Rings {
     Rings::new(&Source, domain.clone()).unwrap()
 }
 
-fn release(rings: &mut Rings) {
+pub(crate) fn release(rings: &mut Rings) {
     // SAFETY: no modeled device keeps any of these mappings.
     unsafe { rings.release_after_stop() }.unwrap();
 }
@@ -1602,7 +1627,7 @@ fn push_rings(trace: &mut Vec<u8>, rings: &Rings) {
 }
 
 /// The next length-prefixed segment of the oracle's trace.
-fn segment<'a>(trace: &'a [u8], offset: &mut usize) -> &'a [u8] {
+pub(crate) fn segment<'a>(trace: &'a [u8], offset: &mut usize) -> &'a [u8] {
     let length = u32::from_le_bytes(trace[*offset..*offset + 4].try_into().unwrap()) as usize;
     *offset += 4;
     let segment = &trace[*offset..*offset + length];

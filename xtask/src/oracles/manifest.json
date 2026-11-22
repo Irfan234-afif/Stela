@@ -2473,6 +2473,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "h2c_headers_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_H2C_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 H2C, TXWD and C2H C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",
