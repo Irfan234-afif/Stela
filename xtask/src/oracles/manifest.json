@@ -2473,6 +2473,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "channel_switch_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rtw8852b/channel/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_CHANNEL_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RTL8852B channel switch C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "pre_init_register_trace_matches_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/pci/tests.rs",
     "kind": "oracle",

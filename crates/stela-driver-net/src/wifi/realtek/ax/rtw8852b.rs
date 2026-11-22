@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2022 Realtek Corporation
 //! What is RTL8852B's own in pinned rtw89, beside the AX generation's shared
-//! layers: its RF calibration tables ([`rfk`]), its efuse layout and readers
+//! layers: its channel switch ([`channel`]), its RF calibration tables
+//! ([`rfk`]), its efuse layout and readers
 //! ([`efuse`]), the values its power functions and chip info give
 //! [`super::power`], and the PCIe HCI flow control and DLE tables its chip
 //! info gives [`super::dle`].
@@ -13,6 +14,7 @@ use super::{
     registers::SCOREBOARD,
 };
 
+pub mod channel;
 pub mod efuse;
 pub mod rfk;
 

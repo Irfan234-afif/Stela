@@ -1016,3 +1016,204 @@ pub const PCIE_PHY_RATE: u16 = 0x82;
 pub const PCIE_PHY_RATE_MASK: u8 = 0x03;
 pub const PCIE_L1_CTRL: u16 = 0x0719;
 pub const PCIE_BIT_L1: u8 = 1 << 3;
+
+/// CMAC0's RF mode, `R_AX_WMAC_RFMOD` with `B_AX_WMAC_RFMOD_MASK`.
+pub const WMAC_RFMOD: u32 = 0xc010;
+pub const WMAC_RFMOD_MASK: u32 = 0x0003;
+/// `R_AX_TXRATE_CHK` and the band bits `__rtw8852bx_set_channel_mac` sets.
+pub const TXRATE_CHK: u32 = 0xc628;
+pub const BAND_MODE: u32 = 1 << 4;
+pub const CHECK_CCK_EN: u32 = 1 << 0;
+pub const RTS_LIMIT_IN_OFDM6: u32 = 1 << 1;
+/// `R_AX_PPDU_STAT` and its report enables.
+pub const PPDU_STAT: u32 = 0xce40;
+pub const PPDU_STAT_RPT_EN: u32 = 1 << 0;
+pub const APP_MAC_INFO_RPT: u32 = 1 << 1;
+pub const APP_PLCP_HDR_RPT: u32 = 1 << 3;
+pub const PPDU_STAT_RPT_CRC32: u32 = 1 << 5;
+/// `R_AX_HW_RPT_FWD`'s PPDU status destination, `RTW89_PRPT_DEST_HOST`.
+pub const HW_RPT_FWD: u32 = 0x9c18;
+pub const FWD_PPDU_STAT_MASK: u32 = 0x0003;
+pub const PRPT_DEST_HOST: u32 = 1;
+/// `MASKBYTE0`.
+pub const MASKBYTE0: u32 = 0x00ff;
+
+// BB and RF names keep rtw89's `R_`, `B_` and `RR_` prefixes: without them a
+// register and its field would share a name (`R_PATH0_BT_SHARE_V1` and
+// `B_PATH0_BT_SHARE_V1`).
+
+/// The CCK SCO thresholds `rtw8852bx_ctrl_sco_cck` writes.
+pub const R_RXSCOBC: u32 = 0x23b0;
+pub const B_RXSCOBC_TH: u32 = 0x0007_ffff;
+pub const R_RXSCOCCK: u32 = 0x23b4;
+pub const B_RXSCOCCK_TH: u32 = 0x0007_ffff;
+/// Each path's band select and BT share bits.
+pub const R_PATH0_BAND_SEL_V1: u32 = 0x4738;
+pub const B_PATH0_BAND_SEL_MSK_V1: u32 = 1 << 17;
+pub const R_PATH1_BAND_SEL_V1: u32 = 0x4aa4;
+pub const B_PATH1_BAND_SEL_MSK_V1: u32 = 1 << 17;
+pub const R_PATH0_BT_SHARE_V1: u32 = 0x4738;
+pub const B_PATH0_BT_SHARE_V1: u32 = 1 << 19;
+pub const R_PATH0_BTG_PATH_V1: u32 = 0x4738;
+pub const B_PATH0_BTG_PATH_V1: u32 = 1 << 22;
+pub const R_PATH1_BT_SHARE_V1: u32 = 0x4aa4;
+pub const B_PATH1_BT_SHARE_V1: u32 = 1 << 19;
+pub const R_PATH1_BTG_PATH_V1: u32 = 0x4aa4;
+pub const B_PATH1_BTG_PATH_V1: u32 = 1 << 22;
+/// The channel's bandwidth, SCO compensation and primary channel.
+pub const R_FC0_BW_V1: u32 = 0x49c0;
+pub const B_FC0_BW_INV: u32 = 0x007f;
+pub const B_FC0_BW_SET: u32 = 0xc000_0000;
+pub const B_ANT_RX_BT_SEG0: u32 = 0x03c0_0000;
+pub const R_CHBW_MOD_V1: u32 = 0x49c4;
+pub const B_ANT_RX_SEG0: u32 = 0x000f;
+pub const B_CHBW_MOD_SBW: u32 = 0x3000;
+pub const B_CHBW_MOD_PRICH: u32 = 0x0f00;
+pub const B_BT_SHARE: u32 = 1 << 14;
+/// The CCK TX filter's coefficients.
+pub const R_TXFIR0: u32 = 0x2300;
+pub const B_TXFIR_C01: u32 = 0x00ff_ffff;
+pub const R_TXFIR2: u32 = 0x2304;
+pub const B_TXFIR_C23: u32 = 0x00ff_ffff;
+pub const R_TXFIR4: u32 = 0x2308;
+pub const B_TXFIR_C45: u32 = 0x00ff_ffff;
+pub const R_TXFIR6: u32 = 0x230c;
+pub const B_TXFIR_C67: u32 = 0x00ff_ffff;
+pub const R_TXFIR8: u32 = 0x2310;
+pub const B_TXFIR_C89: u32 = 0x00ff_ffff;
+pub const R_TXFIRA: u32 = 0x2314;
+pub const B_TXFIR_CAB: u32 = 0x00ff_ffff;
+pub const R_TXFIRC: u32 = 0x2318;
+pub const B_TXFIR_CCD: u32 = 0x00ff_ffff;
+pub const R_TXFIRE: u32 = 0x231c;
+pub const B_TXFIR_CEF: u32 = 0x00ff_ffff;
+/// The RX gain compensation and RSSI offsets `rtw8852bx_set_gain_offset`
+/// writes.
+pub const R_P0_AGC_RSVD: u32 = 0x4acc;
+pub const R_P1_AGC_RSVD: u32 = 0x4ad8;
+pub const R_PATH0_G_TIA1_LNA6_OP1DB_V1: u32 = 0x4694;
+pub const R_PATH1_G_TIA1_LNA6_OP1DB_V1: u32 = 0x4778;
+pub const B_PATH0_R_G_OFST_MASK: u32 = 0x00ff_0000;
+pub const R_RX_RPL_OFST: u32 = 0x23ac;
+pub const B_RX_RPL_OFST_CCK_MASK: u32 = 0x007f;
+/// The RPL offsets by RX subchannel.
+pub const R_P0_RPL1: u32 = 0x49b0;
+pub const R_P1_RPL1: u32 = 0x4a00;
+pub const B_P0_RPL1_BIAS_MASK: u32 = 0x00ff;
+pub const B_P0_RPL1_20_MASK: u32 = 0xff00;
+pub const B_P0_RPL1_40_MASK: u32 = 0x00ff_0000;
+pub const B_P0_RPL1_41_MASK: u32 = 0xff00_0000;
+pub const B_P0_RPL1_SHIFT: u32 = 8;
+pub const B_P0_RPL1_MASK: u32 = 0xffff_ff00;
+pub const R_P0_RPL2: u32 = 0x49b4;
+pub const R_P1_RPL2: u32 = 0x4a04;
+pub const B_P0_RTL2_42_MASK: u32 = 0x00ff;
+pub const B_P0_RTL2_80_MASK: u32 = 0xff00;
+pub const B_P0_RTL2_81_MASK: u32 = 0x00ff_0000;
+pub const B_P0_RTL2_8A_MASK: u32 = 0xff00_0000;
+pub const R_P0_RPL3: u32 = 0x49b8;
+pub const R_P1_RPL3: u32 = 0x4a08;
+pub const B_P0_RTL3_82_MASK: u32 = 0x00ff;
+pub const B_P0_RTL3_83_MASK: u32 = 0xff00;
+pub const B_P0_RTL3_84_MASK: u32 = 0x00ff_0000;
+pub const B_P0_RTL3_89_MASK: u32 = 0xff00_0000;
+/// Each path's original RX RF mode.
+pub const R_P0_RFMODE_ORI_RX: u32 = 0x12ac;
+pub const B_P0_RFMODE_ORI_RX_ALL: u32 = 0x00ff_f000;
+pub const R_P1_RFMODE_ORI_RX: u32 = 0x32ac;
+pub const B_P1_RFMODE_ORI_RX_ALL: u32 = 0x00ff_f000;
+/// The CCK primary channel, the CCK enable and the CCK CCA.
+pub const R_RXSC: u32 = 0x237c;
+pub const B_RXSC_EN: u32 = 1 << 0;
+pub const R_UPD_CLK_ADC: u32 = 0x0700;
+pub const B_ENABLE_CCK: u32 = 1 << 5;
+pub const R_RXCCA: u32 = 0x2344;
+pub const B_RXCCA_DIS: u32 = 1 << 31;
+/// The BT dynamic DC estimate and the BT grant weighting.
+pub const R_BT_DYN_DC_EST_EN_V1: u32 = 0x4420;
+pub const B_BT_DYN_DC_EST_EN_MSK: u32 = 1 << 31;
+pub const R_GNT_BT_WGT_EN: u32 = 0x0c6c;
+pub const B_GNT_BT_WGT_EN: u32 = 1 << 21;
+/// The encoded primary channel.
+pub const R_MAC_PIN_SEL: u32 = 0x0734;
+pub const B_CH_IDX_SEG0: u32 = 0x00ff_0000;
+/// Each path's 5 MHz mask and the subband option.
+pub const R_PATH0_5MDET_V1: u32 = 0x46f8;
+pub const B_PATH0_5MDET_EN: u32 = 1 << 12;
+pub const B_PATH0_5MDET_TH: u32 = 0x003f;
+pub const B_PATH0_5MDET_SB2: u32 = 1 << 8;
+pub const B_PATH0_5MDET_SB0: u32 = 1 << 6;
+pub const R_PATH1_5MDET_V1: u32 = 0x47b8;
+pub const B_PATH1_5MDET_EN: u32 = 1 << 12;
+pub const B_PATH1_5MDET_TH: u32 = 0x003f;
+pub const B_PATH1_5MDET_SB2: u32 = 1 << 8;
+pub const B_PATH1_5MDET_SB0: u32 = 1 << 6;
+pub const R_ASSIGN_SBD_OPT_V1: u32 = 0x4440;
+pub const B_ASSIGN_SBD_OPT_EN_V1: u32 = 1 << 31;
+/// The packet POP enable a monitor interface clears.
+pub const R_PKT_CTRL: u32 = 0x47d4;
+pub const B_PKT_POP_EN: u32 = 1 << 8;
+/// The BB reset: each path's hardware SI trigger and the async reset.
+pub const R_S0_HW_SI_DIS: u32 = 0x1200;
+pub const B_S0_HW_SI_DIS_W_R_TRIG: u32 = 0x7000_0000;
+pub const R_S1_HW_SI_DIS: u32 = 0x3200;
+pub const B_S1_HW_SI_DIS_W_R_TRIG: u32 = 0x7000_0000;
+pub const R_RSTB_ASYNC: u32 = 0x0704;
+pub const B_RSTB_ASYNC_ALL: u32 = 1 << 1;
+pub const R_PD_CTRL: u32 = 0x0c3c;
+pub const B_PD_HIT_DIS: u32 = 1 << 9;
+/// Each path's TSSI tracking and TX power reset, and the ADC FIFO reset.
+pub const R_P0_TSSI_TRK: u32 = 0x5818;
+pub const B_P0_TSSI_TRK_EN: u32 = 1 << 30;
+pub const R_P1_TSSI_TRK: u32 = 0x7818;
+pub const R_P0_TXPW_RSTB: u32 = 0x58dc;
+pub const B_P0_TXPW_RSTB_MANON: u32 = 1 << 30;
+pub const R_P1_TXPW_RSTB: u32 = 0x78dc;
+pub const R_ADC_FIFO: u32 = 0x20fc;
+pub const B_ADC_FIFO_RST: u32 = 0xff00_0000;
+
+/// RF 0x18, the channel and bandwidth: `RR_CFGCH` through SWSI and
+/// `RR_CFGCH_V1` through the direct window, with their fields and values.
+pub const RR_CFGCH: u32 = 0x0018;
+pub const RR_CFGCH_V1: u32 = 0x0001_0018;
+pub const RR_CFGCH_BW: u32 = 0x0c00;
+pub const RR_CFGCH_POW_LCK: u32 = 1 << 15;
+pub const RR_CFGCH_TRX_AH: u32 = 1 << 14;
+pub const RR_CFGCH_BCN: u32 = 1 << 13;
+pub const RR_CFGCH_BW2: u32 = 1 << 12;
+pub const RR_CFGCH_BAND1: u32 = 0x0003_0000;
+pub const RR_CFGCH_BAND0: u32 = 0x0300;
+pub const RR_CFGCH_CH: u32 = 0x00ff;
+pub const CFGCH_BW_20M: u32 = 3;
+pub const CFGCH_BW_40M: u32 = 2;
+pub const CFGCH_BW_80M: u32 = 1;
+pub const CFGCH_BAND1_5G: u32 = 1;
+pub const CFGCH_BAND0_5G: u32 = 1;
+/// The synthesizer's lock check: LDO, LPF busy, lock, MMD reset, LCK
+/// trigger, power, SX, LUT mode, VCO and LCK state.
+pub const RR_LDO: u32 = 0x00b1;
+pub const RR_LDO_SEL: u32 = 0x01c0;
+pub const RR_LPF: u32 = 0x00b7;
+pub const RR_LPF_BUSY: u32 = 1 << 8;
+pub const RR_SYNFB: u32 = 0x00c5;
+pub const RR_SYNFB_LK: u32 = 1 << 15;
+pub const RR_MMD: u32 = 0x00d5;
+pub const RR_MMD_RST_EN: u32 = 1 << 8;
+pub const RR_MMD_RST_SYN: u32 = 1 << 6;
+pub const RR_LCK_TRG: u32 = 0x00d3;
+pub const RR_LCK_TRGSEL: u32 = 1 << 8;
+pub const RR_POW: u32 = 0x00a0;
+pub const RR_POW_SYN: u32 = 0x000c;
+pub const RR_SX: u32 = 0x00af;
+pub const RR_SYNLUT: u32 = 0x00dd;
+pub const RR_SYNLUT_MOD: u32 = 1 << 4;
+pub const RR_VCO: u32 = 0x00b2;
+pub const RR_LCKST: u32 = 0x00cf;
+pub const RR_LCKST_BIN: u32 = 1 << 0;
+/// The RX baseband filter's LUT: write enable, address and data.
+pub const RR_LUTWE2: u32 = 0x00ee;
+pub const RR_LUTWE2_RTXBW: u32 = 1 << 2;
+pub const RR_LUTWA: u32 = 0x0033;
+pub const RR_LUTWA_M2: u32 = 0x001f;
+pub const RR_LUTWD0: u32 = 0x003f;
+pub const RR_LUTWD0_LB: u32 = 0x003f;
