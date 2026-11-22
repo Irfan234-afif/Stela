@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020 Realtek Corporation
 //! The rtw89 register names the AX layers read and write, as pinned
-//! rtw89/reg.h, mac.h, phy.h and core.h define them. MAC registers are
-//! BAR2 offsets; BB and RF registers are named without `cr_base`, which
-//! [`super::io`] adds.
+//! rtw89/reg.h, pci.h, mac.h, phy.h and core.h define them. MAC registers
+//! are BAR2 offsets; BB and RF registers are named without `cr_base`, which
+//! [`super::io`] adds. The PCIe PHY registers reached through MDIO and the
+//! configuration space offsets are named at the end.
 
 /// `R_AX_SYS_CFG1` and its cut field, `B_AX_CHIP_VER_MASK`.
 pub const SYS_CFG1: u32 = 0x00f0;
@@ -84,6 +85,8 @@ pub const FEN_BBRSTB: u32 = 1 << 0;
 /// `R_AX_SYS_PW_CTRL` and its bits.
 pub const SYS_PW_CTRL: u32 = 0x0004;
 pub const DIS_WLBT_PDNSUSEN_SOPC: u32 = 1 << 18;
+/// `B_AX_PSUS_OFF_CAPC_EN`, which `rtw89_pci_aphy_pwrcut` clears.
+pub const PSUS_OFF_CAPC_EN: u32 = 1 << 14;
 pub const RDY_SYSPWR: u32 = 1 << 17;
 pub const EN_WLON: u32 = 1 << 16;
 pub const APDM_HPDN: u32 = 1 << 15;
@@ -115,9 +118,17 @@ pub const EF_DATA_MASK: u32 = 0x0000_ffff;
 pub const EFUSE_CTRL_1_V1: u32 = 0x0038;
 pub const EF_BURST: u32 = 1 << 19;
 
-/// `R_AX_SYS_SDIO_CTRL` and `B_AX_PCIE_CALIB_EN_V1`.
+/// `R_AX_SYS_SDIO_CTRL` and its bits: `B_AX_PCIE_DIS_L2_CTRL_LDO_HCI` and
+/// `B_AX_PCIE_DIS_WLSUS_AFT_PDN`, which `rtw89_pci_hci_ldo` sets and clears,
+/// and `B_AX_PCIE_CALIB_EN_V1`.
 pub const SYS_SDIO_CTRL: u32 = 0x0070;
+pub const PCIE_DIS_L2_CTRL_LDO_HCI: u32 = 1 << 15;
+pub const PCIE_DIS_WLSUS_AFT_PDN: u32 = 1 << 14;
 pub const PCIE_CALIB_EN_V1: u32 = 1 << 12;
+
+/// `R_AX_HCI_OPT_CTRL` and `BIT_WAKE_CTRL`, `rtw89_pci_power_wake_ax`'s bit.
+pub const HCI_OPT_CTRL: u32 = 0x0074;
+pub const WAKE_CTRL: u32 = 1 << 5;
 
 /// `R_AX_HCI_LDO_CTRL` and `B_AX_R_AX_VADJ_MASK`.
 pub const HCI_LDO_CTRL: u32 = 0x007a;
@@ -175,6 +186,194 @@ pub const C3_L1_MASK: u32 = 0x0000_0030;
 pub const C2_L1_MASK: u32 = 0x0000_000c;
 pub const C1_L1_MASK: u32 = 0x0000_0003;
 
+/// `R_AX_PCIE_INIT_CFG1` (`rtw8852b_pci_info.init_cfg_reg`) and its bits.
+pub const PCIE_INIT_CFG1: u32 = 0x1000;
+pub const PCIE_RXRST_KEEP_REG: u32 = 1 << 23;
+pub const PCIE_TXRST_KEEP_REG: u32 = 1 << 22;
+pub const RXBD_MODE: u32 = 1 << 18;
+pub const PCIE_MAX_RXDMA_MASK: u32 = 0x0001_c000;
+pub const RXHCI_EN: u32 = 1 << 13;
+pub const LATENCY_CONTROL: u32 = 1 << 12;
+pub const TXHCI_EN: u32 = 1 << 11;
+pub const PCIE_MAX_TXDMA_MASK: u32 = 0x0000_0700;
+pub const RST_BDRAM: u32 = 1 << 3;
+/// `R_AX_PCIE_INIT_CFG2` and the WD DMA intervals, `B_AX_WD_ITVL_IDLE` and
+/// `B_AX_WD_ITVL_ACT`.
+pub const PCIE_INIT_CFG2: u32 = 0x1004;
+pub const WD_ITVL_IDLE: u32 = 0x0f00_0000;
+pub const WD_ITVL_ACT: u32 = 0x000f_0000;
+/// `R_AX_PCIE_PS_CTRL` and `B_AX_L1OFF_PWR_OFF_EN`.
+pub const PCIE_PS_CTRL: u32 = 0x1008;
+pub const L1OFF_PWR_OFF_EN: u32 = 1 << 5;
+/// `R_AX_PCIE_DMA_STOP1` (`rtw8852b_pci_info.dma_stop1` and `dma_io_stop`)
+/// and its bits; `B_AX_TX_STOP1_MASK_V1` stops the seven TX channels an
+/// RTL8852BE has.
+pub const PCIE_DMA_STOP1: u32 = 0x1010;
+pub const STOP_PCIEIO: u32 = 1 << 20;
+pub const STOP_WPDMA: u32 = 1 << 19;
+pub const STOP_CH12: u32 = 1 << 18;
+pub const STOP_CH9: u32 = 1 << 17;
+pub const STOP_CH8: u32 = 1 << 16;
+pub const STOP_ACH3: u32 = 1 << 11;
+pub const STOP_ACH2: u32 = 1 << 10;
+pub const STOP_ACH1: u32 = 1 << 9;
+pub const STOP_ACH0: u32 = 1 << 8;
+pub const TX_STOP1_MASK_V1: u32 =
+    STOP_ACH0 | STOP_ACH1 | STOP_ACH2 | STOP_ACH3 | STOP_CH8 | STOP_CH9 | STOP_CH12;
+/// `R_AX_TXBD_RWPTR_CLR1` and the index clears of the seven TX channels.
+pub const TXBD_RWPTR_CLR1: u32 = 0x1014;
+pub const CLR_CH12_IDX: u32 = 1 << 10;
+pub const CLR_CH9_IDX: u32 = 1 << 9;
+pub const CLR_CH8_IDX: u32 = 1 << 8;
+pub const CLR_ACH3_IDX: u32 = 1 << 3;
+pub const CLR_ACH2_IDX: u32 = 1 << 2;
+pub const CLR_ACH1_IDX: u32 = 1 << 1;
+pub const CLR_ACH0_IDX: u32 = 1 << 0;
+/// `R_AX_RXBD_RWPTR_CLR` (`rtw8852b_pci_info.rxbd_rwptr_clr_reg`),
+/// `B_AX_CLR_RPQ_IDX` and `B_AX_CLR_RXQ_IDX`.
+pub const RXBD_RWPTR_CLR: u32 = 0x1018;
+pub const CLR_RPQ_IDX: u32 = 1 << 1;
+pub const CLR_RXQ_IDX: u32 = 1 << 0;
+/// `R_AX_PCIE_DMA_BUSY1` (`rtw8852b_pci_info.dma_busy1` and
+/// `dma_busy3_reg`) and its bits; `DMA_BUSY1_CHECK_V1` covers the seven TX
+/// channels.
+pub const PCIE_DMA_BUSY1: u32 = 0x101c;
+pub const CH12_BUSY: u32 = 1 << 18;
+pub const CH9_BUSY: u32 = 1 << 17;
+pub const CH8_BUSY: u32 = 1 << 16;
+pub const ACH3_BUSY: u32 = 1 << 11;
+pub const ACH2_BUSY: u32 = 1 << 10;
+pub const ACH1_BUSY: u32 = 1 << 9;
+pub const ACH0_BUSY: u32 = 1 << 8;
+pub const RPQ_BUSY: u32 = 1 << 1;
+pub const RXQ_BUSY: u32 = 1 << 0;
+pub const DMA_BUSY1_CHECK_V1: u32 =
+    ACH0_BUSY | ACH1_BUSY | ACH2_BUSY | ACH3_BUSY | CH8_BUSY | CH9_BUSY | CH12_BUSY;
+
+/// The BD count registers (`R_AX_*_RXBD_NUM`, `R_AX_*_TXBD_NUM`), 16 bits
+/// wide.
+pub const RXQ_RXBD_NUM: u32 = 0x1020;
+pub const RPQ_RXBD_NUM: u32 = 0x1022;
+pub const ACH0_TXBD_NUM: u32 = 0x1024;
+pub const ACH1_TXBD_NUM: u32 = 0x1026;
+pub const ACH2_TXBD_NUM: u32 = 0x1028;
+pub const ACH3_TXBD_NUM: u32 = 0x102a;
+pub const ACH4_TXBD_NUM: u32 = 0x102c;
+pub const ACH5_TXBD_NUM: u32 = 0x102e;
+pub const ACH6_TXBD_NUM: u32 = 0x1030;
+pub const ACH7_TXBD_NUM: u32 = 0x1032;
+pub const CH8_TXBD_NUM: u32 = 0x1034;
+pub const CH9_TXBD_NUM: u32 = 0x1036;
+pub const CH12_TXBD_NUM: u32 = 0x1038;
+pub const CH10_TXBD_NUM: u32 = 0x1338;
+pub const CH11_TXBD_NUM: u32 = 0x133a;
+/// The BD index registers (`R_AX_*_RXBD_IDX`, `R_AX_*_TXBD_IDX`): the host
+/// index in `TXBD_HOST_IDX_MASK`, the hardware's in `TXBD_HW_IDX_MASK`.
+pub const RXQ_RXBD_IDX: u32 = 0x1050;
+pub const RPQ_RXBD_IDX: u32 = 0x1054;
+pub const ACH0_TXBD_IDX: u32 = 0x1058;
+pub const ACH1_TXBD_IDX: u32 = 0x105c;
+pub const ACH2_TXBD_IDX: u32 = 0x1060;
+pub const ACH3_TXBD_IDX: u32 = 0x1064;
+pub const ACH4_TXBD_IDX: u32 = 0x1068;
+pub const ACH5_TXBD_IDX: u32 = 0x106c;
+pub const ACH6_TXBD_IDX: u32 = 0x1070;
+pub const ACH7_TXBD_IDX: u32 = 0x1074;
+pub const CH8_TXBD_IDX: u32 = 0x1078;
+pub const CH9_TXBD_IDX: u32 = 0x107c;
+pub const CH12_TXBD_IDX: u32 = 0x1080;
+pub const CH10_TXBD_IDX: u32 = 0x137c;
+pub const CH11_TXBD_IDX: u32 = 0x1380;
+pub const TXBD_HW_IDX_MASK: u32 = 0x0fff_0000;
+pub const TXBD_HOST_IDX_MASK: u32 = 0x0000_0fff;
+
+/// `R_AX_DBI_FLAG` and its fields, and `R_AX_DBI_WDATA` and
+/// `R_AX_DBI_RDATA`: configuration space reached through BAR2.
+pub const DBI_FLAG: u32 = 0x1090;
+pub const DBI_RFLAG: u32 = 1 << 17;
+pub const DBI_WFLAG: u32 = 1 << 16;
+pub const DBI_WREN_MSK: u32 = 0x0000_f000;
+pub const DBI_ADDR_MSK: u32 = 0x0000_0ffc;
+pub const DBI_2LSB: u32 = 0x0000_0003;
+pub const DBI_WDATA: u32 = 0x1094;
+pub const DBI_RDATA: u32 = 0x1098;
+/// `R_AX_MDIO_CFG` and its fields, and `R_AX_MDIO_WDATA` and
+/// `R_AX_MDIO_RDATA`: the PCIe PHY's registers, 16 bits each.
+pub const MDIO_CFG: u32 = 0x10a0;
+pub const MDIO_PHY_ADDR_MASK: u32 = 0x0000_3000;
+pub const MDIO_RFLAG: u16 = 1 << 9;
+pub const MDIO_WFLAG: u16 = 1 << 8;
+pub const MDIO_WDATA: u32 = 0x10a4;
+pub const MDIO_RDATA: u32 = 0x10a6;
+
+/// The BD base registers (`R_AX_*_RXBD_DESA_L`, `R_AX_*_TXBD_DESA_L`), each
+/// followed by its upper half (`_DESA_H`).
+pub const RXQ_RXBD_DESA_L: u32 = 0x1100;
+pub const RXQ_RXBD_DESA_H: u32 = 0x1104;
+pub const RPQ_RXBD_DESA_L: u32 = 0x1108;
+pub const RPQ_RXBD_DESA_H: u32 = 0x110c;
+pub const ACH0_TXBD_DESA_L: u32 = 0x1110;
+pub const ACH0_TXBD_DESA_H: u32 = 0x1114;
+pub const ACH1_TXBD_DESA_L: u32 = 0x1118;
+pub const ACH1_TXBD_DESA_H: u32 = 0x111c;
+pub const ACH2_TXBD_DESA_L: u32 = 0x1120;
+pub const ACH2_TXBD_DESA_H: u32 = 0x1124;
+pub const ACH3_TXBD_DESA_L: u32 = 0x1128;
+pub const ACH3_TXBD_DESA_H: u32 = 0x112c;
+pub const ACH4_TXBD_DESA_L: u32 = 0x1130;
+pub const ACH4_TXBD_DESA_H: u32 = 0x1134;
+pub const ACH5_TXBD_DESA_L: u32 = 0x1138;
+pub const ACH5_TXBD_DESA_H: u32 = 0x113c;
+pub const ACH6_TXBD_DESA_L: u32 = 0x1140;
+pub const ACH6_TXBD_DESA_H: u32 = 0x1144;
+pub const ACH7_TXBD_DESA_L: u32 = 0x1148;
+pub const ACH7_TXBD_DESA_H: u32 = 0x114c;
+pub const CH8_TXBD_DESA_L: u32 = 0x1150;
+pub const CH8_TXBD_DESA_H: u32 = 0x1154;
+pub const CH9_TXBD_DESA_L: u32 = 0x1158;
+pub const CH9_TXBD_DESA_H: u32 = 0x115c;
+pub const CH12_TXBD_DESA_L: u32 = 0x1160;
+pub const CH12_TXBD_DESA_H: u32 = 0x1164;
+pub const CH10_TXBD_DESA_L: u32 = 0x1358;
+pub const CH10_TXBD_DESA_H: u32 = 0x135c;
+pub const CH11_TXBD_DESA_L: u32 = 0x1360;
+pub const CH11_TXBD_DESA_H: u32 = 0x1364;
+
+/// `R_AX_PCIE_DBG_CTRL` and the bits `rtw89_pci_set_dbg` sets in it and in
+/// `R_AX_PCIE_EXP_CTRL`: `B_AX_ASFF_FULL_NO_STK` and `B_AX_EN_STUCK_DBG`.
+pub const PCIE_DBG_CTRL: u32 = 0x11c0;
+pub const ASFF_FULL_NO_STK: u32 = 1 << 1;
+pub const EN_STUCK_DBG: u32 = 1 << 0;
+/// `R_AX_LBC_WATCHDOG` and its fields.
+pub const LBC_WATCHDOG: u32 = 0x11d8;
+pub const LBC_TIMER: u32 = 0x0000_00f0;
+pub const LBC_FLAG: u32 = 1 << 1;
+pub const LBC_EN: u32 = 1 << 0;
+
+/// The TX channels' BD RAM controls (`R_AX_*_BDRAM_CTRL`) and their fields.
+pub const ACH0_BDRAM_CTRL: u32 = 0x1200;
+pub const ACH1_BDRAM_CTRL: u32 = 0x1204;
+pub const ACH2_BDRAM_CTRL: u32 = 0x1208;
+pub const ACH3_BDRAM_CTRL: u32 = 0x120c;
+pub const ACH4_BDRAM_CTRL: u32 = 0x1210;
+pub const ACH5_BDRAM_CTRL: u32 = 0x1214;
+pub const ACH6_BDRAM_CTRL: u32 = 0x1218;
+pub const ACH7_BDRAM_CTRL: u32 = 0x121c;
+pub const CH8_BDRAM_CTRL: u32 = 0x1220;
+pub const CH9_BDRAM_CTRL: u32 = 0x1224;
+pub const CH12_BDRAM_CTRL: u32 = 0x1228;
+pub const CH10_BDRAM_CTRL: u32 = 0x1320;
+pub const CH11_BDRAM_CTRL: u32 = 0x1324;
+pub const BDRAM_SIDX_MASK: u32 = 0x0000_00ff;
+pub const BDRAM_MAX_MASK: u32 = 0x0000_ff00;
+pub const BDRAM_MIN_MASK: u32 = 0x00ff_0000;
+
+/// `R_AX_PCIE_EXP_CTRL` (`rtw8852b_pci_info.exp_ctrl_reg`), its tag count
+/// (`max_tag_num_mask`, `B_AX_MAX_TAG_NUM`) and `B_AX_SIC_EN_FORCE_CLKREQ`.
+pub const PCIE_EXP_CTRL: u32 = 0x13f0;
+pub const MAX_TAG_NUM: u32 = 0x0007_0000;
+pub const SIC_EN_FORCE_CLKREQ: u32 = 1 << 4;
+
 /// `R_AX_HCI_FUNC_EN` (`rtw8852b_chip_info.hci_func_en_addr`) and its DMA
 /// enables, `B_AX_HCI_RXDMA_EN` and `B_AX_HCI_TXDMA_EN`.
 pub const HCI_FUNC_EN: u32 = 0x8380;
@@ -208,6 +407,10 @@ pub const DMAC_CLK_EN: u32 = 0x8404;
 pub const DLE_WDE_CLK_EN: u32 = 1 << 26;
 pub const DLE_PLE_CLK_EN: u32 = 1 << 23;
 pub const DISPATCHER_CLK_EN: u32 = 1 << 18;
+
+/// `R_AX_TX_ADDRESS_INFO_MODE_SETTING` and `B_AX_HOST_ADDR_INFO_8B_SEL`.
+pub const TX_ADDRESS_INFO_MODE_SETTING: u32 = 0x8810;
+pub const HOST_ADDR_INFO_8B_SEL: u32 = 1 << 0;
 
 /// `R_AX_HCI_FC_CTRL` (`rtw8852b_page_regs.hci_fc_ctrl`) and the fields the
 /// H2C-only flow control sets: `B_AX_HCI_FC_CH12_FULL_COND_MASK`,
@@ -270,6 +473,10 @@ pub const PLE_Q_MGN_INI_RDY: u32 = 1 << 1;
 pub const PLE_BUF_MGN_INI_RDY: u32 = 1 << 0;
 pub const PLE_MGN_INI_RDY: u32 = PLE_Q_MGN_INI_RDY | PLE_BUF_MGN_INI_RDY;
 
+/// `R_AX_PKTIN_SETTING` and `B_AX_WD_ADDR_INFO_LENGTH`.
+pub const PKTIN_SETTING: u32 = 0x9a00;
+pub const WD_ADDR_INFO_LENGTH: u32 = 1 << 1;
+
 /// mac.h's DLE page sizes (`RTW89_WDE_PG_*`, `RTW89_PLE_PG_*`), their page
 /// selections (`S_AX_WDE_PAGE_SEL_*`, `S_AX_PLE_PAGE_SEL_*`), and
 /// `DLE_BOUND_UNIT`, the PLE start bound's unit in bytes.
@@ -319,3 +526,29 @@ pub const XTAL_SI_PON_EI: u8 = 1 << 1;
 pub const XTAL_SI_PON_WEI: u8 = 1 << 0;
 pub const XTAL_SI_SRAM_CTRL: u8 = 0xa1;
 pub const XTAL_SI_SRAM_DIS: u8 = 1 << 1;
+
+/// The PCIe PHY's MDIO pages (`MDIO_PG0_G1` to `MDIO_PG1_G2`): page 0 holds
+/// addresses below 0x20, page 1 the rest, one pair per link generation.
+pub const MDIO_PG0_G1: u16 = 0;
+pub const MDIO_PG1_G1: u16 = 1;
+pub const MDIO_PG0_G2: u16 = 2;
+pub const MDIO_PG1_G2: u16 = 3;
+/// `RAC_REG_REV2`, `BAC_CMU_EN_DLY_MASK` and `PCIE_DPHY_DLY_25US`.
+pub const RAC_REG_REV2: u8 = 0x1b;
+pub const BAC_CMU_EN_DLY_MASK: u16 = 0xf000;
+pub const PCIE_DPHY_DLY_25US: u16 = 0x1;
+/// `RAC_REG_FLD_0`, `BAC_AUTOK_N_MASK` and `PCIE_AUTOK_4`.
+pub const RAC_REG_FLD_0: u8 = 0x1d;
+pub const BAC_AUTOK_N_MASK: u16 = 0x000c;
+pub const PCIE_AUTOK_4: u16 = 0x3;
+/// `RAC_CTRL_PPR_V1` and `B_AX_CALIB_EN`.
+pub const RAC_CTRL_PPR_V1: u8 = 0x30;
+pub const CALIB_EN: u16 = 1 << 13;
+
+/// Configuration space offsets: `RTW89_PCIE_PHY_RATE` (the link status's
+/// low byte) with `RTW89_PCIE_PHY_RATE_MASK`, and `RTW89_PCIE_L1_CTRL` with
+/// `RTW89_PCIE_BIT_L1`.
+pub const PCIE_PHY_RATE: u16 = 0x82;
+pub const PCIE_PHY_RATE_MASK: u8 = 0x03;
+pub const PCIE_L1_CTRL: u16 = 0x0719;
+pub const PCIE_BIT_L1: u8 = 1 << 3;

@@ -7,12 +7,15 @@
 //! register map, firmware interface or DMA layout.
 //!
 //! Register access ([`io`]), RTL8852B's RF calibration tables
-//! ([`rtw8852b::rfk`]), its power sequence ([`power`]) and its DMAC's
-//! pre-init with the firmware download's quota ([`dle`]) are the first
-//! slices. Powering the chip on and pre-initializing its DMAC prove that
-//! its polled bits answered, nothing about its firmware or radio.
+//! ([`rtw8852b::rfk`]), its power sequence ([`power`]), its DMAC's pre-init
+//! with the firmware download's quota ([`dle`]) and its PCIe pre-init with
+//! the DMA rings ([`pci`]) are the first slices. Powering the chip on and
+//! pre-initializing its DMAC and PCIe DMA prove that its polled bits
+//! answered and the ring addresses were written, nothing about its firmware
+//! or radio.
 pub mod dle;
 pub mod io;
+pub mod pci;
 pub mod power;
 pub mod registers;
 pub mod rtw8852b;
