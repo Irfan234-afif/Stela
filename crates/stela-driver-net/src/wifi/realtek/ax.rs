@@ -17,7 +17,10 @@
 //! mailbox ([`h2creg`]) are the first slices, and [`bootstrap`] composes
 //! them in rtw89's probe order into one power cycle, which [`attach`]
 //! runs for a boot and ends with the chip cold again. The full MAC init
-//! ([`mac`]) is the first slice after that power cycle's firmware runs. Powering the chip on,
+//! ([`mac`]) is the first slice after that power cycle's firmware runs, and
+//! the BB, RF, TX power and regulation tables rtw89 takes from the
+//! firmware's elements ([`elements`]) are the first its radio needs.
+//! Powering the chip on,
 //! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
 //! its polled bits answered, the ring addresses were written and the command
 //! BDs were filled; a download that returns proves that the firmware
@@ -30,6 +33,7 @@ pub mod bootstrap;
 pub mod c2h;
 pub mod dle;
 pub mod efuse;
+pub mod elements;
 pub mod features;
 pub mod fwdl;
 pub mod h2c;

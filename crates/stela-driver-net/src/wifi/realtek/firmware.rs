@@ -278,14 +278,20 @@ pub struct Rtw89<'a> {
     pub entries: Vec<Entry<'a>>,
     pub selected: usize,
     pub image: AxImage<'a>,
-    /// Complete trailing firmware elements, including tables not yet consumed.
+    /// `rtw89_mfw_get_size`: where the container's last entry ends, which
+    /// is where `rtw89_fw_recognize_elements` starts looking for elements
+    /// (aligned to 16 from the file's start); 0 for a legacy single image,
+    /// which has none.
+    pub elements_offset: usize,
+    /// The file from [`Self::elements_offset`] on: the firmware elements
+    /// [`super::ax::elements`] recognizes. Empty for a legacy image.
     pub trailing_elements: &'a [u8],
 }
 impl<'a> Rtw89<'a> {
     pub fn parse(data: &'a [u8], observed_cut: u8) -> Result<Self, ParseError> {
         image_limit(data)?;
         let mut entries = Vec::new();
-        let (container_header, end) = if data.first() == Some(&0xff) {
+        let (container_header, elements_offset, end) = if data.first() == Some(&0xff) {
             let container_header = Some(bytes(data, 0, MFW_HEADER)?);
             let count = usize::from(data[1]);
             if count == 0 {
@@ -293,7 +299,6 @@ impl<'a> Rtw89<'a> {
             }
             let table_end = MFW_HEADER + count * MFW_ENTRY;
             bytes(data, 0, table_end)?;
-            let mut max_end = table_end;
             for index in 0..count {
                 let descriptor = bytes(data, MFW_HEADER + index * MFW_ENTRY, MFW_ENTRY)?;
                 let offset = le32(descriptor, 4)? as usize;
@@ -302,7 +307,6 @@ impl<'a> Rtw89<'a> {
                     return Err(ParseError::Length);
                 }
                 let content = bytes(data, offset, length)?;
-                max_end = max_end.max(offset + length);
                 entries.push(Entry {
                     descriptor,
                     cut: descriptor[0],
@@ -312,7 +316,10 @@ impl<'a> Rtw89<'a> {
                     data: content,
                 });
             }
-            (container_header, max_end)
+            // rtw89_mfw_get_size: the last entry's shift plus its size,
+            // not whichever entry reaches furthest.
+            let end = entries.last().map_or(table_end, |entry| entry.range.end);
+            (container_header, end, end)
         } else {
             // The donor permits a legacy single image for normal type only.
             entries.push(Entry {
@@ -323,7 +330,7 @@ impl<'a> Rtw89<'a> {
                 range: 0..data.len(),
                 data,
             });
-            (None, data.len())
+            (None, 0, data.len())
         };
         let best = |kind| {
             let mut selected = None;
@@ -348,6 +355,7 @@ impl<'a> Rtw89<'a> {
             entries,
             selected,
             image,
+            elements_offset,
             trailing_elements: &data[end..],
         })
     }

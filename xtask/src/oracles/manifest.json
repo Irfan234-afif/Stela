@@ -2514,6 +2514,17 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "pinned_firmware_elements_build_the_tables_linux_builds",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/elements/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES",
+      "STELA_RTW89_ELEMENTS_ORACLE"
+    ],
+    "reason": "requires the pinned rtw8852b_fw-2.bin and the unchanged pinned rtw89 firmware element C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",
