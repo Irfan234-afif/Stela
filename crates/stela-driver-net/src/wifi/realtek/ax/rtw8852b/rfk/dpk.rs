@@ -17,6 +17,12 @@
 //! [`DpkInfo::oneshot_timeouts`] and the calibration goes on, as rtw89 logs
 //! it and goes on. That the one-shots reported and the AGC loop ended is
 //! all a return proves; nothing here judges the predistortion learned.
+//!
+//! [`dpk_track`] is `rtw8852b_dpk_track` with `_dpk_track`, which
+//! `rtw89_track_work` runs every two seconds through RTL8852B's
+//! `rfk_track`: each path's power scaling factor moved by how far the
+//! averaged thermal meter has drifted from the one its result was learned
+//! at, and in TSSI mode by the TX AGC the TSSI loop settled on.
 use super::{
     Band, Bandwidth, Channel, RF_PATH_NUM, Scheduler, State, kpath, paused, pmac::sign_extend32,
     poll, reg::*, rfk_backup_bb_reg, rfk_backup_rf_reg, rfk_restore_bb_reg, rfk_restore_rf_reg,
@@ -911,6 +917,70 @@ fn dpk_cal_select<I: Io + ?Sized>(
         rfk_restore_rf_reg(io, &backup_rf_val[p], path)?;
         if state.is_tssi_mode[p] {
             dpk_tssi_pause(io, path, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// `rtw8852b_dpk_track` (`_dpk_track`) for the averaged thermal meter
+/// `thermal` of paths A and B (`ewma_thermal_read(&phystat.avg_thermal[i])`,
+/// [`crate::wifi::realtek::ax::dynamic::Thermal::read`]): each path's
+/// result in use has its power scaling factor rewritten for the drift since
+/// it was learned, 1.5 steps per thermal step on 2 GHz and 2.5 on 5 GHz,
+/// unless tracking is disabled (`R_DPK_TRK`) or the path's TX AGC reads 0.
+/// In TSSI mode the TX AGC offset and the BB TX AGC against its target
+/// count too; the offset is kept from one path to the next when the next
+/// has no TX AGC or thermal reading, as rtw89 keeps it.
+pub fn dpk_track<I: Io + ?Sized>(
+    io: &mut I,
+    state: &State,
+    thermal: [u8; DPK_RF_PATH],
+) -> Result<(), Error> {
+    let dpk = &state.dpk;
+    let mut delta_ther = [0i8; DPK_RF_PATH];
+    let mut ini_diff = 0i8;
+    for path in 0..RF_PATH_NUM {
+        let p = usize::from(path);
+        let kidx = dpk.cur_idx[p];
+        let bp = &dpk.bp[p][usize::from(kidx)];
+        let cur_ther = thermal[p];
+        if bp.ch != 0 && cur_ther != 0 {
+            delta_ther[p] = (i32::from(bp.ther_dpk) - i32::from(cur_ther)) as i8;
+        }
+        delta_ther[p] = if bp.band == Band::Ghz2 as u8 {
+            (i32::from(delta_ther[p]) * 3 / 2) as i8
+        } else {
+            (i32::from(delta_ther[p]) * 5 / 2) as i8
+        };
+        let txagc_bb_reg = R_TXAGC_BB + (u32::from(path) << 13);
+        let txagc_rf = io.phy_read32_mask(txagc_bb_reg, 0x0000_003f)? as u8;
+        let pwsf = if state.is_tssi_mode[p] {
+            // Read for rtw89's log line.
+            io.read_rf(path, RR_TXA, RR_TXA_TRK)?;
+            let txagc_bb = io.phy_read32_mask(txagc_bb_reg, MASKBYTE2)? as i8;
+            let txagc_bb_tp =
+                io.phy_read32_mask(R_TXAGC_TP + (u32::from(path) << 13), B_TXAGC_TP)? as i8;
+            let mut txagc_ofst = io.phy_read32_mask(txagc_bb_reg, MASKBYTE3)? as i8;
+            // HW TX AGC offset mode.
+            if io.phy_read32_mask(R_DPD_COM + (u32::from(path) << 8), B_DPD_COM_OF)? == 0x1 {
+                txagc_ofst = 0;
+            }
+            if txagc_rf != 0 && cur_ther != 0 {
+                ini_diff = (i32::from(txagc_ofst) + i32::from(delta_ther[p])) as i8;
+            }
+            let txdpd = io.phy_read32_mask(R_P0_TXDPD + (u32::from(path) << 13), B_P0_TXDPD)?;
+            let mut pwsf = i32::from(bp.pwsf) + i32::from(ini_diff);
+            if txdpd == 0x0 {
+                pwsf += i32::from(txagc_bb_tp) - i32::from(txagc_bb);
+            }
+            pwsf as u16
+        } else {
+            ((i32::from(bp.pwsf) + i32::from(delta_ther[p])) & 0x1ff) as u16
+        };
+        if io.phy_read32_mask(R_DPK_TRK, B_DPK_TRK_DIS)? == 0 && txagc_rf != 0 {
+            let bnd = R_DPD_BND + (u32::from(path) << 8) + (u32::from(kidx) << 2);
+            io.phy_write32_mask(bnd, B_DPD_BND_0, pwsf.into())?;
+            io.phy_write32_mask(bnd, B_DPD_BND_1, pwsf.into())?;
         }
     }
     Ok(())

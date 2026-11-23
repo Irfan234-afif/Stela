@@ -1670,3 +1670,202 @@ fn a_scan_start_in_tssi_mode_and_a_refused_access_are_left_alone() {
     );
     assert!(!io.log.iter().any(|r| r[0] == 12));
 }
+
+/// The DPK tracking oracle's records, from a segment.
+fn track_records(segment: &[u8]) -> Vec<[u32; 3]> {
+    segment
+        .chunks(12)
+        .map(|r| {
+            core::array::from_fn(|i| u32::from_le_bytes(r[4 * i..4 * i + 4].try_into().unwrap()))
+        })
+        .collect()
+}
+
+/// One DPK tracking case as the Rust side runs it, from the inputs the C
+/// segment records: the modes and tables in use (58), each result (59),
+/// and per period (60) its BAR2 words (63) and RR_TM words (65).
+fn replay_dpk_track(c: &[[u32; 3]]) -> Vec<u8> {
+    use crate::wifi::realtek::ax::dynamic::Thermal;
+
+    let mut io = Model::new(Fill::Pattern, NONE);
+    let mut state = State::default();
+    let [tag, modes, zero] = c[0];
+    assert_eq!(tag, 58);
+    io.mark(58, modes, zero);
+    state.is_tssi_mode = [modes & 1 != 0, modes & 2 != 0];
+    state.dpk.cur_idx = [(modes >> 8) as u8, (modes >> 16) as u8];
+    for &[tag, a, b] in &c[1..5] {
+        assert_eq!(tag, 59);
+        let bp = &mut state.dpk.bp[(a >> 8 & 0xff) as usize][(a & 0xff) as usize];
+        bp.band = (a >> 16) as u8;
+        bp.ch = (a >> 24) as u8;
+        bp.ther_dpk = b as u8;
+        bp.pwsf = (b >> 16) as u16;
+        io.mark(59, a, b);
+    }
+    let mut thermal = Thermal::default();
+    let mut at = 5;
+    while at < c.len() {
+        if c[at][0] != 60 {
+            at += 1;
+            continue;
+        }
+        let n = c[at][1];
+        io.mark(60, n, 0);
+        at += 1;
+        while c[at][0] == 63 {
+            let [_, register, value] = c[at];
+            io.set(CR + register, 4, value);
+            io.mark(63, register, value);
+            at += 1;
+        }
+        while c[at][0] == 65 {
+            let [_, path, value] = c[at];
+            io.rf[path as usize][RR_TM as usize] = value;
+            io.mark(65, path, value);
+            at += 1;
+        }
+        io.mark(50, 1, n);
+        thermal.update(&mut io, state.is_tssi_mode).unwrap();
+        let [a, b] = thermal.read();
+        io.mark(
+            66,
+            u32::from(a) | u32::from(b) << 8 | u32::from(thermal.last_thermal_max) << 16,
+            0,
+        );
+        io.mark(50, 2, n);
+        track(&mut io, &state, thermal.read()).unwrap();
+    }
+    io.encode()
+}
+
+#[test]
+#[ignore = "oracle: STELA_RTW89_RFK_ORACLE"]
+fn dpk_track_traces_match_unchanged_c() {
+    let directory = std::path::PathBuf::from(std::env::var("STELA_RTW89_RFK_ORACLE").unwrap());
+    let trace = std::fs::read(directory.join("dpk_track_trace.bin")).unwrap();
+    let mut offset = 0;
+    let mut cases = 0;
+    while offset < trace.len() {
+        let expected = segment(&trace, &mut offset);
+        let replayed = replay_dpk_track(&track_records(expected));
+        if expected != replayed.as_slice() {
+            let first = expected
+                .chunks(12)
+                .zip(replayed.chunks(12))
+                .position(|(a, b)| a != b);
+            let record = |bytes: &[u8]| {
+                first
+                    .and_then(|at| bytes.chunks(12).nth(at))
+                    .map(track_records)
+            };
+            panic!(
+                "case {cases}: {} bytes against {}, first record apart {first:?}: C {:x?}, \
+                 Rust {:x?}",
+                expected.len(),
+                replayed.len(),
+                record(expected),
+                record(&replayed)
+            );
+        }
+        cases += 1;
+    }
+    assert_eq!(cases, 5);
+}
+
+/// A state whose results in use (table 0) were learned at thermal 0x20 with
+/// pwsf 0x100 on `band`, and a model whose TX AGC reads `txagc_rf` on both
+/// paths, tracking enabled.
+fn track_setup(band: Band, tssi: bool, txagc_rf: u32) -> (Model, State) {
+    let mut io = Model::new(Fill::Zeros, NONE);
+    let mut state = State {
+        is_tssi_mode: [tssi; 2],
+        ..State::default()
+    };
+    for path in 0..2 {
+        state.dpk.bp[path][0] = dpk::DpkBkupPara {
+            band: band as u8,
+            ch: 36,
+            ther_dpk: 0x20,
+            pwsf: 0x100,
+            ..dpk::DpkBkupPara::default()
+        };
+        io.set(CR + R_TXAGC_BB + ((path as u32) << 13), 4, txagc_rf);
+    }
+    (io, state)
+}
+
+fn bnd(io: &Model, path: u32, kidx: u32) -> (u32, u32) {
+    let word = io.get(CR + R_DPD_BND + (path << 8) + (kidx << 2), 4);
+    (field(word, B_DPD_BND_0), field(word, B_DPD_BND_1))
+}
+
+#[test]
+fn dpk_track_moves_pwsf_by_the_thermal_drift_per_band() {
+    // 2 GHz: 1.5 per step, 4 steps cooler than learned: +6.
+    let (mut io, state) = track_setup(Band::Ghz2, false, 0x12);
+    track(&mut io, &state, [0x1c, 0x1c]).unwrap();
+    assert_eq!(bnd(&io, 0, 0), (0x106, 0x106));
+    assert_eq!(bnd(&io, 1, 0), (0x106, 0x106));
+    // 5 GHz: 2.5 per step, 3 steps hotter: -7 (truncated toward 0).
+    let (mut io, state) = track_setup(Band::Ghz5, false, 0x12);
+    track(&mut io, &state, [0x23, 0x20]).unwrap();
+    assert_eq!(bnd(&io, 0, 0), (0x0f9, 0x0f9));
+    assert_eq!(bnd(&io, 1, 0), (0x100, 0x100));
+    // No reading yet: no drift.
+    let (mut io, state) = track_setup(Band::Ghz5, false, 0x12);
+    track(&mut io, &state, [0, 0]).unwrap();
+    assert_eq!(bnd(&io, 0, 0), (0x100, 0x100));
+}
+
+#[test]
+fn dpk_track_writes_nothing_with_tracking_disabled_or_no_tx_agc() {
+    let (mut io, state) = track_setup(Band::Ghz2, false, 0);
+    track(&mut io, &state, [0x10, 0x10]).unwrap();
+    assert!(!io.log.iter().any(|r| r[0] == 8));
+    let (mut io, state) = track_setup(Band::Ghz2, false, 0x12);
+    io.set(CR + R_DPK_TRK, 4, B_DPK_TRK_DIS);
+    track(&mut io, &state, [0x10, 0x10]).unwrap();
+    assert!(!io.log.iter().any(|r| r[0] == 8));
+}
+
+#[test]
+fn dpk_track_in_tssi_mode_adds_the_agc_offset_and_the_bb_agc_against_its_target() {
+    // Offset byte -3, BB byte 0x10 against target 2, drift +6 (2 GHz).
+    let word = 0xfd10_0012u32;
+    let (mut io, state) = track_setup(Band::Ghz2, true, word);
+    io.set(CR + R_TXAGC_TP, 4, 2);
+    io.set(CR + R_TXAGC_TP + (1 << 13), 4, 2);
+    track(&mut io, &state, [0x1c, 0x1c]).unwrap();
+    // R_P0_TXDPD 0: 0x100 + 2 - 0x10 + (-3 + 6).
+    assert_eq!(bnd(&io, 0, 0), (0x0f5, 0x0f5));
+    // The HW offset mode zeroes the offset; R_P0_TXDPD set leaves the BB
+    // AGC out.
+    let (mut io, state) = track_setup(Band::Ghz2, true, word);
+    io.set(CR + R_DPD_COM, 4, B_DPD_COM_OF);
+    io.set(CR + R_P0_TXDPD, 4, 0x1000_0000);
+    track(&mut io, &state, [0x1c, 0x1c]).unwrap();
+    assert_eq!(bnd(&io, 0, 0).0, 0x106);
+}
+
+#[test]
+fn the_thermal_average_leaves_out_a_zero_reading_and_reads_tssi_reports_in_tssi_mode() {
+    use crate::wifi::realtek::ax::dynamic::Thermal;
+
+    let mut io = Model::new(Fill::Zeros, NONE);
+    io.rf[0][RR_TM as usize] = 0x20 << 1;
+    io.rf[1][RR_TM as usize] = 0;
+    let mut thermal = Thermal::init(&mut io, [false, false]).unwrap();
+    assert_eq!(
+        (thermal.read(), thermal.last_thermal_max),
+        ([0x20, 0], 0x20)
+    );
+    // Triggered through RR_TM_TRI, then read 200 us later.
+    assert!(io.log.contains(&[9, 0, 200]));
+    io.set(CR + 0x1c10, 4, 0x2c << 24);
+    io.set(CR + 0x3c10, 4, 0x18 << 24);
+    thermal.update(&mut io, [true, true]).unwrap();
+    // (0x20 * 3 + 0x2c) / 4 on path A; path B's first reading taken whole.
+    assert_eq!(thermal.read(), [0x23, 0x18]);
+    assert_eq!(thermal.last_thermal_max, 0x2c);
+}

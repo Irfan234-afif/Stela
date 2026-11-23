@@ -23,19 +23,25 @@
 //!   `rtw89_phy_cfo_parse`: the CFO the PPDU statuses report
 //!   ([`super::rxdesc::PhyPpdu::cfo`]) averaged, the crystal cap moved
 //!   through XTAL SI toward it and the rest compensated digitally;
-//! - [`Ewma`]: the kernel's `DECLARE_EWMA`, with the average rtw89 keeps of
-//!   a station's RSSI by it ([`RssiAverage`], what `rtw89_core_rx_stats`
+//! - [`Ewma`]: the kernel's `DECLARE_EWMA`, with the averages rtw89 keeps
+//!   by it: a station's RSSI ([`RssiAverage`], what `rtw89_core_rx_stats`
 //!   adds each A1-matched PPDU's `rssi_avg` to), whose lowest is DIG's
-//!   [`Link::rssi_min`].
+//!   [`Link::rssi_min`], and each path's thermal meter ([`Thermal`],
+//!   `rtw89_phy_stat_init` and `rtw89_phy_stat_thermal_update` with
+//!   RTL8852B's `__rtw8852bx_get_thermal`), which DPK tracking reads.
 //!
 //! [`Dynamic`] holds them as `rtwdev` does. [`Dynamic::init`] runs what
 //! `rtw89_phy_dm_init` runs of them, in its order: the environment monitor,
 //! the PHY status bitmaps, DIG, CFO; the caller runs it where rtw89 runs
 //! `rtw89_phy_dm_init`, after the BB and RF tables and before the NCTL
-//! table and the RF calibrations. Every two seconds, unless scanning
+//! table and the RF calibrations, with [`Thermal::init`] (its
+//! `rtw89_phy_stat_init`) first. Every two seconds, unless scanning
 //! (`rtw89_track_work` returns before them then), the caller runs, in
-//! `rtw89_track_work`'s order: [`Dynamic::env_monitor_track`],
-//! [`Dynamic::dig`], the chip's RF tracking, then [`Dynamic::cfo_track`].
+//! `rtw89_track_work`'s order: [`Thermal::update`] (where
+//! `rtw89_phy_stat_track` starts), [`Dynamic::env_monitor_track`],
+//! [`Dynamic::dig`], the chip's RF tracking
+//! ([`super::rtw8852b::rfk::track`] with [`Thermal::read`]), then
+//! [`Dynamic::cfo_track`].
 //! What rtw89 takes from mac80211 and its own
 //! bookkeeping is the caller's and is passed in: the associated stations
 //! and their lowest RSSI average ([`Link`]), the channel, and the traffic
@@ -77,7 +83,10 @@
 use super::{
     io::{Error, Io, Registers},
     registers::{CHIP_CAV, DCFO_OPT, MASKDWORD, PWR_UL_CTRL2},
-    rtw8852b::rfk::{Band, Bandwidth, Channel},
+    rtw8852b::rfk::{
+        Band, Bandwidth, Channel, RF_PATH_NUM,
+        reg::{RR_TM, RR_TM_TRI, RR_TM_VAL},
+    },
 };
 
 #[cfg(test)]
@@ -235,6 +244,65 @@ impl<const PRECISION: u32, const WEIGHT_RCP: u64> Ewma<PRECISION, WEIGHT_RCP> {
 pub type RssiAverage = Ewma<10, 16>;
 /// `DECLARE_EWMA(thermal, 4, 4)`: `phystat.avg_thermal`.
 pub type ThermalAverage = Ewma<4, 4>;
+
+/// `__rtw8852bx_get_thermal`: path `path`'s thermal meter, from the TSSI
+/// tracking's report in TSSI mode, otherwise triggered through RF `RR_TM`
+/// (set, cleared, set) and read 200 us later.
+pub fn get_thermal<I: Io + ?Sized>(io: &mut I, path: u8, tssi_mode: bool) -> Result<u8, Error> {
+    if tssi_mode {
+        let address = 0x1c10 + (u32::from(path) << 13);
+        return io.phy_read32_mask(address, 0x3f00_0000).map(|v| v as u8);
+    }
+    io.write_rf(path, RR_TM, RR_TM_TRI, 0x1)?;
+    io.write_rf(path, RR_TM, RR_TM_TRI, 0x0)?;
+    io.write_rf(path, RR_TM, RR_TM_TRI, 0x1)?;
+    // fsleep(200)
+    io.delay_us(200);
+    io.read_rf(path, RR_TM, RR_TM_VAL).map(|v| v as u8)
+}
+
+/// `rtwdev->phystat`'s thermal part: each path's averaged thermal meter
+/// and the highest reading of the last update.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Thermal {
+    pub avg_thermal: [ThermalAverage; RF_PATH_NUM as usize],
+    pub last_thermal_max: u8,
+}
+
+impl Thermal {
+    /// `rtw89_phy_stat_init`'s thermal part: the averages cleared, then a
+    /// first reading. `tssi_mode` is `rtwdev->is_tssi_mode` per path.
+    pub fn init<I: Io + ?Sized>(io: &mut I, tssi_mode: [bool; 2]) -> Result<Self, Error> {
+        let mut thermal = Self::default();
+        thermal.update(io, tssi_mode)?;
+        Ok(thermal)
+    }
+
+    /// `rtw89_phy_stat_thermal_update`: each path read, a reading of 0 left
+    /// out of its average.
+    pub fn update<I: Io + ?Sized>(
+        &mut self,
+        io: &mut I,
+        tssi_mode: [bool; 2],
+    ) -> Result<(), Error> {
+        let mut th_max = 0;
+        for path in 0..RF_PATH_NUM {
+            let p = usize::from(path);
+            let th = get_thermal(io, path, tssi_mode[p])?;
+            if th != 0 {
+                self.avg_thermal[p].add(th.into());
+            }
+            th_max = th_max.max(th);
+        }
+        self.last_thermal_max = th_max;
+        Ok(())
+    }
+
+    /// `ewma_thermal_read` of each path, as the `u8` DPK tracking keeps.
+    pub fn read(&self) -> [u8; 2] {
+        self.avg_thermal.map(|average| average.read() as u8)
+    }
+}
 
 /// `enum rtw89_ifs_clm_application`, the two rtw89 reaches outside
 /// debugfs.

@@ -79,6 +79,23 @@ per payload word. After the state's and IQK's records come rfk_mcc (40),
 the DPK flags (43), per path and table the DPK result (41) and sync (42),
 per path, band and word the TSSI alignment (44), and per path, channel
 index and word the alignment kept by channel (45), for the channels kept.
+
+dpk_track_trace.bin holds dpk_track_cases(), each over patterned memory:
+rtw8852b.c's rtw8852b_rfk_track (rtw8852b_dpk_track with _dpk_track), run
+every two seconds after phy.c's rtw89_phy_stat_thermal_update with
+rtw8852b_common.c's __rtw8852bx_get_thermal, all unchanged; rtw8852b_chip_ops'
+rfk_track and get_thermal and rtw8852bx_info's get_thermal are checked, and
+rtw89_chip_get_thermal stands for the dispatch. The kernel's EWMA
+(DECLARE_EWMA(thermal, 4, 4), include/linux/average.h, which the reference
+tree lacks) is written in the harness. Each case scripts the DPK results in
+use (per path and table: channel, band, thermal and power scaling factor;
+the table in use) and the TSSI mode of each path; each period puts words in
+BAR2 (per path R_TXAGC_BB, R_TXAGC_TP, R_DPD_COM, R_P0_TXDPD and the TSSI
+thermal report at 0x1c10, then R_DPK_TRK) and RF RR_TM's word per path. A
+segment records the inputs (58 the modes and tables in use, 59 per path and
+table the result; per period 60, 63 per word, 65 per path's RR_TM), then,
+in the form above, the thermal update (marker 50, 1), the averages read and
+the highest reading (66), and the tracking (marker 50, 2).
 """
 import hashlib
 import json
@@ -104,6 +121,88 @@ TSSI_DPK_ORDER = (
     'rtw8852b_rfk_scan start on channel 1; rtw8852b_tssi then scan start and end on channel 1')
 TRK_ROWS = ('row r, delta i: (r * 13 + i * 7) % 61 - 30; types 4 to 7 at rows 0, 3, 6 and 9, '
             '8 to 15 at 12 to 19')
+# The BB words each DPK tracking period puts in BAR2: per path R_TXAGC_BB,
+# R_TXAGC_TP, R_DPD_COM, R_P0_TXDPD and the TSSI thermal report, then
+# R_DPK_TRK.
+TRACK_REGS = [0x1c60, 0x1c04, 0x81c8, 0x58d4, 0x1c10,
+              0x3c60, 0x3c04, 0x82c8, 0x78d4, 0x3c10, 0x80f0]
+
+
+def track_period(seed, tm, rf=(0x12, 0x15), bb=(0x10, 0x0e), ofst=(0, 0), tp=(2, 3), of=(0, 0),
+                 txdpd=(1, 1), th=(0, 0), dis=0):
+    """One period: RR_TM's thermal per path, then per path the TX AGC
+    (R_TXAGC_BB's RF index, BB byte and offset byte), R_TXAGC_TP's target,
+    the HW TX AGC offset mode, R_P0_TXDPD and the TSSI thermal report, and
+    DPK tracking disabled or not."""
+    def h(k):
+        return (seed * 0x9e3779b1 + k * 0x7f4a7c15 + 0x2468ace) & 0xffffffff
+    words = []
+    for p in range(2):
+        words += [
+            (ofst[p] & 0xff) << 24 | (bb[p] & 0xff) << 16 | (h(p * 8) & 0xffc0) | rf[p],
+            (h(p * 8 + 1) & ~0x7) & 0xffffffff | tp[p],
+            (h(p * 8 + 2) & ~0x8000) & 0xffffffff | of[p] << 15,
+            (h(p * 8 + 3) & 0x0fffffff) | txdpd[p] << 28,
+            (h(p * 8 + 4) & ~0x3f000000) & 0xffffffff | th[p] << 24,
+        ]
+    words.append((h(20) & 0x7fffffff) | dis << 31)
+    rr_tm = [(h(21 + p) & 0xfff80) | tm[p] << 1 for p in range(2)]
+    return dict(words=words, rr_tm=rr_tm)
+
+
+def dpk_track_cases():
+    """(TSSI mode per path, table in use per path, per path and table
+    (channel, band, thermal, pwsf), periods)."""
+    s = iter(range(1, 1000))
+    cases = []
+    # 2 GHz, no TSSI: the thermal meter drifting either way, a period read
+    # 0 (left out of the average), tracking disabled, a path's TX AGC 0.
+    cases.append(((0, 0), (0, 0), (((1, 0, 0x20, 0x1f0), (36, 1, 0x10, 0x033)),
+                                   ((1, 0, 0x22, 0x005), (36, 1, 0x11, 0x044))), [
+        track_period(next(s), (0x20, 0x22)),
+        track_period(next(s), (0x24, 0x26)),
+        track_period(next(s), (0x2c, 0x30)),
+        track_period(next(s), (0x18, 0x10)),
+        track_period(next(s), (0, 0)),
+        track_period(next(s), (0x22, 0x24), dis=1),
+        track_period(next(s), (0x22, 0x24), rf=(0x12, 0)),
+    ]))
+    # 5 GHz, no TSSI, table 1 on path A; path B's result has no channel; a
+    # drift past what an s8 holds.
+    cases.append(((0, 0), (1, 0), (((1, 0, 0x20, 0x010), (36, 1, 0x30, 0x0c0)),
+                                   ((0, 1, 0x30, 0x050), (149, 1, 0x3f, 0x1ff))), [
+        track_period(next(s), (0x28, 0x30)),
+        track_period(next(s), (0x38, 0x2e)),
+        track_period(next(s), (0x01, 0x01)),
+        track_period(next(s), (0x01, 0x01)),
+    ]))
+    # 5 GHz, both paths in TSSI mode: the thermal from the TSSI report, the
+    # HW offset mode, R_P0_TXDPD 0 bringing in the BB TX AGC against its
+    # target, negative AGC bytes, then path A's TX AGC 0.
+    cases.append(((1, 1), (0, 1), (((149, 1, 0x25, 0x100), (36, 1, 0x20, 0x080)),
+                                   ((36, 1, 0x1a, 0x070), (149, 1, 0x27, 0x0fe))), [
+        track_period(next(s), (0x05, 0x06), th=(0x25, 0x27), ofst=(0xfd, 0x02)),
+        track_period(next(s), (0x05, 0x06), th=(0x2a, 0x21), ofst=(0xfd, 0x02), of=(1, 0)),
+        track_period(next(s), (0x05, 0x06), th=(0x2a, 0x21), ofst=(0x04, 0xf0), txdpd=(0, 0),
+                     bb=(0xf0, 0x12), tp=(7, 0)),
+        track_period(next(s), (0x05, 0x06), th=(0x30, 0x1c), ofst=(0x7f, 0x80), txdpd=(0, 9),
+                     bb=(0x80, 0x7f), tp=(5, 1), rf=(0, 0x20)),
+    ]))
+    # 2 GHz, both in TSSI mode, path B's thermal report always 0: path B
+    # takes the offset path A computed.
+    cases.append(((1, 1), (0, 0), (((6, 0, 0x1e, 0x120), (1, 0, 0x10, 0x010)),
+                                   ((6, 0, 0x1f, 0x0f0), (1, 0, 0x10, 0x010))), [
+        track_period(next(s), (0x05, 0x06), th=(0x1e, 0), ofst=(0x06, 0x30)),
+        track_period(next(s), (0x05, 0x06), th=(0x26, 0), ofst=(0xfa, 0x30), txdpd=(0, 1)),
+        track_period(next(s), (0x05, 0x06), th=(0x16, 0), ofst=(0x01, 0x30), rf=(0, 0x15)),
+    ]))
+    # Path A in TSSI mode, path B not, 2 GHz.
+    cases.append(((1, 0), (1, 1), (((1, 0, 0x20, 0x010), (11, 0, 0x22, 0x0aa)),
+                                   ((1, 0, 0x20, 0x010), (11, 0, 0x23, 0x1fe))), [
+        track_period(next(s), (0x30, 0x20), th=(0x22, 0x3f), ofst=(0x10, 0)),
+        track_period(next(s), (0x30, 0x27), th=(0x1d, 0x3f), ofst=(0xf8, 0), of=(1, 1)),
+    ]))
+    return cases
 
 
 def main(argv):
@@ -357,6 +456,111 @@ def main(argv):
                       'rfk_band_changed': 'rtw8852b_rfk_band_changed',
                       'rfk_scan': 'rtw8852b_rfk_scan'}:
         raise ValueError(f'rtw8852b_chip_ops is {chip_ops38}')
+
+    # DPK tracking (dpk_track_trace.bin).
+    chip_ops55 = members('rtw8852b.c', 'static const struct rtw89_chip_ops rtw8852b_chip_ops',
+                         ['rfk_track', 'get_thermal'])
+    if chip_ops55 != {'rfk_track': 'rtw8852b_rfk_track', 'get_thermal': 'rtw8852bx_get_thermal'}:
+        raise ValueError(f'rtw8852b_chip_ops is {chip_ops55}')
+    bx55 = members('rtw8852b_common.c', 'const struct rtw8852bx_info rtw8852bx_info',
+                   ['get_thermal'])
+    if bx55 != {'get_thermal': '__rtw8852bx_get_thermal'}:
+        raise ValueError(f'rtw8852bx_info is {bx55}')
+    if '\treturn rtw8852bx_info.get_thermal(rtwdev, rf_path);\n' not in \
+            locate('rtw8852b_common.h', 'rtw8852bx_get_thermal')[1] or \
+            '\treturn chip->ops->get_thermal(rtwdev, rf_path);\n' not in \
+            locate('core.h', 'rtw89_chip_get_thermal')[1] or \
+            '\t\tchip->ops->rfk_track(rtwdev);\n' not in \
+            locate('core.h', 'rtw89_chip_rfk_track')[1]:
+        raise ValueError('rtw89_chip_get_thermal or rtw89_chip_rfk_track no longer dispatch '
+                         'as the harness does')
+    track55 = '\n\n'.join([
+        functions('rtw8852b_common.c', ['__rtw8852bx_get_thermal']),
+        '/* rtw89_chip_get_thermal through rtw8852b_chip_ops and rtw8852bx_info. */\n'
+        'static u8 rtw89_chip_get_thermal(struct rtw89_dev *rtwdev, enum rtw89_rf_path rf_path)\n'
+        '{\n\treturn __rtw8852bx_get_thermal(rtwdev, rf_path);\n}',
+        functions('phy.c', ['rtw89_phy_stat_thermal_update']),
+        functions('rtw8852b_rfk.c', ['_dpk_track', 'rtw8852b_dpk_track']),
+        functions('rtw8852b.c', ['rtw8852b_rfk_track'])])
+    harness55 = r'''
+#define RTW89_DBG_RFK_TRACK 4
+#define fsleep(us) model_delay(us)
+#ifndef max
+#define max(a, b) ({ __typeof__(a) __a = (a); __typeof__(b) __b = (b); __a > __b ? __a : __b; })
+#endif
+'''
+    tcases55 = dpk_track_cases()
+    case_rows, bp_rows, period_rows = [], [], []
+    for tssi, cur, bps, periods in tcases55:
+        case_rows.append('\t{{%d, %d}, {%d, %d}, %d, %d}' % (
+            tssi[0], tssi[1], cur[0], cur[1], len(period_rows), len(periods)))
+        bp_rows.append('\t{' + ', '.join('{' + ', '.join('{%d, %d, 0x%x, 0x%x}' % b for b in path)
+                                         + '}' for path in bps) + '}')
+        for period in periods:
+            period_rows.append('\t{{%s}, {0x%x, 0x%x}}' % (
+                ', '.join('0x%x' % w for w in period['words']), *period['rr_tm']))
+    track_c = r'''
+static const u32 track_regs[] = {''' + ', '.join('0x%x' % r for r in TRACK_REGS) + r'''};
+struct track_period { u32 words[ARRAY_SIZE(track_regs)]; u32 rr_tm[2]; };
+static const struct track_period track_periods[] = {
+''' + ',\n'.join(period_rows) + r'''
+};
+static const struct { u8 ch, band, ther; u16 pwsf; } track_bps[][2][2] = {
+''' + ',\n'.join(bp_rows) + r'''
+};
+static const struct { u8 tssi[2], cur[2]; u32 first, n; } track_cases[] = {
+''' + ',\n'.join(case_rows) + r'''
+};
+static size_t run_track(const char *path)
+{
+	FILE *out = open_trace(path);
+	for (size_t c = 0; c < ARRAY_SIZE(track_cases); c++) {
+		static struct rtw89_dev dev;
+		memset(&dev, 0, sizeof(dev));
+		dev.chip = &chip_info;
+		fill(PATTERN);
+		record(58, track_cases[c].tssi[0] | (u32)track_cases[c].tssi[1] << 1 |
+			   (u32)track_cases[c].cur[0] << 8 | (u32)track_cases[c].cur[1] << 16, 0);
+		for (u32 p = 0; p < RF_PATH_NUM_8852B; p++) {
+			dev.is_tssi_mode[p] = track_cases[c].tssi[p];
+			dev.dpk.cur_idx[p] = track_cases[c].cur[p];
+			for (u32 k = 0; k < RTW89_DPK_BKUP_NUM; k++) {
+				struct rtw89_dpk_bkup_para *b = &dev.dpk.bp[p][k];
+
+				b->ch = track_bps[c][p][k].ch;
+				b->band = track_bps[c][p][k].band;
+				b->ther_dpk = track_bps[c][p][k].ther;
+				b->pwsf = track_bps[c][p][k].pwsf;
+				record(59, p << 8 | k | (u32)b->band << 16 | (u32)b->ch << 24,
+				       b->ther_dpk | (u32)b->pwsf << 16);
+			}
+		}
+		for (u32 n = 0; n < track_cases[c].n; n++) {
+			const struct track_period *t = &track_periods[track_cases[c].first + n];
+
+			record(60, n, 0);
+			for (u32 i = 0; i < ARRAY_SIZE(track_regs); i++) {
+				set(CR_BASE + track_regs[i], 4, t->words[i]);
+				record(63, track_regs[i], t->words[i]);
+			}
+			for (u32 p = 0; p < 2; p++) {
+				rf[p][RR_TM] = t->rr_tm[p];
+				record(65, p, t->rr_tm[p]);
+			}
+			record(50, 1, n);
+			rtw89_phy_stat_thermal_update(&dev);
+			record(66, (u32)ewma_thermal_read(&dev.phystat.avg_thermal[0]) |
+				   (u32)ewma_thermal_read(&dev.phystat.avg_thermal[1]) << 8 |
+				   (u32)dev.phystat.last_thermal_max << 16, 0);
+			record(50, 2, n);
+			rtw8852b_rfk_track(&dev);
+		}
+		flush(out);
+	}
+	close_trace(out);
+	return ARRAY_SIZE(track_cases);
+}
+'''
     bx_names = ['bb_cfg_tx_path', 'bb_ctrl_rx_path', 'bb_set_plcp_tx', 'bb_set_power',
                 'bb_set_pmac_pkt_tx', 'bb_backup_tssi', 'bb_restore_tssi', 'bb_tx_mode_switch',
                 'ctrl_btg_bt_rx']
@@ -461,6 +665,18 @@ struct rtw89_chan {
 struct rtw89_fw_elm_info { const struct rtw89_fw_txpwr_track_cfg *txpwr_trk; };
 struct rtw89_fw_info { struct rtw89_fw_elm_info elm_info; };
 struct rtw89_io_ops { void (*phy_write32)(struct rtw89_dev *rtwdev, u32 addr, u32 data); };
+/* The kernel's DECLARE_EWMA(thermal, 4, 4) as include/linux/average.h
+ * expands it, written here: the reference tree has no include/. */
+struct ewma_thermal { unsigned long internal; };
+static inline void ewma_thermal_init(struct ewma_thermal *e) { e->internal = 0; }
+static inline unsigned long ewma_thermal_read(struct ewma_thermal *e) { return e->internal >> 4; }
+static inline void ewma_thermal_add(struct ewma_thermal *e, unsigned long val)
+{
+	unsigned long internal = e->internal;
+
+	e->internal = internal ? (((internal << 2) - internal) + (val << 4)) >> 2 : (val << 4);
+}
+struct rtw89_phy_stat { struct ewma_thermal avg_thermal[RF_PATH_MAX]; u8 last_thermal_max; };
 struct rtw89_dev {
 	const struct rtw89_chip_info *chip;
 	const struct rtw89_io_ops *io;
@@ -477,6 +693,7 @@ struct rtw89_dev {
 	struct rtw89_fem_info fem;
 	struct rtw89_phy_efuse_gain efuse_gain;
 	struct rtw89_fw_info fw;
+	struct rtw89_phy_stat phystat;
 };
 static const struct rtw89_chan *rtw89_chan_get(struct rtw89_dev *d, enum rtw89_chanctx_idx i)
 {
@@ -913,6 +1130,7 @@ static void close_trace(FILE *out)
 		abort();
 }
 struct chan { enum rtw89_band band; enum rtw89_bandwidth bw; u8 ch; };
+static size_t run_track(const char *path);
 int main(int argc, char **argv)
 {
 	static const struct {
@@ -1014,7 +1232,7 @@ int main(int argc, char **argv)
 		{1, {{OP_SCAN_START, &g1}}},
 		{3, {{OP_TSSI, &g1}, {OP_SCAN_START, &g1}, {OP_SCAN_END, &g1}}},
 	};
-	if (argc != 4)
+	if (argc != 5)
 		return 2;
 	FILE *out = open_trace(argv[1]);
 	for (size_t c = 0; c < ARRAY_SIZE(cases); c++) {
@@ -1146,8 +1364,10 @@ int main(int argc, char **argv)
 		flush(out);
 	}
 	close_trace(out);
+	size_t track_n = run_track(argv[4]);
 	free(segment);
-	printf("%zu %zu %zu\n", ARRAY_SIZE(cases), ARRAY_SIZE(iqk_cases), ARRAY_SIZE(tcases));
+	printf("%zu %zu %zu %zu\n", ARRAY_SIZE(cases), ARRAY_SIZE(iqk_cases), ARRAY_SIZE(tcases),
+	       track_n);
 	return 0;
 }
 '''
@@ -1155,7 +1375,8 @@ int main(int argc, char **argv)
         preamble, reg_h, core_defines, defines38, phy_defines, chip_defines, declarations,
         declarations38, rfk_macros, by_cond, harness, harness38, core_helpers, phy_helpers,
         phy_h38, io_table, rf_access, phy38, dispatch, parser, tables, chip, chan38,
-        common_h38, common38, bx_table, rfk_head, rfk, extra_group, rfk38, rfk_init, fw38, chip38, main_c])
+        common_h38, common38, bx_table, rfk_head, rfk, extra_group, rfk38, rfk_init, fw38, chip38, harness55, track55,
+        main_c, track_c])
     generated = out / 'rfk_oracle.c'
     generated.write_text(program, newline='\n')
     exe = out / 'rfk_oracle'
@@ -1169,9 +1390,13 @@ int main(int argc, char **argv)
     trace = out / 'rfk_trace.bin'
     iqk_trace = out / 'iqk_trace.bin'
     tssi_dpk_trace = out / 'tssi_dpk_trace.bin'
-    run = subprocess.run([str(exe), str(trace), str(iqk_trace), str(tssi_dpk_trace)],
-                         check=True, capture_output=True, text=True)
-    cases, iqk_cases, tssi_dpk_cases = map(int, run.stdout.split())
+    dpk_track_trace = out / 'dpk_track_trace.bin'
+    run = subprocess.run([str(exe), str(trace), str(iqk_trace), str(tssi_dpk_trace),
+                          str(dpk_track_trace)], check=True, capture_output=True, text=True)
+    cases, iqk_cases, tssi_dpk_cases, dpk_track_cases_n = map(int, run.stdout.split())
+    if dpk_track_cases_n != len(tcases55):
+        raise ValueError(f'{dpk_track_cases_n} DPK tracking cases ran')
+    dpk_track_data = dpk_track_trace.read_bytes()
     data = trace.read_bytes()
     iqk_data = iqk_trace.read_bytes()
     tssi_dpk_data = tssi_dpk_trace.read_bytes()
@@ -1198,6 +1423,11 @@ int main(int argc, char **argv)
         tssi_dpk_cases=tssi_dpk_cases, tssi_dpk_case_order=TSSI_DPK_ORDER, trk_rows=TRK_ROWS,
         tssi_dpk_trace_bytes=len(tssi_dpk_data),
         tssi_dpk_trace_sha256=hashlib.sha256(tssi_dpk_data).hexdigest(),
+        dpk_track_cases=dpk_track_cases_n,
+        dpk_track_periods=sum(len(case[3]) for case in tcases55),
+        dpk_track_dispatch=dict(rtw8852b_chip_ops=chip_ops55, rtw8852bx_info=bx55),
+        dpk_track_trace_bytes=len(dpk_track_data),
+        dpk_track_trace_sha256=hashlib.sha256(dpk_track_data).hexdigest(),
         generated_source_sha256=hashlib.sha256(generated.read_bytes()).hexdigest(),
         oracle_limit=[
             'MMIO, delays and the chip answers are a model derived from the code; no Linux '
@@ -1224,12 +1454,19 @@ int main(int argc, char **argv)
             'ktime_get is 0: the alignment\'s time account is not modeled',
             'RTW8852B_TSSI_GET_VAL\'s shifts into int\'s sign bit are compiled -fwrapv with '
             'the shift base check off, as the kernel\'s -fno-strict-overflow leaves them',
+            'the DPK tracking cases script the DPK results in use, the thermal readings and '
+            'the TX AGC words instead of running rtw8852b_dpk first; DECLARE_EWMA(thermal, 4, '
+            '4) is written in the harness as include/linux/average.h expands it',
+            'rtw89_chip_get_thermal and rtw89_chip_rfk_track are stood for by direct calls '
+            'to __rtw8852bx_get_thermal and rtw8852b_rfk_track, as the checked dispatch '
+            'reaches them',
         ])
     (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n', newline='\n')
     print(json.dumps({k: receipt[k] for k in [
         'cases', 'trace_bytes', 'trace_sha256', 'iqk_cases', 'iqk_trace_bytes',
         'iqk_trace_sha256', 'tssi_dpk_cases', 'tssi_dpk_trace_bytes',
-        'tssi_dpk_trace_sha256']}))
+        'tssi_dpk_trace_sha256', 'dpk_track_cases', 'dpk_track_trace_bytes',
+        'dpk_track_trace_sha256']}))
     return 0
 
 

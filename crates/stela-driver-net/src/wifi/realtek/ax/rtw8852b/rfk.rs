@@ -386,6 +386,15 @@ pub fn scan<I: Io + ?Sized, S: Scheduler<I> + ?Sized>(
     tssi::wifi_scan_notify(io, scheduler, state, start, channel, inputs)
 }
 
+/// `rtw8852b_rfk_track`, which `rtw89_core_rfk_track` runs every two
+/// seconds outside MCC: DPK tracking ([`dpk::dpk_track`]) for the averaged
+/// thermal meter of paths A and B. TSSI tracks in hardware, and
+/// `rtw89_core_rfk_tssi_record`, which follows it, returns at once on an AX
+/// chip.
+pub fn track<I: Io + ?Sized>(io: &mut I, state: &State, thermal: [u8; 2]) -> Result<(), Error> {
+    dpk::dpk_track(io, state, thermal)
+}
+
 /// `rtw89_rfk_parser_by_cond`: `if_true` when `condition` holds, otherwise
 /// `if_false`.
 pub fn run_by_cond<I: Io + ?Sized>(
