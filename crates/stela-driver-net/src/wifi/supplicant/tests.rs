@@ -214,7 +214,15 @@ impl Authenticator {
     }
 
     fn group_message_1(&mut self) -> Vec<u8> {
-        self.signed(ACK | MIC | SECURE | ENCRYPTED, &gtk_kde(2, &[0x66; 16]))
+        self.group_message_1_with(2, &[0x66; 16], &[])
+    }
+
+    /// Group message 1 of a rekey: `gtk` under `index`, then the KDEs in
+    /// `extra`.
+    pub(crate) fn group_message_1_with(&mut self, index: u8, gtk: &[u8], extra: &[u8]) -> Vec<u8> {
+        let mut elements = gtk_kde(index, gtk);
+        elements.extend_from_slice(extra);
+        self.signed(ACK | MIC | SECURE | ENCRYPTED, &elements)
     }
 
     pub(crate) fn signed_reply(&self, frame: &[u8], info: u16) {

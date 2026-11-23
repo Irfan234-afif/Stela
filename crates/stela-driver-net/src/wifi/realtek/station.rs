@@ -2282,6 +2282,18 @@ impl<D: Device> Radio for Realtek<D> {
             entry,
             material: Zeroizing::new(material.to_vec()),
         });
+        // A group key installed while the port is open is a group
+        // handshake's rekey, which the keeper installs only once its message
+        // 1 was authenticated: the port is authorized again with it, so the
+        // AP's frames under the new GTK pass, as mac80211 takes them under
+        // the group key it was last given.
+        if !pairwise && self.port_open {
+            let epoch = self
+                .station
+                .association_epoch()
+                .ok_or(Error::Refused("no association"))?;
+            self.authorize_port(epoch)?;
+        }
         Ok(identity)
     }
 

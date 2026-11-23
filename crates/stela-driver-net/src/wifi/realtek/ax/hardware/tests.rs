@@ -260,9 +260,7 @@ impl Bench {
         ap.message_2(&self.answers(from)[0]);
         let mut igtk = Vec::new();
         if protection == Protection::Wpa3Sae {
-            igtk = vec![0xdd, 4 + 8 + 16, 0x00, 0x0f, 0xac, 9, 4, 0];
-            igtk.extend_from_slice(&[0; 6]);
-            igtk.extend_from_slice(&[0x77; 16]);
+            igtk = igtk_kde(4, [0x77; 16]);
         }
         let frame = data(
             local.0,
@@ -292,6 +290,64 @@ impl Bench {
         }
         panic!("no firmware loss reported");
     }
+
+    /// A group key handshake with `ap` over the PTK: its message 1 at
+    /// `sequence` and the PTK's packet number `pn`, `gtk` under `index`
+    /// and, under PMF, a new IGTK beside it (ID 4 beside GTK 1, 5 beside
+    /// GTK 2); the station's message 2 checked by the authenticator.
+    fn rekey(&mut self, ap: &mut Authenticator, sequence: u16, pn: u8, index: u8, gtk: [u8; 16]) {
+        let from = self.chip.sent_count();
+        let mut igtk = Vec::new();
+        if self.ap.protection == Protection::Wpa3Sae {
+            igtk = igtk_kde(3 + index, [!gtk[0]; 16]);
+        }
+        let message = ap.group_message_1_with(index, &gtk, &igtk);
+        let frame = data(
+            self.local.0,
+            sequence,
+            [0x88, 0x8e],
+            &message,
+            Some((0, pn)),
+        );
+        self.hear(&frame, true);
+        assert!(
+            self.run(|bench| !bench.answers(from).is_empty()),
+            "no group message 2"
+        );
+        ap.signed_reply(&self.answers(from)[0], 0x300);
+    }
+
+    /// Group data from the AP under GTK `index`, past the RSC of 7 its
+    /// handshake gave, delivered whole: its first byte `value`.
+    fn group_data(&mut self, sequence: u16, index: u8, value: u8) {
+        self.data_from_ap([0xff; 6], sequence, (index, 8), value);
+    }
+
+    /// Data from the AP to `receiver` at `sequence` under `key`, its index
+    /// and packet number, delivered whole: its first byte `value`.
+    fn data_from_ap(&mut self, receiver: [u8; 6], sequence: u16, key: (u8, u8), value: u8) {
+        let frame = data(receiver, sequence, [8, 0], &[value; 46], Some(key));
+        self.hear(&frame, true);
+        let mut values = Vec::new();
+        for _ in 0..8 {
+            match self.wifi.receive() {
+                Ok(Some(ethernet)) => values.push(ethernet[14]),
+                Ok(None) => {}
+                // What the station reports beside it, such as power save.
+                Err(LinkError::Adapter(why)) => assert!(!why.contains("firmware"), "{why}"),
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+        assert_eq!(values, [value]);
+    }
+}
+
+/// An IGTK KDE: key `id`, IPN 0, `key`.
+fn igtk_kde(id: u8, key: [u8; 16]) -> Vec<u8> {
+    let mut kde = vec![0xdd, 4 + 8 + 16, 0x00, 0x0f, 0xac, 9, id, 0];
+    kde.extend_from_slice(&[0; 6]);
+    kde.extend_from_slice(&key);
+    kde
 }
 
 /// The bench joined to the AP through its handshake, the port open; the
@@ -1142,4 +1198,33 @@ fn the_crash_trigger_asks_for_a_cpu_exception_whose_halt_is_recovered() {
     assert!(why.ends_with("cold re-init 1/3"), "{why}");
     assert!(chip.on());
     assert_eq!(hardware.recover(), None);
+}
+
+#[test]
+fn a_wpa3_sae_station_keeps_its_association_through_repeated_group_rekeys() {
+    let mut bench = bench(Protection::Wpa3Sae);
+    let mut ap = bench.join();
+    let (mut sequence, mut pn) = (2, 1);
+    for round in 0..6 {
+        // GTK 2, 1, 2, ... each with its IGTK.
+        let index = 2 - round % 2;
+        let gtk = [0x60 + round; 16];
+        bench.rekey(&mut ap, sequence, pn, index, gtk);
+        // The new GTK reaches the security CAM; group data under it and
+        // unicast data under the PTK pass the station's checks, the second
+        // rekey replacing the GTK the port opened with among them.
+        let keys = sec_cam(&bench.chip.commands())
+            .into_iter()
+            .filter(|key| key.payload[8..24] == gtk)
+            .count();
+        assert_eq!(keys, 1, "round {round}");
+        bench.group_data(sequence + 1, index, 0x30 + round);
+        let local = bench.local.0;
+        bench.data_from_ap(local, sequence + 2, (0, pn + 1), 0x40 + round);
+        sequence += 3;
+        pn += 2;
+        assert!(bench.wifi.carrier(), "round {round}");
+    }
+    assert_eq!(bench.wifi.radio().station().phase(), Phase::Associated);
+    assert_eq!(bench.wifi.radio().device().recoveries(), 0);
 }
