@@ -47,8 +47,9 @@
 //!
 //! Left out: the low-power mask and handler (`rtw89_pci_ops_switch_mode`,
 //! `rtw89_pci_low_power_interrupt_handler`), which only rtw89's power save
-//! reaches; the halt and watchdog causes' `rtw89_ser_notify`, which 5.3
-//! takes from [`Events::halt_c2h`] and [`Events::wdt`]; and the 8851B and
+//! reaches; the halt and watchdog causes' `rtw89_ser_notify`, which the
+//! station's hardware takes from [`Events::halt_c2h`] and [`Events::wdt`]
+//! after the look ([`super::ser`]); and the 8851B and
 //! WiFi 7 variants. RTL8852B's halt mask holds `B_AX_HALT_C2H_INT_EN`
 //! alone, so [`Events::wdt`] reads false here as in rtw89.
 //!

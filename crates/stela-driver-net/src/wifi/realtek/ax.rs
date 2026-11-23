@@ -23,8 +23,9 @@
 //! the chip up again as rtw89's interface start does, tunes it and listens
 //! ([`listen`]), reading what RXQ holds as rtw89 reads it ([`rxdesc`]); the
 //! station's hardware ([`hardware`]) brings it up the same way under the
-//! softMAC station. [`attach`] runs them for a boot: the power cycle, the
-//! Wi-Fi check's listen, then the station the connection keeper keeps.
+//! softMAC station, and recovers a halted firmware cold ([`ser`]).
+//! [`attach`] runs them for a boot: the power cycle, the Wi-Fi check's
+//! listen, then the station the connection keeper keeps.
 //! Powering the chip on,
 //! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
 //! its polled bits answered, the ring addresses were written and the command
@@ -62,5 +63,6 @@ pub mod regd;
 pub mod registers;
 pub mod rtw8852b;
 pub mod rxdesc;
+pub mod ser;
 pub mod txpower;
 pub mod txwd;

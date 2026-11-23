@@ -8,7 +8,7 @@ extern crate std;
 
 use super::*;
 use crate::{
-    Clock, Link,
+    Clock, Link, LinkError,
     firmware::Catalog,
     wifi::{
         connection::{keeper::Radio, security::Security},
@@ -19,7 +19,7 @@ use crate::{
                 bootstrap::tests::{ACV, CUT, DEVICE, board, catalog, container},
                 c2h::RaRpt,
                 elements::{Id, tests as elm},
-                h2c::{H2C_CAT_MAC, H2C_CAT_OUTSRC},
+                h2c::{H2C_CAT_MAC, H2C_CAT_OUTSRC, H2C_CAT_TEST},
                 io::{CR_BASE, field},
                 mac::port::NET_TYPE_INFRA,
                 model::{AID, Ap, Chip as Model, Command, Protection, Sent, Shared},
@@ -27,7 +27,7 @@ use crate::{
                     release::{TX_DONE, TX_RETRY_LIMIT},
                     tests::{Access, Domain, Placement, Source},
                 },
-                registers::{SWSI_DATA_ADDR_V1, SWSI_DATA_V1, WLAN_XTAL_SI_CTRL},
+                registers::{HALT_C2H_CTRL, SWSI_DATA_ADDR_V1, SWSI_DATA_V1, WLAN_XTAL_SI_CTRL},
                 rtw8852b::rfk::{
                     ntfy::{H2C_CL_OUTSRC_RF_FW_NOTIFY, H2C_FUNC_OUTSRC_RF_GET_MCCCH},
                     reg::{B_P0_TSSI_OFT, R_P0_TSSI_TRK, R_TXAGC_BB, RR_TM},
@@ -104,8 +104,15 @@ fn hardware() -> (Hardware<Shared>, Rc<Model>) {
     };
     // SAFETY: the model, its DMA domain and these pages belong to this test
     // alone; no device reaches them.
-    let hardware = unsafe { Hardware::new(claim, &mut config, &firmware(), &settings) }
+    let mut hardware = unsafe { Hardware::new(claim, &mut config, &firmware(), &settings) }
         .unwrap_or_else(|stopped| panic!("{stopped}"));
+    let restart = Restart {
+        config: Box::new(Shared(chip.clone())),
+        firmware: Box::leak(Box::new(firmware())),
+    };
+    // SAFETY: the configuration space is the model's, which the hardware's
+    // register interface reaches, of this test alone.
+    unsafe { hardware.restartable(restart) };
     (hardware, chip)
 }
 
@@ -164,9 +171,10 @@ impl Bench {
         self.chip.sent_from(0)
     }
 
-    /// The EAPOL payloads the station sent.
-    fn answers(&self) -> Vec<Vec<u8>> {
-        self.sent()
+    /// The EAPOL payloads the station sent from its `from`th frame on.
+    fn answers(&self, from: usize) -> Vec<Vec<u8>> {
+        self.chip
+            .sent_from(from)
             .iter()
             .filter_map(|sent| eapol_payload(&sent.frame).map(<[u8]>::to_vec))
             .collect()
@@ -228,40 +236,69 @@ fn data(
     frame
 }
 
+impl Bench {
+    /// The station associated with the AP and through its 4-way handshake
+    /// with a new authenticator, the port open; the GTK is 0x50.., and under
+    /// PMF the IGTK 0x77... The authenticator, for the group handshakes
+    /// that follow.
+    fn join(&mut self) -> Authenticator {
+        assert!(self.associated(), "no association");
+        let from = self.chip.sent_count();
+        let local = self.local;
+        let protection = self.ap.protection;
+        let rsn = self.ap.rsn();
+        let security = Security::select(&rsn, true).unwrap();
+        let pmk = match protection {
+            Protection::Wpa2Psk => Zeroizing::new([0; 32]),
+            Protection::Wpa3Sae => self.ap.pmk().expect("SAE accepted"),
+        };
+        let mut ap =
+            Authenticator::between(security.suites(), pmk, Mac(AP), local, security.element());
+        let frame = data(local.0, 0, [0x88, 0x8e], &ap.message_1(), None);
+        self.hear(&frame, false);
+        assert!(self.run(|bench| !bench.answers(from).is_empty()));
+        ap.message_2(&self.answers(from)[0]);
+        let mut igtk = Vec::new();
+        if protection == Protection::Wpa3Sae {
+            igtk = vec![0xdd, 4 + 8 + 16, 0x00, 0x0f, 0xac, 9, 4, 0];
+            igtk.extend_from_slice(&[0; 6]);
+            igtk.extend_from_slice(&[0x77; 16]);
+        }
+        let frame = data(
+            local.0,
+            1,
+            [0x88, 0x8e],
+            &ap.message_3_with(&rsn, &igtk),
+            None,
+        );
+        self.hear(&frame, false);
+        assert!(self.run(|bench| bench.answers(from).len() > 1));
+        assert!(self.run(|bench| bench.wifi.carrier()), "no carrier");
+        ap.signed_reply(&self.answers(from)[1], 0x308);
+        ap
+    }
+
+    /// Serve the air until the link reports the firmware's loss, and what
+    /// it said.
+    fn lost(&mut self) -> String {
+        for _ in 0..4000 {
+            self.ap.serve(&self.chip);
+            if let Err(LinkError::Adapter(why)) = self.wifi.receive()
+                && why.contains("firmware")
+            {
+                return why;
+            }
+            crate::test_clock::advance(CLOCK, 5_000);
+        }
+        panic!("no firmware loss reported");
+    }
+}
+
 /// The bench joined to the AP through its handshake, the port open; the
 /// GTK is 0x50.., and under PMF the IGTK 0x77...
 fn connected(protection: Protection) -> Bench {
     let mut bench = bench(protection);
-    assert!(bench.associated(), "no association");
-    let local = bench.local;
-    let rsn = bench.ap.rsn();
-    let security = Security::select(&rsn, true).unwrap();
-    let pmk = match protection {
-        Protection::Wpa2Psk => Zeroizing::new([0; 32]),
-        Protection::Wpa3Sae => bench.ap.pmk().expect("SAE accepted"),
-    };
-    let mut ap = Authenticator::between(security.suites(), pmk, Mac(AP), local, security.element());
-    let frame = data(local.0, 0, [0x88, 0x8e], &ap.message_1(), None);
-    bench.hear(&frame, false);
-    assert!(bench.run(|bench| !bench.answers().is_empty()));
-    ap.message_2(&bench.answers()[0]);
-    let mut igtk = Vec::new();
-    if protection == Protection::Wpa3Sae {
-        igtk = vec![0xdd, 4 + 8 + 16, 0x00, 0x0f, 0xac, 9, 4, 0];
-        igtk.extend_from_slice(&[0; 6]);
-        igtk.extend_from_slice(&[0x77; 16]);
-    }
-    let frame = data(
-        local.0,
-        1,
-        [0x88, 0x8e],
-        &ap.message_3_with(&rsn, &igtk),
-        None,
-    );
-    bench.hear(&frame, false);
-    assert!(bench.run(|bench| bench.answers().len() > 1));
-    assert!(bench.run(|bench| bench.wifi.carrier()), "no carrier");
-    ap.signed_reply(&bench.answers()[1], 0x308);
+    bench.join();
     bench
 }
 
@@ -1025,4 +1062,84 @@ fn a_busy_link_runs_cfo_tracking_on_its_timer() {
     hardware.watchdog(false, false).unwrap();
     hardware.coexist(start + 2 * period).unwrap();
     assert_eq!(hardware.cfo_due, None);
+}
+
+#[test]
+fn a_firmware_halt_mid_traffic_brings_the_chip_up_cold_and_rejoins() {
+    let mut bench = connected(Protection::Wpa2Psk);
+    let downloads = bench.chip.attempts().len();
+    let ethernet = bench.ip(0);
+    bench.wifi.transmit(&ethernet).unwrap();
+    assert!(bench.run(|bench| !best_effort(bench).is_empty()));
+    // The firmware halts on a CPU exception, with a frame left on the ring.
+    bench.chip.halt(0x2000_0abc);
+    bench.wifi.transmit(&ethernet).unwrap();
+    let sent = best_effort(&bench).len();
+    assert_eq!(
+        bench.lost(),
+        "rtw89: firmware halted (err status 0x3000, SER_EV_L2_RESET), cold re-init 1/3"
+    );
+    // Powered off and brought up cold: the image downloaded again, the
+    // halt's control cleared, the port closed.
+    assert_eq!(bench.chip.attempts().len(), downloads + 1);
+    assert!(bench.chip.on());
+    let mut io = Shared(bench.chip.clone());
+    assert_eq!(Io::read32(&mut io, HALT_C2H_CTRL).unwrap(), 0);
+    assert!(!bench.wifi.carrier());
+    assert_eq!(bench.wifi.radio().device().recoveries(), 1);
+    // The station joins again from a scan, and its traffic flows.
+    bench.join();
+    bench.wifi.transmit(&ethernet).unwrap();
+    assert!(bench.run(|bench| best_effort(bench).len() > sent));
+}
+
+#[test]
+fn a_fourth_firmware_halt_within_a_minute_leaves_the_chip_off() {
+    let mut bench = connected(Protection::Wpa2Psk);
+    for count in 1..=3 {
+        bench.chip.halt(ser::MAC_AX_ERR_L2_ERR_AH_DMA);
+        let why = bench.lost();
+        assert!(why.ends_with(&format!(", cold re-init {count}/3")), "{why}");
+    }
+    let downloads = bench.chip.attempts().len();
+    bench.chip.halt(ser::MAC_AX_ERR_L2_ERR_AH_DMA);
+    assert_eq!(
+        bench.lost(),
+        "rtw89: firmware halted (err status 0x2000, SER_EV_L2_RESET), past 3 cold re-inits \
+         within a minute; the RTL8852B stays powered off"
+    );
+    // Off for good: no download, no carrier, and the link says why.
+    assert!(!bench.chip.on());
+    assert!(!bench.run(|bench| bench.wifi.carrier()));
+    assert_eq!(bench.chip.attempts().len(), downloads);
+    assert_eq!(bench.wifi.radio().device().recoveries(), 3);
+    assert!(matches!(
+        bench.wifi.receive(),
+        Err(LinkError::Adapter(why)) if why.contains("stays powered off")
+    ));
+}
+
+#[test]
+fn the_crash_trigger_asks_for_a_cpu_exception_whose_halt_is_recovered() {
+    let (mut hardware, chip) = hardware();
+    hardware.trigger_cpu_exception().unwrap();
+    let last = chip.commands().pop().unwrap();
+    assert_eq!(
+        (last.cat, last.class, last.func),
+        (
+            H2C_CAT_TEST,
+            ser::H2C_CL_FW_STATUS_TEST,
+            ser::H2C_FUNC_CPU_EXCEPTION
+        )
+    );
+    // Firmware 0.29.29.18: CRASH_TRIGGER_TYPE_0.
+    assert_eq!(last.payload, ser::CPU_EXCEPTION_TYPE_0.to_le_bytes());
+    // The firmware's answer, its halt, is found by the next look and
+    // recovered.
+    chip.halt(0x2000_0001);
+    hardware.receive(&mut |_| {}).unwrap();
+    let why = hardware.recover().unwrap();
+    assert!(why.ends_with("cold re-init 1/3"), "{why}");
+    assert!(chip.on());
+    assert_eq!(hardware.recover(), None);
 }

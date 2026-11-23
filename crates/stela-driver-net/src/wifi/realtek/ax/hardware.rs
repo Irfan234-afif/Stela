@@ -67,6 +67,14 @@
 //!   calibration and a scan's start suspend DIG; the association and the
 //!   scan's end resume it, as `rtw89_core_sta_link_add`,
 //!   `rtw89_core_sta_link_assoc` and rtw89's hardware scan do.
+//! - [`Device::recover`] is rtw89's system error recovery ([`ser`]) for the
+//!   halt C2H or watchdog cause a [`Device::receive`] look found, every
+//!   error taken as L2: the chip powered off and brought up cold as
+//!   [`Hardware::start`] brought it up, with the configuration space and
+//!   image [`Hardware::restartable`] kept, at most [`RECOVERIES`] times a
+//!   minute; then it stays off, as it does without them. The station
+//!   joins again from a scan. [`Hardware::trigger_cpu_exception`] halts the
+//!   firmware on purpose, for diagnostics.
 //!
 //! What this leaves out, and why:
 //! - `rtw89_mac_bf_assoc`, beamformee CSI: the advertisement's VHT and HE
@@ -126,6 +134,7 @@ use super::{
         txpower as rtw8852b_txpower,
     },
     rxdesc::{self, Delivered, Sorted, Sorter},
+    ser::{self, Halt, RECOVERIES, Recoveries},
     txpower::{Cap, Power},
     txwd::{self, DescInfo},
 };
@@ -326,6 +335,15 @@ pub struct Settings {
     pub alpha2: Option<[u8; 2]>,
     /// An MSI the caller routed raises the function's causes.
     pub vector: bool,
+}
+
+/// What a cold re-init takes beside the chip, which the attach hands over
+/// for as long as the station runs ([`Hardware::restartable`]): the
+/// function's configuration space, which the PCIe pre-init programs, and
+/// the firmware image stage 2 reads its tables and suit from.
+pub struct Restart {
+    pub config: Box<dyn ConfigSpace>,
+    pub firmware: &'static dyn Provider,
 }
 
 /// Why the station's bring-up stopped.
@@ -579,6 +597,15 @@ pub struct Hardware<I = NativeIo> {
     vector: bool,
     limitations: Vec<&'static str>,
     transmitted: Transmitted,
+    /// What stage 2 took beside the chip, which a cold re-init takes again.
+    settings: Settings,
+    restart: Option<Restart>,
+    /// A halt or watchdog cause a look found, which [`Device::recover`]
+    /// takes.
+    halted: Option<Halt>,
+    recoveries: Recoveries,
+    /// Why the chip stays powered off, once a recovery gave up.
+    off: Option<String>,
 }
 
 impl<I: Io> Hardware<I> {
@@ -714,6 +741,11 @@ impl<I: Io> Hardware<I> {
             vector: settings.vector,
             limitations: Vec::new(),
             transmitted: Transmitted::default(),
+            settings: *settings,
+            restart: None,
+            halted: None,
+            recoveries: Recoveries::default(),
+            off: None,
             stage1: Box::new(stage1),
         };
         if let Err(error) = hardware.interface_up() {
@@ -821,6 +853,141 @@ impl<I: Io> Hardware<I> {
             .map_err(failed("interrupts"))?;
         power::power_off(&mut self.io, &radio::power_inputs(&self.stage1))
             .map_err(failed("power off"))
+    }
+
+    /// Lets [`Device::recover`] bring the chip up cold after its firmware
+    /// halts or its watchdog fires, with what `restart` holds. Without it,
+    /// the first such failure powers the chip off for good.
+    ///
+    /// # Safety
+    /// `restart.config` reaches the function this hardware's register
+    /// interface reaches, and no other worker programs that function while
+    /// this hardware holds it: a cold re-init writes its configuration
+    /// space and programs its DMA rings again, as [`Self::start`] did.
+    pub unsafe fn restartable(&mut self, restart: Restart) {
+        self.restart = Some(restart);
+    }
+
+    /// How many cold re-inits ran since the radio came up.
+    pub fn recoveries(&self) -> u32 {
+        self.recoveries.total()
+    }
+
+    /// `rtw89_fw_h2c_trigger_cpu_exception`, for diagnostics: the firmware
+    /// is asked to crash. Its halt C2H arrives at a later look, and
+    /// [`Device::recover`] brings the chip up cold. Refused by firmware
+    /// before 0.29.29.0, which has no crash trigger.
+    pub fn trigger_cpu_exception(&mut self) -> Result<(), String> {
+        self.alive()?;
+        let Self {
+            io,
+            rings,
+            h2c,
+            stage1,
+            ..
+        } = self;
+        ser::trigger_cpu_exception(io, h2c, rings, stage1.features)
+            .map_err(failed("CPU exception trigger"))
+    }
+
+    /// Refuses every operation once a recovery gave up and powered the chip
+    /// off.
+    fn alive(&self) -> Result<(), String> {
+        match &self.off {
+            Some(why) => Err(why.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// The cold re-init that stands for rtw89's L2 recovery
+    /// (`ser_l2_reset_st_hdl`'s `rtw89_core_stop` and mac80211's restart):
+    /// the interrupts off and the chip powered off, which stops its DMA,
+    /// then stage 2's bring-up again ([`bring_up`]) and the interface
+    /// ([`Self::interface_up`]) on the same rings, with nothing of the
+    /// station replayed. Stage 1 is not repeated: rtw89's restart runs
+    /// `rtw89_core_start` alone, and the efuse stage 1 read stands.
+    fn cold_init(&mut self) -> Result<(), String> {
+        let Self {
+            io,
+            rings,
+            h2c,
+            stage1,
+            settings,
+            restart,
+            interrupts,
+            ..
+        } = self;
+        let Some(restart) = restart.as_mut() else {
+            return Err(String::from(
+                "no configuration space kept to bring the chip up again",
+            ));
+        };
+        interrupts.disable(io).map_err(failed("interrupts"))?;
+        power::power_off(io, &radio::power_inputs(stage1)).map_err(failed("power off"))?;
+        let mut report = Box::<radio::Report>::default();
+        let mut powered = false;
+        let mut stage = radio::Stage::Tables;
+        // SAFETY: `restartable`'s contract: `restart.config` reaches the
+        // function `io` does, whose DMA the power-off above stopped, and
+        // `self` keeps the rings it programs for as long as it holds the
+        // chip, as after `start`.
+        let brought = unsafe {
+            bring_up(
+                io,
+                rings,
+                h2c,
+                &mut *restart.config,
+                stage1,
+                restart.firmware,
+                settings,
+                &mut report,
+                &mut powered,
+                &mut stage,
+            )
+        };
+        self.report = report;
+        let (power, running) = brought.map_err(|error| format!("{stage}: {error}"))?;
+        self.power = power;
+        self.running = running;
+        self.forget();
+        self.interface_up()
+    }
+
+    /// What the interface learned since it came up, forgotten as a cold
+    /// re-init brings it up again: the state [`Self::start`] begins with.
+    fn forget(&mut self) {
+        self.interrupts = Interrupts::new(self.settings.vector);
+        self.sorter = Sorter::new(0, rxdesc::NL80211_BAND_2GHZ);
+        self.completions.clear();
+        self.reports.clear();
+        self.cams = cam::Info::default();
+        self.link = Link::station(
+            MAC_ID,
+            PORT,
+            self.stage1.info.efuse.addr,
+            self.stage1.info.hal.tx_nss,
+        );
+        self.peer = None;
+        self.rated = None;
+        self.keys = [None; PAIRWISE_CAM as usize + 1];
+        self.chan = None;
+        self.band = None;
+        self.scanning = false;
+        self.calibrate = false;
+        self.rx_fltr = DEFAULT_AX_RX_FLTR;
+        self.promiscuous = false;
+        self.rssi = RssiAverage::new();
+        self.traffic = Traffic::default();
+        self.cfo_due = None;
+        self.calibrations = 0;
+    }
+
+    /// The chip powered off for good, `why` the answer to every operation
+    /// from now on.
+    fn stop(&mut self, why: &str) {
+        let _ = self.interrupts.disable(&mut self.io);
+        let _ = power::power_off(&mut self.io, &radio::power_inputs(&self.stage1));
+        self.off = Some(format!("{why}; the {} stays powered off", Self::CHIP));
     }
 
     /// `rtw89_ops_configure_filter` for the flags a station's mac80211 sets:
@@ -1192,6 +1359,7 @@ impl<I: Io> Device for Hardware<I> {
         context: &AssociationContext,
         width: Width,
     ) -> Result<(), String> {
+        self.alive()?;
         let negotiated = context.negotiated();
         let he_support = negotiated.he.is_some() && negotiated.mode >= Mode::He;
         let he_operation = context.operations().he.as_ref();
@@ -1252,6 +1420,7 @@ impl<I: Io> Device for Hardware<I> {
 
     /// `rtw89_core_sta_link_disconnect`, then `BSS_CHANGED_BSSID` to none.
     fn left(&mut self) -> Result<(), String> {
+        self.alive()?;
         let peer = self.peer.take();
         self.rated = None;
         self.rssi = RssiAverage::new();
@@ -1282,6 +1451,7 @@ impl<I: Io> Device for Hardware<I> {
         _level: u8,
         reset: bool,
     ) -> Result<(), String> {
+        self.alive()?;
         let rated = self.rated(context, width);
         let changed = self.rated.is_none_or(|old| old.sta != rated.sta);
         self.rated = Some(rated);
@@ -1303,6 +1473,7 @@ impl<I: Io> Device for Hardware<I> {
         scanning: bool,
         eirp_mbm: i32,
     ) -> Result<(), String> {
+        self.alive()?;
         let chan = chan_of(definition)?;
         let txchan = chan.txpower();
         if !self.power.regulation.permits(&txchan) {
@@ -1353,6 +1524,7 @@ impl<I: Io> Device for Hardware<I> {
     /// first frame, then `rtw89_phy_dig_suspend`, as
     /// `rtw89_core_sta_link_add` runs them for a station's AP.
     fn prepare_transmit(&mut self) -> Result<(), String> {
+        self.alive()?;
         if !core::mem::take(&mut self.calibrate) {
             return Ok(());
         }
@@ -1415,6 +1587,7 @@ impl<I: Io> Device for Hardware<I> {
         descriptor: &Descriptor,
         mpdu: &[u8],
     ) -> Result<bool, String> {
+        self.alive()?;
         let length = u16::try_from(mpdu.len())
             .ok()
             .filter(|&length| usize::from(length) <= MAX_FRAME && length > 0)
@@ -1471,8 +1644,14 @@ impl<I: Io> Device for Hardware<I> {
     }
 
     /// One look ([`Interrupts::look`]): RPQ's releases, then RXQ's frames
-    /// and C2H through `rtw89_core_rx`.
+    /// and C2H through `rtw89_core_rx`. A halt C2H or watchdog cause ends
+    /// the looks, the firmware's error read ([`ser::err_status`]) for
+    /// [`Device::recover`], and none follows until it ran.
     fn receive(&mut self, sink: &mut dyn FnMut(Incoming<Report>)) -> Result<(), String> {
+        self.alive()?;
+        if self.halted.is_some() {
+            return Ok(());
+        }
         let mut completions = core::mem::take(&mut self.completions);
         let mut arrived = Vec::new();
         {
@@ -1481,6 +1660,7 @@ impl<I: Io> Device for Hardware<I> {
                 rings,
                 interrupts,
                 sorter,
+                halted,
                 ..
             } = self;
             let lengths = [
@@ -1498,7 +1678,16 @@ impl<I: Io> Device for Hardware<I> {
                         }),
                     })
                     .map_err(failed("receive"))?;
-                if !look.more {
+                // rtw89_pci_interrupt_threadfn's rtw89_ser_notify, the halt
+                // C2H's first.
+                if let Some(events) = look.events {
+                    if events.halt_c2h() {
+                        *halted = Some(Halt::Firmware(ser::err_status(io)));
+                    } else if events.wdt() {
+                        *halted = Some(Halt::Watchdog);
+                    }
+                }
+                if !look.more || halted.is_some() {
                     break;
                 }
             }
@@ -1536,6 +1725,7 @@ impl<I: Io> Device for Hardware<I> {
     /// `__rtw89_ops_bss_link_assoc`'s update, which [`Device::joined`]
     /// makes.
     fn set_port(&mut self, bssid: Mac, aid: u16, linked: bool) -> Result<(), String> {
+        self.alive()?;
         if bssid.0 != self.link.bssid {
             let Self {
                 io,
@@ -1563,6 +1753,7 @@ impl<I: Io> Device for Hardware<I> {
     }
 
     fn filter_beacons(&mut self, own_only: bool) -> Result<(), String> {
+        self.alive()?;
         self.promiscuous = !own_only;
         self.configure_filter()
     }
@@ -1571,6 +1762,7 @@ impl<I: Io> Device for Hardware<I> {
     /// category, in mac80211's order: `rtw89_aifsn_to_aifs` and
     /// `rtw89_fw_h2c_set_edca`.
     fn set_edca(&mut self, edca: &[AccessCategory; 4], short_slot: bool) -> Result<(), String> {
+        self.alive()?;
         let slot = if short_slot { 9 } else { 20 };
         let sifs = match self.chan.map(|chan| chan.band()) {
             Some(channel::Band::Ghz2) => 10,
@@ -1616,6 +1808,7 @@ impl<I: Io> Device for Hardware<I> {
     /// link's address CAM entry; a key replacing one under the same entry
     /// goes in first, then the old one leaves.
     fn write_key(&mut self, key: &KeyEntry<'_>) -> Result<(), String> {
+        self.alive()?;
         let entry = usize::from(key.entry);
         if entry >= self.keys.len() {
             return Err(format!("key entry {entry}"));
@@ -1674,6 +1867,7 @@ impl<I: Io> Device for Hardware<I> {
 
     /// `rtw89_cam_sec_key_del` with the firmware told.
     fn clear_key(&mut self, entry: u8) -> Result<(), String> {
+        self.alive()?;
         let Some(index) = self.keys.get_mut(usize::from(entry)).and_then(Option::take) else {
             return Ok(());
         };
@@ -1712,6 +1906,7 @@ impl<I: Io> Device for Hardware<I> {
     /// (`rtw89_phy_cfo_track_work`, queued `cfo_timer_ms` on) runs here
     /// once due, as the Device has no timer of its own.
     fn coexist(&mut self, now: u64) -> Result<(), String> {
+        self.alive()?;
         self.now = now;
         self.cfo_work(now)
     }
@@ -1720,6 +1915,7 @@ impl<I: Io> Device for Hardware<I> {
     /// scan [`Hardware::track`] (thermal, environment monitor, DIG, RF
     /// tracking), `rtw89_phy_ra_update` and CFO tracking, in its order.
     fn watchdog(&mut self, scanning: bool, _stbc: bool) -> Result<Watched, String> {
+        self.alive()?;
         let busy = self.traffic.track();
         if scanning {
             return Ok(Watched { level: 0, busy });
@@ -1739,6 +1935,7 @@ impl<I: Io> Device for Hardware<I> {
     /// `rtw89_phy_dig_suspend` as the scan starts and
     /// `rtw89_phy_dig_resume` with the floor DIG last set as it ends.
     fn scanning(&mut self, scanning: bool) -> Result<(), String> {
+        self.alive()?;
         self.scanning = scanning;
         let address = scanning.then_some(self.link.mac_addr);
         if !scanning {
@@ -1810,6 +2007,29 @@ impl<I: Io> Device for Hardware<I> {
             self.calibrations,
             if self.vector { "msi" } else { "polled" }
         ))
+    }
+
+    /// What `rtw89_ser_notify` would start for the halt or watchdog cause a
+    /// look found, every error taken as L2: the chip brought up cold
+    /// ([`Hardware::cold_init`]) at most [`RECOVERIES`] times a minute,
+    /// then powered off for good, as is a chip whose re-init failed. What
+    /// it says names the firmware's error and rtw89's event for it.
+    fn recover(&mut self) -> Option<String> {
+        let halt = self.halted.take()?;
+        let Some(count) = self.recoveries.allow(self.now) else {
+            self.stop(&format!(
+                "rtw89: {halt}, past {RECOVERIES} cold re-inits within a minute"
+            ));
+            return self.off.clone();
+        };
+        let done = format!("rtw89: {halt}, cold re-init {count}/{RECOVERIES}");
+        match self.cold_init() {
+            Ok(()) => Some(done),
+            Err(error) => {
+                self.stop(&format!("{done} failed: {error}"));
+                self.off.clone()
+            }
+        }
     }
 }
 

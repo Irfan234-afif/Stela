@@ -679,15 +679,14 @@ impl<R: Radio> Keeper<R> {
         self.progress.failed = Some((self.progress.standing, String::from(message)));
     }
 
-    /// The radio, for device models.
-    #[cfg(test)]
-    pub(crate) fn radio(&self) -> &R {
+    /// The radio, for device models and diagnostics.
+    pub fn radio(&self) -> &R {
         &self.link
     }
 
-    /// The radio, for device models.
-    #[cfg(test)]
-    pub(crate) fn radio_mut(&mut self) -> &mut R {
+    /// The radio, for device models and diagnostics, such as a firmware
+    /// crash asked for on purpose.
+    pub fn radio_mut(&mut self) -> &mut R {
         &mut self.link
     }
 

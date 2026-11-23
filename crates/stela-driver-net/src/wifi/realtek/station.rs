@@ -305,11 +305,21 @@ pub trait Device {
     fn diagnostic(&mut self) -> Option<String> {
         None
     }
+    /// The firmware's loss since the last look, once the hardware dealt
+    /// with it: what it says of the loss and of the chip, which it brought
+    /// up cold or powered off for good. The peer, its keys and its
+    /// agreements went with the firmware. `None` while the firmware runs,
+    /// and always for rtw88's chips, whose firmware Stela never sees go.
+    fn recover(&mut self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug)]
 pub enum Error {
     Hardware(String),
+    /// The firmware went: what the hardware said of it.
+    Lost(String),
     Station(crate::wifi::station::Error),
     BlockAck(ba::Error),
     Data(data::Error),
@@ -330,6 +340,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lacks { what, chip } => write!(f, "Unsupported(\"{what} on an {chip}\")"),
+            Self::Lost(why) => f.write_str(why),
             error => write!(f, "{error:?}"),
         }
     }
@@ -633,9 +644,14 @@ impl<D: Device> Realtek<D> {
         Keeper::keep(self, network, entropy, clock)
     }
 
-    /// The device, for its models.
-    #[cfg(test)]
-    pub(crate) fn device_mut(&mut self) -> &mut D {
+    /// The device, for its models and diagnostics.
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
+    /// The device, for its models and diagnostics, such as a firmware crash
+    /// asked for on purpose.
+    pub fn device_mut(&mut self) -> &mut D {
         &mut self.device
     }
 
@@ -732,6 +748,50 @@ impl<D: Device> Realtek<D> {
         self.left = false;
         self.reporting = None;
         Ok(())
+    }
+
+    /// The firmware went, and the device says `why` and what came of it:
+    /// the hardware's half of the association goes as [`Self::clear`] has
+    /// it go, whatever the device refuses, and the station's half starts
+    /// over, for the keeper to join again from a scan once told
+    /// ([`keeper::Event::FirmwareLost`]). Nothing is replayed, as
+    /// `ieee80211_restart_hw` would replay it: the chip came up cold.
+    fn lost(&mut self, why: String) -> Result<(), Error> {
+        // A device that stays off refuses these; `why` says so.
+        let _ = self.clear();
+        self.station = Station::new(self.address).map_err(Error::Station)?;
+        self.scanner = Scanner::new(self.address).map_err(Error::Scan)?;
+        self.hop = None;
+        self.scanned = None;
+        self.observed.clear();
+        self.outbox.clear();
+        self.held.clear();
+        self.parked.clear();
+        self.changes.clear();
+        self.aggregating = Default::default();
+        self.unaggregated = [false; 8];
+        self.no_amsdu = [false; 8];
+        self.rate_amsdu = 0;
+        self.tail_joins = false;
+        self.admitted = None;
+        self.context = None;
+        self.following = None;
+        self.keys.clear();
+        self.management_cipher = None;
+        self.integrity = None;
+        self.tuned = None;
+        self.agreements = Default::default();
+        self.fragments.clear();
+        self.reporting = None;
+        self.port_open = false;
+        self.departing = None;
+        self.left = false;
+        // What the lost association's frames would have the keeper do goes
+        // with it: an EAPOL or SAE frame the halt's look still delivered.
+        self.events
+            .retain(|event| matches!(event, keeper::Event::Unsupported(_)));
+        self.events.push_back(keeper::Event::FirmwareLost);
+        Err(Error::Lost(why))
     }
 
     fn observed(&self, handle: usize) -> Result<Arc<NativeBssObservation>, Error> {
@@ -1730,6 +1790,9 @@ impl<D: Device> Realtek<D> {
     fn operate(&mut self) -> Result<(), Error> {
         let now = self.clock.now_us();
         self.take_incoming(now)?;
+        if let Some(why) = self.device.recover() {
+            return self.lost(why);
+        }
         Self::hardware(self.device.coexist(now))?;
         self.announce_streams()?;
         self.watchdog(now)?;

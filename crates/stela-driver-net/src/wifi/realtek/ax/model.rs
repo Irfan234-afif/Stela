@@ -52,6 +52,9 @@
 //! ([`Chip::tuned`]). [`Ap`] plays an AP over that: it hears what the chip
 //! hands the air, releases each frame through RPQ, answers on RXQ as an AP
 //! answers a station, and beacons while the radio stands on its channel.
+//! [`Chip::halt`] plays a firmware that halts: its error in the halt
+//! registers, the halt C2H cause in HISR0, which clears where a 1 is
+//! written, and the data rings still until the WL MAC is powered off.
 //!
 //! It checks nothing the firmware would check (no checksum, no cut) and
 //! sends no C2H on RXQ by itself. Delays take no time.
@@ -149,6 +152,9 @@ struct State {
     indirect: BTreeMap<u32, u32>,
     /// The data rings' DMA stands still.
     stalled: bool,
+    /// The firmware halted, which stalled the data rings until the WL MAC
+    /// is powered off.
+    halted: bool,
 }
 
 /// One frame a data ring handed the chip, as its DMA read it.
@@ -226,6 +232,7 @@ impl Chip {
                 rf: [BTreeMap::new(), BTreeMap::new()],
                 indirect: BTreeMap::new(),
                 stalled: false,
+                halted: false,
             }),
             domain,
         }
@@ -285,6 +292,20 @@ impl Chip {
                 }
             })
             .collect()
+    }
+
+    /// The firmware halts with `err` for `rtw89_mac_get_err_status` to read:
+    /// `R_AX_HALT_C2H` holds it, `R_AX_HALT_C2H_CTRL` is set, the halt C2H
+    /// cause latches in HISR0, and the data rings' DMA stands still until
+    /// the WL MAC is powered off.
+    pub(crate) fn halt(&self, err: u32) {
+        self.bus.set(HALT_C2H, 4, err);
+        self.bus.set(HALT_C2H_CTRL, 4, 1);
+        let causes = self.bus.get(HISR0, 4);
+        self.bus.set(HISR0, 4, causes | HALT_C2H_INT_EN);
+        let state = &mut *self.state.borrow_mut();
+        state.halted = true;
+        state.stalled = true;
     }
 
     /// Whether the data rings' DMA stands still: a kick moves nothing until
@@ -563,6 +584,7 @@ impl Chip {
         }
         Self::check(register, width);
         let cpu = self.cpu();
+        let causes = self.bus.get(HISR0, 4);
         let mut bus = &self.bus;
         match width {
             1 => Io::write8(&mut bus, register, value as u8),
@@ -570,6 +592,10 @@ impl Chip {
             _ => Io::write32(&mut bus, register, value),
         }
         .unwrap();
+        // HISR0's causes clear where a 1 is written.
+        if (register, width) == (HISR0, 4) {
+            self.bus.set(HISR0, 4, causes & !value);
+        }
         if Self::efuse_register(register, width) {
             let mut efuse = self.efuse.borrow_mut();
             match width {
@@ -660,6 +686,10 @@ impl Chip {
             if value & APFM_OFFMAC != 0 {
                 stored &= !APFM_OFFMAC;
                 state.on = false;
+                // A halted firmware's DMA stands still until the power-off.
+                if core::mem::take(&mut state.halted) {
+                    state.stalled = false;
+                }
             }
             self.bus.set(SYS_PW_CTRL, 4, stored);
         }
@@ -792,6 +822,28 @@ unsafe impl Io for Shared {
     }
     fn delay_us(&mut self, microseconds: u64) {
         Io::delay_us(&mut &*self.0, microseconds);
+    }
+}
+
+/// The chip's configuration space, for a station's cold re-init.
+impl ConfigSpace for Shared {
+    fn read8(&self, offset: u16) -> Result<u8, ConfigError> {
+        ConfigSpace::read8(&&*self.0, offset)
+    }
+    fn read16(&self, offset: u16) -> Result<u16, ConfigError> {
+        ConfigSpace::read16(&&*self.0, offset)
+    }
+    fn read32(&self, offset: u16) -> Result<u32, ConfigError> {
+        ConfigSpace::read32(&&*self.0, offset)
+    }
+    fn write8(&mut self, offset: u16, value: u8) -> Result<(), ConfigError> {
+        ConfigSpace::write8(&mut &*self.0, offset, value)
+    }
+    fn write16(&mut self, offset: u16, value: u16) -> Result<(), ConfigError> {
+        ConfigSpace::write16(&mut &*self.0, offset, value)
+    }
+    fn write32(&mut self, offset: u16, value: u32) -> Result<(), ConfigError> {
+        ConfigSpace::write32(&mut &*self.0, offset, value)
     }
 }
 
