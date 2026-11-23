@@ -760,9 +760,9 @@ fn unsupported(class: [u8; 3]) -> Option<&'static str> {
         [0x01, 0x08, _] => Some("non-NVMe non-volatile memory controller"),
         [0x01, ..] => Some("storage controller"),
         [0x02, 0x00, _] => Some("Ethernet controller whose ID no driver here takes"),
-        [0x02, 0x80, _] => {
-            Some("Wi-Fi controller other than Intel's, MediaTek's MT7925 and Realtek's RTL8822C")
-        }
+        [0x02, 0x80, _] => Some(
+            "Wi-Fi controller other than Intel's, MediaTek's MT7925 and Realtek's RTL8822C and RTL8852BE",
+        ),
         [0x02, ..] => Some("network controller whose ID no driver here takes"),
         // Admitted identities attach through the mount's native services.
         [0x04, 0x03, _] => Some("HD Audio controller outside the supported identities"),
@@ -4345,7 +4345,9 @@ mod tests {
     fn unclaimed_host_classes_are_reported_and_others_ignored() {
         assert_eq!(
             unsupported([0x02, 0x80, 0x00]),
-            Some("Wi-Fi controller other than Intel's, MediaTek's MT7925 and Realtek's RTL8822C")
+            Some(
+                "Wi-Fi controller other than Intel's, MediaTek's MT7925 and Realtek's RTL8822C and RTL8852BE"
+            )
         );
         assert_eq!(
             unsupported([0x01, 0x04, 0x00]),

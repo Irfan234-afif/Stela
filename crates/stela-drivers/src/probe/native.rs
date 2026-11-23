@@ -71,7 +71,7 @@ pub(super) enum Kind {
     IntelWifi,
     /// A MediaTek Wi-Fi function; only MT7925 attaches.
     MediatekWifi,
-    /// A Realtek Wi-Fi function; only RTL8822C attaches.
+    /// An RTL8822C, which attaches as an rtw88 station.
     RealtekWifi,
     /// An RTL8852BE, which attaches as an rtw89 station.
     RealtekAxWifi,
