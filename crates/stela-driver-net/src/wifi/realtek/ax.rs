@@ -38,6 +38,7 @@ pub mod cam;
 pub mod capabilities;
 pub mod coex;
 pub mod dle;
+pub mod dynamic;
 pub mod efuse;
 pub mod elements;
 pub mod features;

@@ -17,7 +17,8 @@
 //!   with `rtw89_core_update_phy_ppdu` (the PHY status header's IE map and
 //!   RSSI), and `rtw89_core_rx_parse_phy_sts` (the IEs walked by AX's
 //!   `physt_ie_len`, IE00 and IE01 parsed by `rtw89_core_parse_phy_status_ie00`
-//!   and `_ie01`, then `__rtw8852bx_convert_rpl_to_rssi`);
+//!   and `_ie01`, the latter's CFO kept for `rtw89_phy_cfo_parse`
+//!   ([`PhyPpdu::cfo`]), then `__rtw8852bx_convert_rpl_to_rssi`);
 //! - [`RxStatus::update`]: the part of `rtw89_core_update_rx_status` the
 //!   PPDU match and the report read: the tuned frequency, the FCS and
 //!   decryption flags, the bandwidth, rate index and GI the match compares;
@@ -36,8 +37,8 @@
 //!   `rtw89_pci_rxbd_deliver_skbs` reassembles: an RX buffer holds 11498
 //!   bytes, more than the longest MPDU, so [`split`] refuses a segment.
 //! - What `rtw89_core_rx_to_mac80211` and its helpers do for mac80211:
-//!   radiotap, statistics, station and CFO tracking
-//!   (`rtw89_phy_cfo_parse`), antenna diversity, the packet number check,
+//!   radiotap, statistics, station tracking, antenna diversity, the packet
+//!   number check,
 //!   the MCC correction and `rtw89_correct_cck_chan`, which moves a CCK rate
 //!   reported on 5 GHz to the previous channel: Stela has no previous
 //!   channel and reports the rate as read. IE09 and IE10, which rtw89 parses
@@ -137,6 +138,9 @@ pub const PHY_STS_IE00_W3_RX_PATH_EN: u32 = 0xf000_0000;
 pub const PHY_STS_IE01_W0_RSSI_AVG_FD: u32 = 0x0000_ff00;
 pub const PHY_STS_IE01_W0_CH_IDX: u32 = 0x00ff_0000;
 pub const PHY_STS_IE01_W0_RX_PATH_EN: u32 = 0xf000_0000;
+/// `RTW89_PHY_STS_IE01_W1_FD_CFO`: the CFO RTL8852B reports
+/// (`cfo_src_fd`), S(12,2).
+pub const PHY_STS_IE01_W1_FD_CFO: u32 = 0x000f_ff00;
 pub const PHY_STS_IE01_W2_AVG_SNR: u32 = 0x0000_003f;
 pub const PHY_STS_IE01_W2_EVM_MAX: u32 = 0x0000_ff00;
 pub const PHY_STS_IE01_W2_EVM_MIN: u32 = 0x00ff_0000;
@@ -400,6 +404,11 @@ pub struct PhyPpdu {
     /// IE01's FD average. Only an A1-matched report carries that average;
     /// the others' RSSI comes out as the header's less its own average.
     pub hdr_rssi: Option<[u8; RF_PATH_NUM]>,
+    /// The CFO an A1-matched OFDM report's IE01 carried, sign-extended from
+    /// its 12 FD bits (RTL8852B's `cfo_src_fd`): what rtw89 hands
+    /// `rtw89_phy_cfo_parse` with `mac_id`, for
+    /// [`super::dynamic::Dynamic::cfo_parse`].
+    pub cfo: Option<i16>,
 }
 
 impl PhyPpdu {
@@ -597,8 +606,9 @@ fn process_phy_status_ie(ie: &[u8], phy: &mut PhyPpdu) {
             phy.evm_max = field(w(2), PHY_STS_IE01_W2_EVM_MAX) as u8;
             phy.evm_min = field(w(2), PHY_STS_IE01_W2_EVM_MIN) as u8;
             phy.ofdm_has = true;
-            // rtw89_phy_cfo_parse feeds CFO tracking, which Stela runs
-            // none of.
+            // The sign conversion for S(12,2), for rtw89_phy_cfo_parse.
+            let cfo = field(w(1), PHY_STS_IE01_W1_FD_CFO);
+            phy.cfo = Some(((cfo << 20) as i32 >> 20) as i16);
         }
         // rtw89_core_parse_phy_status_ie09 with physt_gen 0.
         PHYSTS_IE09_FTR_0 => phy.ie09 = true,
