@@ -1228,3 +1228,71 @@ fn a_wpa3_sae_station_keeps_its_association_through_repeated_group_rekeys() {
     assert_eq!(bench.wifi.radio().station().phase(), Phase::Associated);
     assert_eq!(bench.wifi.radio().device().recoveries(), 0);
 }
+
+#[test]
+fn a_wpa3_sae_station_rides_out_lost_beacons_and_rejoins_once_its_ap_is_back() {
+    let mut bench = bench(Protection::Wpa3Sae);
+    bench.join();
+    let downloads = bench.chip.attempts().len();
+    // The beacons stop, but the AP still acknowledges: the station's
+    // nullfunc probe keeps the association.
+    bench.ap.quiet = true;
+    let from = bench.chip.sent_count();
+    let probed = |bench: &mut Bench| {
+        bench
+            .chip
+            .sent_from(from)
+            .iter()
+            .any(|sent| sent.frame[0] & 0x7f == 0x48)
+    };
+    assert!(bench.run(probed), "no probe of the AP");
+    for _ in 0..200 {
+        assert!(bench.wifi.carrier());
+        bench.ap.serve(&bench.chip);
+        crate::test_clock::advance(CLOCK, 5_000);
+    }
+    // Gone as well: the probe goes unacknowledged and the connection is
+    // lost.
+    bench.ap.gone = true;
+    assert!(bench.run(|bench| !bench.wifi.carrier()), "kept a gone AP");
+    // Back: the station scans, authenticates by SAE and keys up again, on
+    // the chip it had.
+    bench.ap.quiet = false;
+    bench.ap.gone = false;
+    let mut ap = bench.join();
+    bench.rekey(&mut ap, 2, 1, 2, [0x6a; 16]);
+    bench.group_data(3, 2, 0x4a);
+    assert_eq!(bench.chip.attempts().len(), downloads);
+}
+
+#[test]
+fn a_firmware_halt_in_the_middle_of_a_group_rekey_is_recovered_and_keyed_again() {
+    let mut bench = bench(Protection::Wpa3Sae);
+    let mut ap = bench.join();
+    bench.rekey(&mut ap, 2, 1, 2, [0x61; 16]);
+    // The next rekey's message 1 arrives with the firmware's halt, an
+    // assertion.
+    let from = bench.chip.sent_count();
+    let message = ap.group_message_1_with(1, &[0x62; 16], &igtk_kde(4, [0x9d; 16]));
+    let frame = data(bench.local.0, 4, [0x88, 0x8e], &message, Some((0, 2)));
+    bench.hear(&frame, true);
+    bench.chip.halt(0x3000_0042);
+    assert_eq!(
+        bench.lost(),
+        "rtw89: firmware halted (err status 0x4000, SER_EV_L2_RESET), cold re-init 1/3"
+    );
+    // The interrupted rekey went with the firmware: nothing answered it.
+    assert_eq!(bench.answers(from), Vec::<Vec<u8>>::new());
+    // Joined again from SAE and a new 4-way handshake, whose keys alone
+    // the new firmware holds, then rekeyed.
+    let mut ap = bench.join();
+    let gtks: Vec<_> = sec_cam(&bench.chip.commands())
+        .into_iter()
+        .map(|key| key.payload[8])
+        .collect();
+    assert!(!gtks.contains(&0x61) && !gtks.contains(&0x62), "{gtks:x?}");
+    bench.rekey(&mut ap, 2, 1, 2, [0x63; 16]);
+    bench.group_data(3, 2, 0x43);
+    assert!(bench.wifi.carrier());
+    assert_eq!(bench.wifi.radio().device().recoveries(), 1);
+}
