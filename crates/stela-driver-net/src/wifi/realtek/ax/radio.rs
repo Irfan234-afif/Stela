@@ -63,6 +63,10 @@
 //! finds it cold. A stage that fails reads the same registers and powers
 //! the chip off, once it was powered on.
 //!
+//! Steps 2 to the start of 8 are [`power_up`], and what step 1 reads for TX
+//! power is [`TxPower`]: the station's hardware ([`super::hardware`]) brings
+//! the interface up through them too, then tunes as its station asks.
+//!
 //! What this leaves out, and why:
 //! - The rest of `rtw89_phy_dm_init`: the statistics, diagnostics, CCX and
 //!   NHM monitors, the PHY status IE bitmaps (`rtw89_physts_parsing_init`),
@@ -88,12 +92,13 @@
 //! proves the radio receives on the channel.
 use super::{
     super::{
-        firmware::Layout,
+        firmware::{Layout, Rtw89},
         identity::{Chip, StageError},
     },
     bootstrap::Report as Stage1,
     coex,
     dle::{self, PreInit},
+    efuse::Info,
     elements::{self, Board, Elements, Id},
     fwdl::{self, Downloaded},
     h2c::Channel as H2c,
@@ -719,7 +724,7 @@ pub unsafe fn run<I: Io, C: ConfigSpace + ?Sized>(
 
 /// `rtw89_mac_pwr_on` and `rtw89_mac_pwr_off`'s inputs once probe is done:
 /// the cut and what the efuse gave.
-fn power_inputs(stage1: &Stage1) -> power::Inputs {
+pub fn power_inputs(stage1: &Stage1) -> power::Inputs {
     let efuse = &stage1.info.efuse;
     power::Inputs {
         cut: stage1.version.cut,
@@ -728,6 +733,50 @@ fn power_inputs(stage1: &Stage1) -> power::Inputs {
         power_k_valid: efuse.power_k_valid,
         probe_done: true,
     }
+}
+
+/// The TX power reads every channel switch makes, owned: what
+/// [`Stage::Tables`] reads of the firmware's elements for TX power
+/// ([`txpower::Tables::load`]), TSSI's tracking deltas ([`TrkDeltas`]) and
+/// the regulation ([`Regulation::new`]).
+pub struct TxPower {
+    pub tables: txpower::Tables,
+    pub deltas: TrkDeltas,
+    pub regulation: Regulation,
+}
+
+impl TxPower {
+    /// The TX power tables of `elements`, the tracking deltas, and the
+    /// regulation of the efuse's country and the stack's `alpha2`
+    /// (`--wifi-country`, `"00"` when none).
+    pub fn load(elements: &Elements<'_>, info: &Info, alpha2: [u8; 2]) -> Result<Self, Error> {
+        let tables =
+            txpower::Tables::load(elements.rfe_data.as_ref()).map_err(Error::TxpwrTables)?;
+        let deltas = elements
+            .txpwr_trk
+            .as_ref()
+            .and_then(TrkDeltas::from_elements)
+            .ok_or(Error::TxpwrTrk)?;
+        let regulation = Regulation::new(regd::map(elements), info.efuse.country_code, alpha2);
+        Ok(Self {
+            tables,
+            deltas,
+            regulation,
+        })
+    }
+}
+
+/// What [`power_up`] leaves for the channel switches and calibrations
+/// that follow it.
+pub struct Running {
+    /// The register mailbox the download opened, through which the
+    /// scheduler's TX is stopped and resumed.
+    pub mailbox: Mailbox,
+    /// The RF calibrations' state after RFK init.
+    pub state: Box<State>,
+    /// What a channel switch reads besides the channel: the BB gain table's
+    /// values, the efuse gains, the RPL biases and the RX antennas.
+    pub inputs: channel::Inputs,
 }
 
 /// [`run`]'s stages, each begun through `begin`, what each learns put in
@@ -753,8 +802,7 @@ unsafe fn bring_up<I: Io, C: ConfigSpace + ?Sized>(
 ) -> Result<(), Error> {
     let cut = stage1.version.cut;
     let info = &stage1.info;
-    let rfe = info.efuse.rfe_type;
-    let board = Board::rtl8852b(rfe, cut);
+    let board = Board::rtl8852b(info.efuse.rfe_type, cut);
     let chan = plan.channel;
 
     begin(Stage::Tables);
@@ -764,20 +812,9 @@ unsafe fn bring_up<I: Io, C: ConfigSpace + ?Sized>(
     };
     let elements = Elements::recognize(suit, board).map_err(Error::Elements)?;
     let tables = Tables::from_elements(&elements).map_err(Error::PhyTable)?;
-    let txpwr_tables =
-        txpower::Tables::load(elements.rfe_data.as_ref()).map_err(Error::TxpwrTables)?;
-    let deltas = elements
-        .txpwr_trk
-        .as_ref()
-        .and_then(TrkDeltas::from_elements)
-        .ok_or(Error::TxpwrTrk)?;
-    let regulation = Regulation::new(
-        regd::map(&elements),
-        info.efuse.country_code,
-        plan.alpha2.unwrap_or(*b"00"),
-    );
+    let power = TxPower::load(&elements, info, plan.alpha2.unwrap_or(*b"00"))?;
     let txchan = chan.txpower();
-    if !regulation.permits(&txchan) {
+    if !power.regulation.permits(&txchan) {
         return Err(Error::NotPermitted);
     }
     let (cap, country_cap) = match plan.country {
@@ -790,91 +827,22 @@ unsafe fn bring_up<I: Io, C: ConfigSpace + ?Sized>(
         None => (Cap::NONE, false),
     };
     report.regulated = Some(Regulated {
-        alpha2: regulation.regd().alpha2,
-        programmed: regulation.programmed,
+        alpha2: power.regulation.regd().alpha2,
+        programmed: power.regulation.programmed,
         cap,
         country_cap,
     });
 
-    begin(Stage::PowerOn);
-    let inputs = power_inputs(stage1);
-    report.powered = Some(power::power_on(io, &inputs).map_err(Error::PowerOn)?);
-    *powered = true;
-    phy::init_bb_afe(io, tables.afe.as_ref(), &mut report.phy_warnings).map_err(Error::Phy)?;
-
-    begin(Stage::DmacPreInit);
-    report.pre_init = Some(dle::partial_init_before_hci(io).map_err(Error::DmacPreInit)?);
-
-    begin(Stage::PciePreInit);
-    // SAFETY: the caller's contract: `io` and `config` reach the function
-    // whose DMA domain `rings` was allocated in, its DMA stopped by the
-    // power-off, and the caller keeps `rings`.
-    unsafe { pci::mac_pre_init(io, config, rings) }.map_err(Error::PciePreInit)?;
-
-    begin(Stage::Download);
-    let downloaded = fwdl::download(io, rings, h2c, &suit.image, &stage1.secure)
-        .map_err(|failure| Error::Download(Box::new(failure)))?;
-    report.downloaded = Some(downloaded);
-    let mut mailbox = Mailbox::after_download(&downloaded);
-
-    begin(Stage::MacInit);
-    report.mac = Some(
-        mac::init(
-            io,
-            &mut Fwcmd {
-                channel: h2c,
-                rings,
-            },
+    // SAFETY: the caller's contract.
+    let Running {
+        mut mailbox,
+        mut state,
+        inputs,
+    } = unsafe {
+        power_up(
+            io, rings, h2c, config, stage1, suit, &tables, report, powered, begin,
         )
-        .map_err(Error::Mac)?,
-    );
-
-    begin(Stage::BbRf);
-    let load = phy::load(
-        io,
-        &mut Fwcmd {
-            channel: h2c,
-            rings,
-        },
-        &tables,
-        board,
-    )
-    .map_err(Error::Phy)?;
-    report.phy_warnings.extend_from_slice(&load.warnings);
-
-    begin(Stage::Coex);
-    report.coex = Some(
-        coex::init_wl_only(
-            io,
-            &mut Fwcmd {
-                channel: h2c,
-                rings,
-            },
-            rfe,
-            cut,
-        )
-        .map_err(Error::Io)?,
-    );
-
-    begin(Stage::DmInit);
-    let (offset_base, rssi_base) = bb_sethw(io).map_err(Error::Io)?;
-    report.bases = Some((offset_base, rssi_base));
-    phy::init_rf_nctl(io, &tables, board, &mut report.phy_warnings).map_err(Error::Phy)?;
-    let mut state = Box::<State>::default();
-    let refused = rfk::init(
-        io,
-        &mut MacScheduler {
-            firmware: Some(&mut mailbox),
-        },
-        &mut state,
-    );
-    report.rfk = Some(state.clone());
-    report.rfk_init = Some(refused.map_err(Error::Io)?);
-    rtw8852b_txpower::set_txpwr_ctrl(io).map_err(Error::Io)?;
-
-    begin(Stage::Start);
-    report.ppdu_status = ignored(channel::cfg_ppdu_status(io, true)).map_err(Error::PpduStatus)?;
-    update_rts_threshold(io).map_err(Error::Io)?;
+    }?;
     // rtw89_hci_start: Stela polls RXQ from here on.
     let band = match chan.band() {
         channel::Band::Ghz2 => NL80211_BAND_2GHZ,
@@ -885,27 +853,19 @@ unsafe fn bring_up<I: Io, C: ConfigSpace + ?Sized>(
     report.rx_filter = Some(set_rx_fltr(io, SCAN_RX_FLTR).map_err(Error::Io)?);
 
     begin(Stage::Channel);
-    let inputs = channel::Inputs {
-        bb_gain: BbGain::from_table(&load.bb_gain),
-        efuse_gain: info.efuse_gain,
-        offset_base,
-        rssi_base,
-        antenna_rx: info.hal.antenna_rx,
-        monitor: false,
-    };
-    let power = Power {
-        tables: &txpwr_tables,
-        regulation: &regulation,
+    let txpwr = Power {
+        tables: &power.tables,
+        regulation: &power.regulation,
         cap,
     };
     let switched = channel::switch(io, Some(&mut mailbox), &chan, &inputs, None, |io, _| {
-        rtw8852b_txpower::set_txpwr(io, &power, &txchan)
+        rtw8852b_txpower::set_txpwr(io, &txpwr, &txchan)
     })
     .map_err(Error::Io)?;
     report.switched = Some(switched);
     let tssi = tssi::Inputs {
         efuse: &info.tssi,
-        deltas: &deltas,
+        deltas: &power.deltas,
         gain: &inputs,
     };
     if switched.band_notice {
@@ -953,6 +913,132 @@ unsafe fn bring_up<I: Io, C: ConfigSpace + ?Sized>(
     );
     report.heard = Some(heard);
     listened.map_err(Error::Rings)
+}
+
+/// [`Stage::PowerOn`] to the start of [`Stage::Start`] on the chip stage 1
+/// (`stage1`) left powered off, with the image `suit` and the BB, RF and
+/// NCTL `tables` [`Stage::Tables`] read: the power-on and AFE, the partial
+/// init with its download, the MAC init, the BB and RF tables, coex
+/// WL-only, the DM init with RFK init, and the start's PPDU status and RTS
+/// threshold, each stage begun through `begin`, what each learns put in
+/// `report`, `powered` set once the power-on succeeded. What stays of the
+/// start, the first drain of RXQ and the RX filter, is the caller's, as is
+/// every channel.
+///
+/// # Safety
+/// [`run`]'s contract, for `io`, `rings`, `h2c` and `config`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stage-1 owners and the tables the bring-up loads"
+)]
+pub unsafe fn power_up<I: Io, C: ConfigSpace + ?Sized>(
+    io: &mut I,
+    rings: &mut Rings,
+    h2c: &mut H2c<'_>,
+    config: &mut C,
+    stage1: &Stage1,
+    suit: &Rtw89<'_>,
+    tables: &Tables<'_>,
+    report: &mut Report,
+    powered: &mut bool,
+    begin: &mut dyn FnMut(Stage),
+) -> Result<Running, Error> {
+    let cut = stage1.version.cut;
+    let info = &stage1.info;
+    let rfe = info.efuse.rfe_type;
+    let board = Board::rtl8852b(rfe, cut);
+
+    begin(Stage::PowerOn);
+    let inputs = power_inputs(stage1);
+    report.powered = Some(power::power_on(io, &inputs).map_err(Error::PowerOn)?);
+    *powered = true;
+    phy::init_bb_afe(io, tables.afe.as_ref(), &mut report.phy_warnings).map_err(Error::Phy)?;
+
+    begin(Stage::DmacPreInit);
+    report.pre_init = Some(dle::partial_init_before_hci(io).map_err(Error::DmacPreInit)?);
+
+    begin(Stage::PciePreInit);
+    // SAFETY: the caller's contract: `io` and `config` reach the function
+    // whose DMA domain `rings` was allocated in, its DMA stopped by the
+    // power-off, and the caller keeps `rings`.
+    unsafe { pci::mac_pre_init(io, config, rings) }.map_err(Error::PciePreInit)?;
+
+    begin(Stage::Download);
+    let downloaded = fwdl::download(io, rings, h2c, &suit.image, &stage1.secure)
+        .map_err(|failure| Error::Download(Box::new(failure)))?;
+    report.downloaded = Some(downloaded);
+    let mut mailbox = Mailbox::after_download(&downloaded);
+
+    begin(Stage::MacInit);
+    report.mac = Some(
+        mac::init(
+            io,
+            &mut Fwcmd {
+                channel: h2c,
+                rings,
+            },
+        )
+        .map_err(Error::Mac)?,
+    );
+
+    begin(Stage::BbRf);
+    let load = phy::load(
+        io,
+        &mut Fwcmd {
+            channel: h2c,
+            rings,
+        },
+        tables,
+        board,
+    )
+    .map_err(Error::Phy)?;
+    report.phy_warnings.extend_from_slice(&load.warnings);
+
+    begin(Stage::Coex);
+    report.coex = Some(
+        coex::init_wl_only(
+            io,
+            &mut Fwcmd {
+                channel: h2c,
+                rings,
+            },
+            rfe,
+            cut,
+        )
+        .map_err(Error::Io)?,
+    );
+
+    begin(Stage::DmInit);
+    let (offset_base, rssi_base) = bb_sethw(io).map_err(Error::Io)?;
+    report.bases = Some((offset_base, rssi_base));
+    phy::init_rf_nctl(io, tables, board, &mut report.phy_warnings).map_err(Error::Phy)?;
+    let mut state = Box::<State>::default();
+    let refused = rfk::init(
+        io,
+        &mut MacScheduler {
+            firmware: Some(&mut mailbox),
+        },
+        &mut state,
+    );
+    report.rfk = Some(state.clone());
+    report.rfk_init = Some(refused.map_err(Error::Io)?);
+    rtw8852b_txpower::set_txpwr_ctrl(io).map_err(Error::Io)?;
+
+    begin(Stage::Start);
+    report.ppdu_status = ignored(channel::cfg_ppdu_status(io, true)).map_err(Error::PpduStatus)?;
+    update_rts_threshold(io).map_err(Error::Io)?;
+    Ok(Running {
+        mailbox,
+        state,
+        inputs: channel::Inputs {
+            bb_gain: BbGain::from_table(&load.bb_gain),
+            efuse_gain: info.efuse_gain,
+            offset_base,
+            rssi_base,
+            antenna_rx: info.hal.antenna_rx,
+            monitor: false,
+        },
+    })
 }
 
 /// A result rtw89 ignores: kept, unless the interface refused an access.

@@ -541,6 +541,9 @@ pub(crate) enum Placement {
     Oracle,
     /// The oracle's, but mapping `index` at `address`.
     Moved { index: usize, address: u64 },
+    /// The oracle's pools, then each mapping on its own pages, a page
+    /// apart however large it is: for a test that maps more than the rings.
+    Packed,
 }
 
 struct Mapped {
@@ -553,6 +556,8 @@ struct Mapped {
 #[derive(Default)]
 struct DomainState {
     maps: usize,
+    /// Where [`Placement::Packed`] places its next mapping.
+    next: u64,
     mappings: BTreeMap<u64, Mapped>,
     unmaps: usize,
     /// The address of every mapping unmapped, in order.
@@ -637,6 +642,11 @@ unsafe impl DmaDomain for Domain {
                 index: moved,
                 address,
             } if moved == index => address,
+            Placement::Packed if index > 1 => {
+                let address = state.next.max(RX_BUF_DMA);
+                state.next = address + pages.bytes().next_multiple_of(0x1000) as u64 + 0x1000;
+                address
+            }
             _ => match index {
                 0 => TX_POOL_DMA,
                 1 => RX_POOL_DMA,
