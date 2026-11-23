@@ -75,9 +75,10 @@ pub enum Error {
     IntelWifi(net::wifi::intel::attach::AttachError),
     MediatekWifi(net::wifi::mediatek::attach::AttachError),
     RealtekWifi(net::wifi::realtek::attach::AttachError),
-    /// An RTL8852BE's stage 1 stopped, or the chip was left off, or its
-    /// power-off failed ([`net::wifi::realtek::ax::attach::Outcome::no_station`]).
-    RealtekAxWifi(net::wifi::realtek::ax::attach::NoStation),
+    /// An RTL8852BE runs no station: it was left off, its stage 1 stopped,
+    /// or its station did not start
+    /// ([`net::wifi::realtek::ax::attach::Outcome::unattached`]).
+    RealtekAxWifi(net::wifi::realtek::ax::attach::Unattached),
     IntelBluetooth(crate::bluetooth::intel_pcie::Error),
     Bcm4377(crate::bluetooth::bcm4377::Error),
     Ehci(usb::ehci::Error),
@@ -328,10 +329,13 @@ pub enum Adapter {
     IntelWifi(Box<native::Located<native::IntelWifi>>),
     MediatekWifi(Box<native::Located<native::MediatekWifi>>),
     RealtekWifi(Box<native::Located<native::RealtekWifi>>),
+    /// An RTL8852BE station (rtw89).
+    RealtekAxWifi(Box<native::Located<native::RealtekAxWifi>>),
 }
 
 impl Adapter {
     /// Stable implementation name for diagnostics and driver verification.
+    /// A Wi-Fi station's is its kind's ([`native::Kind::radio`]).
     pub fn driver(&self) -> &'static str {
         match self {
             Self::Virtio(_) => "virtio-net",
@@ -344,21 +348,47 @@ impl Adapter {
             Self::Usb(_) => "usb-cdc",
             Self::Tg3(_) => "tg3",
             Self::Aqtion(_) => "atlantic",
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(_) => "iwlwifi",
-            Self::MediatekWifi(_) => "mt7925e",
-            Self::RealtekWifi(_) => "rtw88_8822ce",
             Self::UsbVendor(device) => device.driver(),
+            _ => self
+                .radio()
+                .and_then(native::Kind::radio)
+                .unwrap_or("Wi-Fi"),
+        }
+    }
+
+    /// The native kind a Wi-Fi station attached as, `None` for a wired
+    /// adapter.
+    fn radio(&self) -> Option<native::Kind> {
+        match self {
+            #[cfg(feature = "native-acpi")]
+            Self::IntelWifi(_) => Some(native::Kind::IntelWifi),
+            Self::MediatekWifi(_) => Some(native::Kind::MediatekWifi),
+            Self::RealtekWifi(_) => Some(native::Kind::RealtekWifi),
+            Self::RealtekAxWifi(_) => Some(native::Kind::RealtekAxWifi),
+            _ => None,
         }
     }
 
     /// Whether the adapter is a Wi-Fi radio rather than a wired port.
     pub fn wireless(&self) -> bool {
+        self.radio().is_some()
+    }
+
+    /// The association of an RTL8852BE station whose port is open: the
+    /// network, the AP, its AID and the suites, for the Wi-Fi check.
+    pub fn associated(&self) -> Option<net::wifi::connection::keeper::Association> {
         match self {
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(_) => true,
-            Self::MediatekWifi(_) | Self::RealtekWifi(_) => true,
-            _ => false,
+            Self::RealtekAxWifi(device) => device.link.associated(),
+            _ => None,
+        }
+    }
+
+    /// Where an RTL8852BE station's connection stands and how its attempts
+    /// went, for the Wi-Fi check.
+    pub fn progress(&self) -> Option<net::wifi::connection::keeper::Progress> {
+        match self {
+            Self::RealtekAxWifi(device) => Some(device.link.progress()),
+            _ => None,
         }
     }
 
@@ -381,15 +411,19 @@ impl Adapter {
             Self::IntelWifi(device) => &device.location,
             Self::MediatekWifi(device) => &device.location,
             Self::RealtekWifi(device) => &device.location,
+            Self::RealtekAxWifi(device) => &device.location,
         }
     }
 }
 
 impl Link for Adapter {
-    /// The driver's own state line, where it keeps one (RTL8168 family).
+    /// The driver's own state line, where it keeps one: the RTL8168 family's
+    /// registers and rings, and an RTL8852BE station's connection and TX
+    /// releases.
     fn diagnostic(&mut self) -> Option<String> {
         match self {
             Self::Realtek(device) => device.diagnostic(),
+            Self::RealtekAxWifi(device) => device.link.diagnostic(),
             _ => None,
         }
     }
@@ -411,6 +445,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.mac(),
             Self::MediatekWifi(device) => device.mac(),
             Self::RealtekWifi(device) => device.mac(),
+            Self::RealtekAxWifi(device) => device.mac(),
         }
     }
     fn carrier(&mut self) -> bool {
@@ -431,6 +466,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.carrier(),
             Self::MediatekWifi(device) => device.carrier(),
             Self::RealtekWifi(device) => device.carrier(),
+            Self::RealtekAxWifi(device) => device.carrier(),
         }
     }
     fn carrier_wait_us(&self) -> u64 {
@@ -451,6 +487,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.carrier_wait_us(),
             Self::MediatekWifi(device) => device.carrier_wait_us(),
             Self::RealtekWifi(device) => device.carrier_wait_us(),
+            Self::RealtekAxWifi(device) => device.carrier_wait_us(),
         }
     }
     fn signals(&self) -> bool {
@@ -471,6 +508,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.signals(),
             Self::MediatekWifi(device) => device.signals(),
             Self::RealtekWifi(device) => device.signals(),
+            Self::RealtekAxWifi(device) => device.signals(),
         }
     }
     fn retarget(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
@@ -485,6 +523,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.due_us(),
             Self::MediatekWifi(device) => device.due_us(),
             Self::RealtekWifi(device) => device.due_us(),
+            Self::RealtekAxWifi(device) => device.link.due_us(),
             _ => None,
         }
     }
@@ -506,6 +545,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.transmit(frame),
             Self::MediatekWifi(device) => device.transmit(frame),
             Self::RealtekWifi(device) => device.transmit(frame),
+            Self::RealtekAxWifi(device) => device.transmit(frame),
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
@@ -526,6 +566,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.receive(),
             Self::MediatekWifi(device) => device.receive(),
             Self::RealtekWifi(device) => device.receive(),
+            Self::RealtekAxWifi(device) => device.receive(),
         }
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
@@ -546,6 +587,7 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.receive_reusing(frame),
             Self::MediatekWifi(device) => device.receive_reusing(frame),
             Self::RealtekWifi(device) => device.receive_reusing(frame),
+            Self::RealtekAxWifi(device) => device.receive_reusing(frame),
         }
     }
 }
@@ -894,8 +936,8 @@ pub struct Devices {
     /// their class and why.
     pub unsupported: Vec<(Address, [u8; 3], &'static str)>,
     /// The RTL8852B functions a boot given a `--wifi` network took through
-    /// stage 1: each is also in [`Self::unsupported`] (stage 1 reached the
-    /// efuse and the chip is off again) or [`Self::failures`].
+    /// stage 1: each is also in [`Self::nics`] (its station) or
+    /// [`Self::failures`] (why it runs none).
     pub rtl8852b: Vec<Rtl8852b>,
     /// PCI bridges found with bus mastering off, which the scan turned on
     /// so the functions below them reach memory and the interrupt
@@ -1351,8 +1393,8 @@ struct WifiInputs<'a> {
     observations: net::wifi::intel::platform::Observations,
     firmware: &'static dyn crate::firmware::Provider,
     network: &'a Network,
-    /// The channel an RTL8852BE's stage 2 listens on, when the boot named
-    /// one (`--wifi-check-channel`).
+    /// The channel an RTL8852BE's stage 2 listens on before its station
+    /// starts, for the Wi-Fi check; `None` without the check.
     channel: Option<net::wifi::realtek::ax::rtw8852b::channel::Channel>,
 }
 
@@ -1538,11 +1580,15 @@ unsafe fn realtek_wifi(
     unsafe { native::realtek_wifi(services, address, completion, inputs) }
 }
 
-/// Take the RTL8852BE at `address` through stage 1, then stage 2 on
-/// `wifi.channel` (channel 36 at 80 MHz by default), and leave it cold.
-/// Stage 1 transmits nothing; stage 2's RF calibrations do, at the TX power
+/// Attach the RTL8852BE at `address` as a station kept joined to
+/// `wifi.network`, after stage 1 and, for the Wi-Fi check, stage 2's listen
+/// on `wifi.channel`. Stage 1 transmits nothing, so it runs whatever the
+/// regulatory data; the listen's RF calibrations transmit at the TX power
 /// the network's country gives in regulatory.db when both are there, and
-/// at rtw89's own bound otherwise, as rtw89 runs without regulatory.db.
+/// at rtw89's own bound otherwise, as rtw89 runs without regulatory.db. The
+/// station starts only with regulatory.db's rules for the network's country
+/// (the world's without one) and the services' entropy; without them the
+/// chip stays off. `completion` is the message its MSI sends.
 ///
 /// # Safety
 /// As for [`intel_wifi`].
@@ -1553,6 +1599,7 @@ unsafe fn realtek_wifi(
 unsafe fn realtek_ax_wifi(
     services: &dyn NativeServices,
     address: Address,
+    completion: Option<crate::bus::irq::MsiMessage>,
     wifi: &WifiInputs<'_>,
     regulatory: &Option<
         Result<
@@ -1561,7 +1608,10 @@ unsafe fn realtek_ax_wifi(
         >,
     >,
 ) -> Result<native::RealtekAx, native::Failure> {
-    use net::wifi::realtek::ax::radio::{LISTEN_US, Plan};
+    use net::wifi::realtek::ax::{
+        attach::Join,
+        radio::{LISTEN_US, Plan},
+    };
     let inputs = net::wifi::realtek::ax::attach::Inputs {
         firmware: wifi.firmware,
         pages: services.pages(),
@@ -1572,15 +1622,36 @@ unsafe fn realtek_ax_wifi(
         (Some(alpha2), Some(Ok(database))) => database.clone().select(alpha2).ok(),
         _ => None,
     };
-    let plan = Plan {
-        channel: wifi.channel.unwrap_or_else(Plan::default_channel),
+    let plan = wifi.channel.map(|channel| Plan {
+        channel,
         alpha2,
         country: country.as_ref(),
         listen_us: LISTEN_US,
         clock: wifi.clock,
-    };
+    });
+    let join = match regulatory {
+        Some(Ok(database)) => {
+            let alpha2 = alpha2.unwrap_or(*b"00");
+            database.clone().select(alpha2).map_err(|error| {
+                alloc::format!("regulatory.db country {}: {error:?}", alpha2.escape_ascii())
+            })
+        }
+        Some(Err(error)) => Err(alloc::format!("no regulatory database: {error:?}")),
+        None => Err(String::from("no regulatory database")),
+    }
+    .and_then(|country| {
+        let entropy = services
+            .entropy()
+            .map_err(|error| alloc::format!("no entropy for its handshakes: {error}"))?;
+        Ok(Join {
+            network: wifi.network.clone(),
+            country,
+            entropy,
+            vector: false,
+        })
+    });
     // SAFETY: forwarded from the caller.
-    unsafe { native::realtek_ax_wifi(services, address, inputs, &plan) }
+    unsafe { native::realtek_ax_wifi(services, address, completion, inputs, plan.as_ref(), join) }
 }
 
 /// Attach the Broadcom PCIe Bluetooth function at `address` with its
@@ -1746,9 +1817,9 @@ fn network_handoff(handoff: &Handoff) -> Handoff {
     }
 }
 
-/// [`probe_with_provider`], with `observer` told of each start and an
-/// RTL8852BE's stage 2 listening on `wifi_channel` (channel 36 at 80 MHz
-/// when `None`).
+/// [`probe_with_provider`], with `observer` told of each start and, for
+/// the Wi-Fi check, an RTL8852BE's stage 2 listening on `wifi_channel`
+/// before its station starts (no listen when `None`).
 ///
 /// # Safety
 /// As for [`probe_with_provider`]; `observer` drives no device the probe
@@ -2823,15 +2894,23 @@ unsafe fn attach_native(
                 return;
             };
             // SAFETY: as for tg3 below.
-            match unsafe { realtek_ax_wifi(services, address, wifi, &devices.regulatory) } {
+            match unsafe {
+                realtek_ax_wifi(
+                    services,
+                    address,
+                    inputs.handoff.completion,
+                    wifi,
+                    &devices.regulatory,
+                )
+            } {
                 Ok(found) => {
-                    match found.outcome.no_station() {
-                        None => devices.unsupported.push((
-                            address,
-                            function.class,
-                            net::wifi::realtek::ax::attach::NO_STATION,
-                        )),
-                        Some(why) => devices.failures.push((address, Error::RealtekAxWifi(why))),
+                    match (found.station, found.outcome.unattached()) {
+                        (Some(station), _) => {
+                            devices.nics.push(Adapter::RealtekAxWifi(Box::new(station)));
+                        }
+                        (None, why) => devices
+                            .failures
+                            .push((address, why.map_or(Error::Unrecorded, Error::RealtekAxWifi))),
                     }
                     devices.owners.push(found.kept);
                     devices.rtl8852b.push(Rtl8852b {
@@ -4132,6 +4211,41 @@ mod tests {
         }
     }
 
+    /// An RTL8852BE's function attaches as an rtw89 station, which the
+    /// network's log names `rtw89_8852be` (Linux's module for it) and takes
+    /// for a Wi-Fi radio, as the other Wi-Fi stations; a wired kind is no
+    /// radio.
+    #[test]
+    fn an_rtl8852be_attaches_as_a_wireless_station_named_after_rtw89s_module() {
+        let identity = |device, class| crate::bus::pci::Identity {
+            address: Address {
+                segment: 0,
+                bus: 3,
+                device: 0,
+                function: 0,
+            },
+            vendor: 0x10ec,
+            device,
+            class,
+        };
+        for device in net::wifi::realtek::identity::RTL8852B_DEVICES {
+            let kind = native::Kind::of_identity(&identity(device, [0x02, 0x80, 0x00]));
+            assert_eq!(kind, Some(native::Kind::RealtekAxWifi));
+            assert_eq!(kind.and_then(native::Kind::radio), Some("rtw89_8852be"));
+        }
+        assert_eq!(
+            [
+                native::Kind::IntelWifi,
+                native::Kind::MediatekWifi,
+                native::Kind::RealtekWifi,
+            ]
+            .map(native::Kind::radio),
+            [Some("iwlwifi"), Some("mt7925e"), Some("rtw88_8822ce")]
+        );
+        assert_eq!(native::Kind::Tg3.radio(), None);
+        assert_eq!(native::Kind::Aqtion.radio(), None);
+    }
+
     /// The chooser refuses a disk whose controller no driver here takes,
     /// naming RAID mode, and offers every disk a driver reaches.
     #[test]
@@ -4338,7 +4452,8 @@ mod tests {
     }
 
     /// An RTL8852BE's stage 1 transmits nothing, so it goes ahead without
-    /// regulatory data: only the mount's refusal stops it here.
+    /// regulatory data, which only its station needs: only the mount's
+    /// refusal stops it here.
     #[test]
     fn an_rtl8852be_stage_1_needs_no_regulatory_data() {
         let services = services::tests::Refusing::default();
@@ -4369,6 +4484,7 @@ mod tests {
             realtek_ax_wifi(
                 &services,
                 address,
+                None,
                 &WifiInputs {
                     clock: handoff.clock,
                     observations: Default::default(),

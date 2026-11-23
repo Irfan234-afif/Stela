@@ -15,14 +15,16 @@
 //! rtw89 expects by version ([`features`]), and the efuse and phycap read
 //! once the firmware runs ([`efuse`], [`rtw8852b::efuse`]) over the register
 //! mailbox ([`h2creg`]) are the first slices, and [`bootstrap`] composes
-//! them in rtw89's probe order into one power cycle, which [`attach`]
-//! runs for a boot and ends with the chip cold again. The full MAC init
-//! ([`mac`]) is the first slice after that power cycle's firmware runs, and
-//! the BB, RF, TX power and regulation tables rtw89 takes from the
-//! firmware's elements ([`elements`]) are the first its radio needs.
-//! Stage 2 ([`radio`]) brings the chip up again as rtw89's interface start
-//! does, tunes it and listens ([`listen`]), reading what RXQ holds as
-//! rtw89 reads it ([`rxdesc`]).
+//! them in rtw89's probe order into one power cycle, which ends with the
+//! chip cold again. The full MAC init ([`mac`]) is the first slice after
+//! that power cycle's firmware runs, and the BB, RF, TX power and
+//! regulation tables rtw89 takes from the firmware's elements
+//! ([`elements`]) are the first its radio needs. Stage 2 ([`radio`]) brings
+//! the chip up again as rtw89's interface start does, tunes it and listens
+//! ([`listen`]), reading what RXQ holds as rtw89 reads it ([`rxdesc`]); the
+//! station's hardware ([`hardware`]) brings it up the same way under the
+//! softMAC station. [`attach`] runs them for a boot: the power cycle, the
+//! Wi-Fi check's listen, then the station the connection keeper keeps.
 //! Powering the chip on,
 //! pre-initializing its DMAC and PCIe DMA and handing it commands prove that
 //! its polled bits answered, the ring addresses were written and the command

@@ -1787,8 +1787,9 @@ pub struct Selection<'a> {
     pub usb_disks: &'a [String],
     /// The Wi-Fi network to join; without one a Wi-Fi adapter stays down.
     pub wifi: Option<&'a stela_drivers::net::wifi::network::Network>,
-    /// The channel an RTL8852BE's stage 2 listens on (`--wifi-check-channel`),
-    /// channel 36 at 80 MHz without one.
+    /// The channel an RTL8852BE's stage 2 listens on before its station
+    /// starts, for the Wi-Fi check (`--wifi-check-channel`, channel 36 at
+    /// 80 MHz without one); `None` without the check.
     pub wifi_channel: Option<stela_drivers::net::wifi::realtek::ax::rtw8852b::channel::Channel>,
     /// With `--external-disks`, the guest hub's free ports, which every disk
     /// left over fills in probe order.
@@ -2156,7 +2157,8 @@ pub unsafe fn open(
         ));
     }
     // Each RTL8852B: what was read before power-on, then how far stage 1
-    // and stage 2 took it, line by line (`ax::attach::Outcome::lines`).
+    // and stage 2 took it and how its station started, line by line
+    // (`ax::attach::Outcome::lines`).
     for chip in &devices.rtl8852b {
         let address = chip.address;
         match &chip.identity {

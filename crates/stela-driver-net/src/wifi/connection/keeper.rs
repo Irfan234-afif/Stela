@@ -24,11 +24,11 @@ use crate::{
         scan::{self, result::Bss},
         security::{Cipher, KeyIdentity, PacketNumber, ReplaySeed},
         station::{
-            Join, NativeBssObservation, PortPolicy, Station,
+            Join, NativeBssObservation, Phase as Peering, PortPolicy, Station,
             external::{self, Received},
             multi_link::{self as mlo, Affiliation, Mld, Setup},
             operations::Operations,
-            phy::{Capabilities, McsMaps, Mode, Role},
+            phy::{Capabilities, McsMaps, Mode, Role, Width},
             wire::{
                 AssociationRequest,
                 multi_link::{Basic, affiliated},
@@ -39,7 +39,7 @@ use crate::{
     },
 };
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
-use core::fmt::Display;
+use core::fmt::{self, Display};
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
 
@@ -98,6 +98,119 @@ pub struct Peer {
     pub beacon_interval: u16,
     pub dtim_period: u8,
     pub slot_time: u16,
+}
+
+/// Where a connection attempt stands, as wpa_supplicant's state names it:
+/// the step a check's report says failed ([`Keeper::progress`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Standing {
+    /// Between attempts: before the first scan, or after a failure's delay.
+    #[default]
+    Waiting,
+    Scanning,
+    /// Open System authentication, or the SAE exchange, with the BSS chosen.
+    Authenticating,
+    /// The association request, its response and the association's
+    /// configuration.
+    Associating,
+    /// The 4-way handshake, waiting for this EAPOL message of four from the
+    /// AP; `None` once message 3 gave the keys.
+    Handshake(Option<u8>),
+    /// The port is open.
+    Connected,
+    /// Leaving an association, after which the station scans again.
+    Leaving,
+}
+
+impl fmt::Display for Standing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Waiting => f.write_str("waiting to scan"),
+            Self::Scanning => f.write_str("scan"),
+            Self::Authenticating => f.write_str("authentication"),
+            Self::Associating => f.write_str("association"),
+            Self::Handshake(Some(message)) => {
+                write!(
+                    f,
+                    "4-way handshake, waiting for EAPOL message {message} of 4"
+                )
+            }
+            Self::Handshake(None) => f.write_str("4-way handshake, installing its keys"),
+            Self::Connected => f.write_str("connected"),
+            Self::Leaving => f.write_str("leaving"),
+        }
+    }
+}
+
+/// The network's BSS a scan chose: where it heard it, and how loud.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chosen {
+    pub bssid: Mac,
+    pub channel: Channel,
+    pub signal_dbm: Option<i8>,
+}
+
+/// How far the keeper's attempts got, for a check's report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Where the connection stands now.
+    pub standing: Standing,
+    /// Whole scans that ended, and how many BSSes the radio held after the
+    /// last of them.
+    pub scans: u32,
+    pub heard: usize,
+    /// The network's BSS the last scan chose; `None` when it found none.
+    pub chosen: Option<Chosen>,
+    /// Attempts that failed, and the last failure with where it stood.
+    pub failures: u32,
+    pub failed: Option<(Standing, String)>,
+}
+
+impl fmt::Display for Progress {
+    /// One line with no address in it: where the connection stands, what
+    /// the scans found, and the last failure.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "connection at {}; {} scans", self.standing, self.scans)?;
+        if self.scans > 0 {
+            write!(f, ", the last heard {} BSSes and ", self.heard)?;
+            match &self.chosen {
+                Some(chosen) => {
+                    write!(
+                        f,
+                        "found the network on channel {} ({} MHz)",
+                        chosen.channel.number, chosen.channel.frequency_mhz
+                    )?;
+                    match chosen.signal_dbm {
+                        Some(signal) => write!(f, " at {signal} dBm")?,
+                        None => f.write_str(" with no signal")?,
+                    }
+                }
+                None => f.write_str("did not find the network")?,
+            }
+        }
+        if let Some((standing, why)) = &self.failed {
+            write!(
+                f,
+                "; {} attempts failed, the last at {standing}: {why}",
+                self.failures
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The association whose port is open ([`Keeper::associated`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Association {
+    pub ssid: Vec<u8>,
+    pub bssid: Mac,
+    pub aid: u16,
+    pub akm: Akm,
+    pub pairwise: Cipher,
+    pub group: Cipher,
+    /// The primary channel and the width the link runs at.
+    pub channel: Channel,
+    pub width: Width,
 }
 
 /// One vendor's station: its firmware's scans, joins, keys and frames.
@@ -470,6 +583,9 @@ pub struct Keeper<R: Radio> {
     michael_failed: Option<u64>,
     /// The last scan missed the network, so the next asks for it by name.
     directed: bool,
+    /// How far the attempts got, [`Progress::standing`] the last one seen
+    /// while the station's own phase still named it.
+    progress: Progress,
 }
 
 impl<R: Radio> Keeper<R> {
@@ -489,7 +605,78 @@ impl<R: Radio> Keeper<R> {
             reported: None,
             michael_failed: None,
             directed: false,
+            progress: Progress::default(),
         }
+    }
+
+    /// How far the attempts got: where the connection stands, what the
+    /// scans found and the last failure, with where it stood then.
+    pub fn progress(&self) -> Progress {
+        let mut progress = self.progress.clone();
+        if let Some(standing) = self.standing() {
+            progress.standing = standing;
+        }
+        progress
+    }
+
+    /// The association whose port is open: the network, the AP, the AID the
+    /// AP gave, the suites and the channel.
+    pub fn associated(&self) -> Option<Association> {
+        let State::Connected {
+            supplicant, bssid, ..
+        } = &self.state
+        else {
+            return None;
+        };
+        let context = self.link.station().association_context()?;
+        let suites = supplicant.suites();
+        Some(Association {
+            ssid: self.network.ssid.clone(),
+            bssid: *bssid,
+            aid: context.response().aid,
+            akm: suites.akm,
+            pairwise: suites.pairwise,
+            group: suites.group,
+            channel: context.channel(),
+            width: context.definition().width,
+        })
+    }
+
+    /// Where the connection stands, from the keeper's state and the
+    /// station's phase; `None` while a join's station has gone idle, which
+    /// the failure that follows names.
+    fn standing(&self) -> Option<Standing> {
+        Some(match &self.state {
+            State::Waiting { .. } => Standing::Waiting,
+            State::Scanning(_) => Standing::Scanning,
+            State::Authenticating(_) => Standing::Authenticating,
+            State::Joining(_) => match self.link.station().phase() {
+                Peering::Authenticating | Peering::ExternalAuthenticating => {
+                    Standing::Authenticating
+                }
+                Peering::Associating | Peering::Configuring | Peering::Associated => {
+                    Standing::Associating
+                }
+                Peering::Idle | Peering::Disconnecting | Peering::Quarantined => return None,
+            },
+            State::Handshake { supplicant, .. } => Standing::Handshake(supplicant.awaited()),
+            State::Connected { .. } => Standing::Connected,
+            State::Leaving { .. } => Standing::Leaving,
+        })
+    }
+
+    /// Note where the connection stands, while the state names it.
+    fn track(&mut self) {
+        if let Some(standing) = self.standing() {
+            self.progress.standing = standing;
+        }
+    }
+
+    /// Count an attempt that failed with `message`, and where it stood.
+    fn note_failure(&mut self, message: &str) {
+        self.track();
+        self.progress.failures = self.progress.failures.saturating_add(1);
+        self.progress.failed = Some((self.progress.standing, String::from(message)));
     }
 
     /// The radio, for device models.
@@ -514,6 +701,7 @@ impl<R: Radio> Keeper<R> {
     /// waits after `failures` attempts.
     fn failed(&mut self, now: u64, message: String) {
         self.failures = self.failures.saturating_add(1);
+        self.note_failure(&message);
         self.fail(message);
         if self.link.stage() != Stage::Idle {
             let _ = self.link.deauthenticate(LEAVING);
@@ -526,6 +714,7 @@ impl<R: Radio> Keeper<R> {
     /// Service the link, take its notices and advance the connection.
     fn poll(&mut self) {
         let now = self.clock.now_us();
+        self.track();
         // A rotation waits for the frames queued before it to be taken.
         if let State::Connected {
             integrity: integrity @ Some(_),
@@ -540,6 +729,9 @@ impl<R: Radio> Keeper<R> {
         if let Err(error) = self.link.service() {
             self.fail(format!("{error}"));
         }
+        // The station's phase as the service left it: an authentication
+        // answered moves a join to its association.
+        self.track();
         while let Some(event) = self.link.take_event() {
             match event {
                 Event::Eapol(ethernet) => self.eapol(&ethernet, now),
@@ -555,7 +747,9 @@ impl<R: Radio> Keeper<R> {
                     self.fail(format!("{} unsupported: {operation}", R::NAME));
                 }
                 Event::ConnectionLost => {
-                    self.fail(format!("{}: the AP ended the association", R::NAME));
+                    let message = format!("{}: the AP ended the association", R::NAME);
+                    self.note_failure(&message);
+                    self.fail(message);
                     self.state = State::Leaving {
                         at: now + RECONNECT_US,
                     };
@@ -576,6 +770,7 @@ impl<R: Radio> Keeper<R> {
     }
 
     fn advance(&mut self, now: u64) {
+        self.track();
         let stage = self.link.stage();
         match &self.state {
             State::Waiting { at } if now >= *at && stage == Stage::Idle => self.scan(now),
@@ -751,9 +946,21 @@ impl<R: Radio> Keeper<R> {
                 }
             }
         }
+        self.progress.scans = self.progress.scans.saturating_add(1);
+        self.progress.heard = observed.len();
+        self.progress.chosen = best.as_ref().map(|(_, bss, _)| Chosen {
+            bssid: bss.bssid,
+            channel: bss.channel,
+            signal_dbm: bss.signal_dbm,
+        });
         let ssid = String::from_utf8_lossy(&self.network.ssid).into_owned();
         self.directed = best.is_none() && refusal.is_none();
         let Some((handle, bss, security)) = best else {
+            // Named without the network's name, which the log keeps out.
+            self.note_failure(&match &refusal {
+                Some(reason) => format!("the network {reason}"),
+                None => String::from("the network was not among the BSSes heard"),
+            });
             self.fail(match refusal {
                 Some(reason) => format!("{}: {ssid} {reason}", R::NAME),
                 None => format!("{}: {ssid} not found", R::NAME),
@@ -1524,6 +1731,15 @@ impl<R: Radio> Link for Keeper<R> {
             return Err(LinkError::Adapter(failure));
         }
         self.link.receive()
+    }
+    /// Where the connection stands and how the attempts went
+    /// ([`Self::progress`]), then the radio's own state.
+    fn diagnostic(&mut self) -> Option<String> {
+        let progress = self.progress();
+        Some(match self.link.diagnostic() {
+            Some(radio) => format!("{progress}; {radio}"),
+            None => format!("{progress}"),
+        })
     }
 }
 

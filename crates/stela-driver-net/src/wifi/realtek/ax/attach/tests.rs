@@ -2,18 +2,45 @@ extern crate std;
 
 use super::*;
 use crate::{
+    Link,
     firmware::Catalog,
-    wifi::realtek::{
-        ax::{
-            bootstrap::tests::{ACV, CUT, DEVICE, board, catalog, container, container_of},
-            fwdl::FWDL_CHECKSUM_FAIL,
-            model::Chip as Model,
-            pci::tests::{Access, Domain, Placement, Source, r32},
+    wifi::{
+        connection::keeper::Standing,
+        intel::policy::tests::regdb,
+        network::Secret,
+        realtek::{
+            ax::{
+                bootstrap::tests::{ACV, CUT, DEVICE, board, catalog, container, container_of},
+                elements::{Id, tests as elm},
+                fwdl::FWDL_CHECKSUM_FAIL,
+                model::{Ap, Chip as Model, Protection},
+                pci::tests::{Access, Domain, Placement, Source, r32},
+            },
+            identity::tests::observed,
         },
-        identity::tests::observed,
     },
 };
 use alloc::vec;
+use core::sync::atomic::{AtomicU8, Ordering};
+use stela_driver_base::entropy::EntropyError;
+use zeroize::Zeroizing;
+
+const CLOCK: Clock = Clock {
+    ticks_per_microsecond: 1,
+};
+const AP: [u8; 6] = [0x02, 0xd2, 0x0b, 0x10, 0x20, 0x30];
+const SSID: &[u8] = b"test";
+
+/// Each read one byte over the last, from 0x5a.
+#[derive(Default)]
+struct FixedEntropy(AtomicU8);
+
+impl Entropy for FixedEntropy {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), EntropyError> {
+        bytes.fill(0x5a + self.0.fetch_add(1, Ordering::Relaxed));
+        Ok(())
+    }
+}
 
 /// What the boot read of the synthetic chip before power-on, at `cut`.
 fn unpowered(cut: u8) -> Unpowered {
@@ -24,26 +51,57 @@ fn unpowered(cut: u8) -> Unpowered {
     }
 }
 
-/// [`run`] over `chip`, whose DMA reaches `domain`, with `catalog`'s image.
+/// The station's network: the model AP's WPA2-PSK one, under a country
+/// whose 2.4 GHz and UNII-1 rules allow 20 dBm.
+fn join() -> Join {
+    let rules: [(u32, u32, u8, u16); 2] = [
+        (2_402_000, 2_472_000, 0, 2000),
+        (5_170_000, 5_250_000, 0, 2000),
+    ];
+    Join {
+        network: Network {
+            ssid: SSID.to_vec(),
+            secret: Secret::Psk(Zeroizing::new([0; 32])),
+            country: Some(*b"ID"),
+        },
+        country: regdb(&[(*b"ID", &rules)]).select(*b"ID").unwrap(),
+        entropy: Arc::new(FixedEntropy::default()),
+        vector: false,
+    }
+}
+
+/// The synthetic container with every element stage 2 and the station
+/// need behind its suits, as the radio's tests build it.
+fn elements() -> Catalog {
+    let mut file = container();
+    let mut pieces = elm::required();
+    pieces.push(elm::plain(Id::BbGain, &elm::regs(3, 9)));
+    for piece in pieces {
+        file.resize(file.len().next_multiple_of(16), 0);
+        file.extend_from_slice(&piece);
+    }
+    catalog(file)
+}
+
+/// [`run`] over `chip`, whose DMA reaches `domain`, with `catalog`'s image,
+/// the check's listen on channel 36 at 80 MHz, and the station for `join`.
 fn run_on<'c>(
     chip: &'c Model,
     domain: &Arc<Domain>,
     catalog: &'c Catalog,
-) -> (Outcome, Kept<'c, &'c Model>) {
-    let clock = Clock {
-        ticks_per_microsecond: 1,
-    };
+    join: Result<Join, String>,
+) -> (Outcome, Kept<&'c Model>) {
     let inputs = Inputs {
         firmware: catalog,
         pages: &Source,
-        clock,
+        clock: CLOCK,
     };
     let plan = radio::Plan {
         channel: radio::Plan::default_channel(),
         alpha2: None,
         country: None,
         listen_us: radio::LISTEN_US,
-        clock,
+        clock: CLOCK,
     };
     let mut config = chip;
     // SAFETY: the model, its DMA domain and these pages belong to this test
@@ -56,9 +114,23 @@ fn run_on<'c>(
             observed(DEVICE, CUT),
             Found::Off,
             &inputs,
-            &plan,
+            Some(&plan),
+            join,
         )
     }
+}
+
+/// Whether `kept` holds stage 1's owners: the register interface, the
+/// rings and the channel.
+fn owners(kept: &Kept<&Model>) -> bool {
+    matches!(
+        kept,
+        Kept::Owners {
+            rings: Some(_),
+            channel: Some(_),
+            ..
+        }
+    )
 }
 
 /// Timings that put the download at 100 ms and the efuse 12 ms later.
@@ -116,9 +188,10 @@ fn a_dead_read_a_cav_or_no_image_leaves_the_chip_off() {
     let summary = outcome.summary();
     assert_eq!((summary.firmware, summary.efuse), (None, None));
     assert_eq!(summary.stopped.unwrap().0, Stage::Firmware);
+    assert_eq!(summary.station, None);
     assert!(
         outcome
-            .no_station()
+            .unattached()
             .unwrap()
             .0
             .starts_with("RTL8852B left off before power-on")
@@ -130,9 +203,9 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
     let domain = Domain::new(Placement::Oracle);
     let chip = Model::new(&board(1), ACV, domain.clone());
     let catalog = catalog(container());
-    let (mut outcome, kept) = run_on(&chip, &domain, &catalog);
+    let (mut outcome, kept) = run_on(&chip, &domain, &catalog, Ok(join()));
     assert!(!chip.on());
-    assert!(kept.rings.is_some() && kept.channel.is_some());
+    assert!(owners(&kept));
     let Outcome::Reached {
         power_off,
         timings,
@@ -174,9 +247,17 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
              beacons=0 probe_resp=0 matched_ppdu=0 crc32_err=0 icv_err=0 c2h=0 ppdu=0 \
              ppdu_valid=0 other=0 segmented=0 truncated=0",
             "stage 2 never powered it on",
+            // The station's start reads the same tables and stops there too.
+            "station: the start stopped at tables: firmware elements 0x00076f34 are \
+             unrecognized: BB_REG RADIO_A RADIO_B RF_NCTL TXPWR_BYRATE TXPWR_LMT_2GHZ \
+             TXPWR_LMT_5GHZ TXPWR_LMT_RU_2GHZ TXPWR_LMT_RU_5GHZ TX_SHAPE_LMT TX_SHAPE_LMT_RU \
+             TXPWR_TRK",
+            "station: not powered off: the failure came before the power-on, which rtw89 leaves \
+             as it is",
         ]
     );
     let summary_radio = outcome.summary().radio;
+    let summary_station = outcome.summary().station;
     assert_eq!(
         outcome.summary(),
         Summary {
@@ -200,6 +281,7 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
             }),
             stopped: None,
             radio: summary_radio.clone(),
+            station: summary_station.clone(),
         }
     );
     let radio = summary_radio.unwrap();
@@ -207,13 +289,39 @@ fn a_chip_that_reaches_the_efuse_is_powered_off_and_reported() {
     assert_eq!(radio.heard, None);
     assert_eq!(radio.stopped.unwrap().0, radio::Stage::Tables);
     assert!(
+        matches!(&summary_station, Some(StationRan::Down(why))
+            if why.starts_with("station's start stopped at tables: firmware elements")),
+        "{summary_station:?}"
+    );
+    assert!(
         outcome
-            .no_station()
+            .unattached()
             .unwrap()
             .0
-            .starts_with("RTL8852B stage 2 stopped at tables: firmware elements"),
+            .starts_with("RTL8852B station's start stopped at tables: firmware elements"),
         "{:?}",
-        outcome.no_station()
+        outcome.unattached()
+    );
+
+    // Without the network's regulation no station starts, and the chip
+    // stays as stage 2's listen left it.
+    let domain = Domain::new(Placement::Oracle);
+    let chip = Model::new(&board(1), ACV, domain.clone());
+    let (outcome, kept) = run_on(
+        &chip,
+        &domain,
+        &catalog,
+        Err(String::from("no regulatory database")),
+    );
+    assert!(!chip.on());
+    assert!(owners(&kept));
+    assert_eq!(
+        outcome.lines().last().unwrap(),
+        "station: none started: no regulatory database; the chip stays off"
+    );
+    assert_eq!(
+        outcome.unattached().unwrap().0,
+        "RTL8852B started no station: no regulatory database"
     );
 }
 
@@ -224,9 +332,9 @@ fn a_download_that_never_finishes_is_logged_attempt_by_attempt_with_its_register
     // Each attempt polls the status for 400 ms; no log is read here.
     chip.logging(false);
     let catalog = catalog(container());
-    let (outcome, kept) = run_on(&chip, &domain, &catalog);
+    let (outcome, kept) = run_on(&chip, &domain, &catalog, Ok(join()));
     assert!(!chip.on());
-    assert!(kept.rings.is_some() && kept.channel.is_some());
+    assert!(owners(&kept));
     let Outcome::Stopped {
         stage,
         registers,
@@ -308,7 +416,7 @@ fn a_download_that_never_finishes_is_logged_attempt_by_attempt_with_its_register
          ChecksumFail, ChecksumFail"
     );
     assert_eq!(
-        outcome.no_station().unwrap().0,
+        outcome.unattached().unwrap().0,
         format!("RTL8852B stage 1 stopped at firmware download: {why}; powered off")
     );
 }
@@ -322,7 +430,7 @@ fn an_efuse_step_that_fails_keeps_the_firmware_stage_for_the_check() {
     // The mailbox is polled for a second; no log is read here.
     chip.logging(false);
     let catalog = catalog(container());
-    let (outcome, _kept) = run_on(&chip, &domain, &catalog);
+    let (outcome, _kept) = run_on(&chip, &domain, &catalog, Ok(join()));
     assert!(!chip.on());
     let summary = outcome.summary();
     let firmware = summary.firmware.unwrap();
@@ -439,7 +547,7 @@ fn a_listen_that_heard_the_ap_is_logged_with_the_plans_headline_and_each_bssid()
         radio_lines(&outcome),
         [
             "rtw89: RTL8852B tuned to channel 36 (80 MHz), heard 3 beacons in 2 s, strongest -41 \
-             dBm from 90:d2:0b:..:..:ed; no station yet",
+             dBm from 90:d2:0b:..:..:ed",
             "stage 2 RX before listening: buffers=0 wifi=0 mgmt=0 ctrl=0 data=0 ext=0 runt=0 \
              beacons=0 probe_resp=0 matched_ppdu=0 crc32_err=0 icv_err=0 c2h=0 ppdu=0 \
              ppdu_valid=0 other=0 segmented=0 truncated=0",
@@ -450,8 +558,81 @@ fn a_listen_that_heard_the_ap_is_logged_with_the_plans_headline_and_each_bssid()
              A1-matched PPDU status; the PHY status header alone -43 dBm), elements name channel \
              36, received at 5180 MHz",
             "stage 2 registers: RX_FLTR_OPT=0x3004408 RF A 0x18=0x1012a",
-            "powered off after stage 2, so the next system finds it cold; no station driver here \
-             yet",
+            "powered off after stage 2's listen, so the station starts on a cold chip",
         ]
     );
+}
+
+/// The `--wifi --wifi-check` attach on the whole-chip model: stage 1, the
+/// listen on channel 36 at 80 MHz, then the station's start on the chip
+/// the listen left cold; the kept station scans, finds the model's AP and
+/// joins it, up to the 4-way handshake its message 1 starts.
+#[test]
+fn with_a_network_an_rtl8852be_attaches_as_a_kept_station_that_joins_the_ap() {
+    core::mem::forget(crate::test_clock::virtualize());
+    let domain = Domain::new(Placement::Packed);
+    let chip = Model::new(&board(1), ACV, domain.clone());
+    chip.logging(false);
+    let catalog = elements();
+    let (outcome, kept) = run_on(&chip, &domain, &catalog, Ok(join()));
+    let Kept::Station(mut wifi) = kept else {
+        panic!("{outcome:?}")
+    };
+    assert!(chip.on());
+    let Outcome::Reached { radio, .. } = &outcome else {
+        panic!("{outcome:?}")
+    };
+    let radio = radio.as_deref().unwrap();
+    assert!(radio.stopped.is_none(), "{:?}", radio.stopped);
+    assert_eq!(radio.power_off, Some(Ok(())));
+    let lines = outcome.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("rtw89: RTL8852B tuned to channel 36 (80 MHz), heard ")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.last().unwrap(),
+        "station: the interface came up, polled; the keeper joins the network"
+    );
+    assert!(outcome.unattached().is_none());
+    let summary = outcome.summary();
+    assert_eq!(summary.station, Some(StationRan::Up { vector: false }));
+    assert!(summary.radio.unwrap().heard.is_some());
+
+    // The keeper scans, finds the AP on its channel and associates.
+    let local = wifi.mac();
+    assert_eq!(local.0, [0x02, 0, 0, 0, 0, 0x01]);
+    let mut ap = Ap::new(AP, local.0, SSID, Protection::Wpa2Psk);
+    let mut joined = false;
+    for _ in 0..4000 {
+        wifi.carrier();
+        ap.serve(&chip);
+        if wifi.progress().standing == Standing::Handshake(Some(1)) {
+            joined = true;
+            break;
+        }
+        crate::test_clock::advance(CLOCK, 5_000);
+    }
+    let progress = wifi.progress();
+    assert!(joined, "{progress}");
+    assert_eq!(progress.scans, 1);
+    let chosen = progress.chosen.unwrap();
+    assert_eq!((chosen.bssid.0, chosen.channel.number), (AP, 36));
+    assert_eq!(progress.failed, None);
+    // No port is open before the handshake.
+    assert_eq!(wifi.associated(), None);
+    let state = wifi.diagnostic().unwrap();
+    assert!(
+        state.starts_with(
+            "connection at 4-way handshake, waiting for EAPOL message 1 of 4; 1 scans, the last \
+             heard 1 BSSes and found the network on channel 36 (5180 MHz)"
+        ),
+        "{state}"
+    );
+    // The hardware's own line: what its rings sent and RPQ released.
+    assert!(state.contains("; tx sent="), "{state}");
+    assert!(state.contains(" channel=36/80 calibrations="), "{state}");
+    assert!(state.ends_with(" polled"), "{state}");
 }

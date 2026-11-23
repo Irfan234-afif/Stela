@@ -73,7 +73,7 @@ pub(super) enum Kind {
     MediatekWifi,
     /// A Realtek Wi-Fi function; only RTL8822C attaches.
     RealtekWifi,
-    /// An RTL8852BE, whose stage 1 runs and leaves it cold; no station yet.
+    /// An RTL8852BE, which attaches as an rtw89 station.
     RealtekAxWifi,
     /// An Intel PCIe Bluetooth function, as `btintel_pcie_table` lists them.
     IntelBluetooth,
@@ -157,6 +157,19 @@ impl Kind {
             Self::Bcm4377 => "bcm4377 Bluetooth",
             Self::Hda => "HD Audio",
             Self::Usb4 => "USB4/Thunderbolt NHI",
+        }
+    }
+
+    /// The Wi-Fi station this kind attaches as, by the name the network's
+    /// log gives its adapter (Linux's module for the chip); `None` for a
+    /// kind that attaches no radio.
+    pub(super) fn radio(self) -> Option<&'static str> {
+        match self {
+            Self::IntelWifi => Some("iwlwifi"),
+            Self::MediatekWifi => Some("mt7925e"),
+            Self::RealtekWifi => Some("rtw88_8822ce"),
+            Self::RealtekAxWifi => Some("rtw89_8852be"),
+            _ => None,
         }
     }
 }
@@ -626,20 +639,28 @@ fn realtek_window(
     }
 }
 
+/// An RTL8852BE station on its hardware.
+pub type RealtekAxWifi = realtek_wifi::station::Wifi<realtek_wifi::ax::hardware::Hardware>;
+
 /// What a boot learned of an RTL8852BE: what it read before power-on and
-/// stage 1's outcome, with the owners the device may still reach.
+/// the attach's outcome, with its station, or the owners the device may
+/// still reach.
 pub(super) struct RealtekAx {
     pub(super) unpowered: realtek_wifi::identity::Unpowered,
     pub(super) outcome: realtek_wifi::ax::attach::Outcome,
+    /// The station, when its interface came up.
+    pub(super) station: Option<Located<RealtekAxWifi>>,
     /// The function, its BAR2 mapping, its requester's preparation or DMA
-    /// attachment, and once stage 1 ran the register interface, rings and
-    /// channel: kept for the rest of the boot, whatever happened.
+    /// attachment, and without a station the register interface, rings
+    /// and channel once stage 1 ran: kept for the rest of the boot,
+    /// whatever happened.
     pub(super) kept: Box<dyn Any>,
 }
 
-/// Take an RTL8852BE through stage 1 and stage 2 as `plan` asks and leave
-/// it cold (`realtek_wifi::ax::attach`), over its requester's cold
-/// preparation, as the drivers that bus-master do.
+/// Take an RTL8852BE from its registers to a kept station for `join`
+/// (`realtek_wifi::ax::attach`), through stage 1, the listen `plan` asks
+/// for, and the station's start, over its requester's cold preparation, as
+/// the drivers that bus-master do.
 ///
 /// Its identity is read first, as `rtw89_pci_probe` maps BAR2 and
 /// `rtw89_chip_info_setup` reads SYS_CFG1 in `rtw89_read_chip_ver` before
@@ -648,8 +669,10 @@ pub(super) struct RealtekAx {
 /// `attach::admit` refuses, a CAV among them, is left so. An admitted one is
 /// stopped (`attach::quiesce`: its WL MAC off), its quiescence acknowledged
 /// and its requester bound to a domain of its own, which lifts the seal;
-/// then bus mastering is turned on for the rings, stage 1 runs and the chip
-/// is powered off again. It stays polled: MSI is never enabled.
+/// then bus mastering is turned on for the rings, and its MSI too when a
+/// station is to start and `completion` gives a message; then stage 1
+/// runs, the chip is powered off again, and the listen and the station
+/// follow.
 ///
 /// # Safety
 /// [`NativeServices`]' contract holds for `services`, nothing else reaches
@@ -661,8 +684,10 @@ pub(super) struct RealtekAx {
 pub(super) unsafe fn realtek_ax_wifi(
     services: &dyn NativeServices,
     address: Address,
+    completion: Option<crate::bus::irq::MsiMessage>,
     inputs: realtek_wifi::ax::attach::Inputs<'static>,
-    plan: &realtek_wifi::ax::radio::Plan<'_>,
+    plan: Option<&realtek_wifi::ax::radio::Plan<'_>>,
+    join: Result<realtek_wifi::ax::attach::Join, String>,
 ) -> Result<RealtekAx, Failure> {
     use crate::bus::pci::requester::preparation::BoundRequester;
     use realtek_wifi::{
@@ -725,6 +750,7 @@ pub(super) unsafe fn realtek_ax_wifi(
     let refused = |refusal, kept: Box<dyn Any>| RealtekAx {
         unpowered,
         outcome: Outcome::Refused(refusal),
+        station: None,
         kept,
     };
     if let Err(refusal) = attach::admit(&unpowered, inputs.firmware) {
@@ -766,14 +792,30 @@ pub(super) unsafe fn realtek_ax_wifi(
     };
     let domain = attachment.domain();
     let mut function = requester.into_function();
-    // Stage 1's rings need bus mastering, which the binding now allows.
-    if let Err(error) = function.enable_polled() {
-        return Err(keep_error(error, (function, attachment, owner, io)));
-    }
+    // Stage 1's rings need bus mastering, which the binding now allows; a
+    // station's causes signal by MSI where the engine gave a message. The
+    // chip raises none until the station's interface comes up and unmasks
+    // them.
+    let configured = (|| -> Result<bool, Error> {
+        function.enable_polled()?;
+        match (&join, completion, msi) {
+            (Ok(_), Some(message), Some(msi)) => {
+                function.enable_msi(msi, message)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    })();
+    let vector = match configured {
+        Ok(vector) => vector,
+        Err(error) => return Err(keep_error(error, (function, attachment, owner, io))),
+    };
+    let join = join.map(|join| attach::Join { vector, ..join });
     // SAFETY: the function is stopped and bound to its own domain, with
-    // memory decoding and bus mastering on and MSI and INTx off; `owner`
-    // keeps BAR2, and the function, attachment, rings and channel stay kept
-    // below for the rest of the boot.
+    // memory decoding and bus mastering on, INTx off and MSI on only for a
+    // station, whose vector `join` names; `owner` keeps BAR2, and the
+    // function, attachment, and the station or the rings and channel stay
+    // kept below for the rest of the boot.
     let (outcome, kept) = unsafe {
         attach::run(
             io,
@@ -783,12 +825,24 @@ pub(super) unsafe fn realtek_ax_wifi(
             found,
             &inputs,
             plan,
+            join,
         )
+    };
+    let (station, kept): (_, Box<dyn Any>) = match kept {
+        attach::Kept::Station(wifi) => (
+            Some(Located {
+                location: alloc::format!("{address}"),
+                link: *wifi,
+            }),
+            Box::new((function, attachment, owner)),
+        ),
+        kept => (None, Box::new((function, attachment, owner, kept))),
     };
     Ok(RealtekAx {
         unpowered,
         outcome,
-        kept: Box::new((function, attachment, owner, kept)),
+        station,
+        kept,
     })
 }
 

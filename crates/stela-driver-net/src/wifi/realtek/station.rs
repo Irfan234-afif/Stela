@@ -299,6 +299,11 @@ pub trait Device {
     fn limitation(&mut self) -> Option<&'static str> {
         None
     }
+    /// The hardware's own state line, with no address in it, such as what
+    /// its rings took and released ([`Link::diagnostic`]).
+    fn diagnostic(&mut self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -566,6 +571,9 @@ pub struct Realtek<D: Device> {
     departing: Option<Ticket>,
     left: bool,
     reported: Vec<&'static str>,
+    /// Why the station's last peer went: the AP's status or reason, a
+    /// frame never acknowledged, or one that never left.
+    departed: Option<crate::wifi::station::Failure>,
 }
 
 impl<D: Device> Realtek<D> {
@@ -613,6 +621,7 @@ impl<D: Device> Realtek<D> {
             departing: None,
             left: false,
             reported: Vec::new(),
+            departed: None,
         })
     }
 
@@ -661,6 +670,9 @@ impl<D: Device> Realtek<D> {
     }
 
     fn depart(&mut self, ticket: Ticket, failure: Option<crate::wifi::station::Failure>) {
+        if failure.is_some() {
+            self.departed = failure;
+        }
         if let Some(failure) = failure
             && self.station.external_authentication().is_some()
         {
@@ -1831,6 +1843,30 @@ impl<D: Device> Link for Realtek<D> {
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         Ok(self.received.pop_front())
+    }
+    /// Why the last peer went, when one did, then the hardware's own state.
+    fn diagnostic(&mut self) -> Option<String> {
+        let departed = self.departed.map(|failure| match failure {
+            crate::wifi::station::Failure::PeerRejected(status) => {
+                format!("the AP refused the last join with status {status}")
+            }
+            crate::wifi::station::Failure::PeerDeparture(reason) => {
+                format!("the AP ended the last association with reason {reason}")
+            }
+            crate::wifi::station::Failure::Timeout => {
+                String::from("the AP did not answer the last join in time")
+            }
+            crate::wifi::station::Failure::Transmit => {
+                String::from("a frame of the last join never left")
+            }
+            crate::wifi::station::Failure::MultiLink => {
+                String::from("the AP MLD's answer broke the last join's multi-link setup")
+            }
+        });
+        match (departed, self.device.diagnostic()) {
+            (Some(departed), Some(device)) => Some(format!("{departed}; {device}")),
+            (departed, device) => departed.or(device),
+        }
     }
 }
 

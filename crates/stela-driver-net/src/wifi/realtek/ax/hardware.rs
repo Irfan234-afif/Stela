@@ -275,6 +275,44 @@ pub enum Report {
     Rate(RaReport),
 }
 
+/// The frames the station put on the rings since the radio came up, and
+/// how RPQ released them (`rtw89_pci_tx_status`): a frame sent that no
+/// release followed, or one released past its retry limit, is a TX path
+/// the air never acknowledged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Transmitted {
+    /// Frames written to a ring and kicked.
+    pub sent: u64,
+    /// `RTW89_TX_DONE`: sent, and acknowledged where an ACK was due.
+    pub acked: u64,
+    /// `RTW89_TX_RETRY_LIMIT`: no ACK within the retries.
+    pub retry_limit: u64,
+    /// `RTW89_TX_LIFE_TIME` and `RTW89_TX_MACID_DROP`, and a status rtw89
+    /// calls invalid.
+    pub dropped: u64,
+}
+
+impl Transmitted {
+    fn released(&mut self, status: TxStatus) {
+        let count = match status {
+            TxStatus::Done => &mut self.acked,
+            TxStatus::RetryLimit => &mut self.retry_limit,
+            TxStatus::LifeTime | TxStatus::MacidDrop | TxStatus::Invalid(_) => &mut self.dropped,
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
+impl fmt::Display for Transmitted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tx sent={} acked={} retry_limit={} dropped={}",
+            self.sent, self.acked, self.retry_limit, self.dropped
+        )
+    }
+}
+
 /// What the station's bring-up takes beside the chip.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -538,6 +576,7 @@ pub struct Hardware<I = NativeIo> {
     calibrations: u32,
     vector: bool,
     limitations: Vec<&'static str>,
+    transmitted: Transmitted,
 }
 
 impl<I: Io> Hardware<I> {
@@ -670,6 +709,7 @@ impl<I: Io> Hardware<I> {
             calibrations: 0,
             vector: settings.vector,
             limitations: Vec::new(),
+            transmitted: Transmitted::default(),
             stage1: Box::new(stage1),
         };
         if let Err(error) = hardware.interface_up() {
@@ -756,6 +796,16 @@ impl<I: Io> Hardware<I> {
     /// How many RF calibrations ran since the radio came up.
     pub fn calibrations(&self) -> u32 {
         self.calibrations
+    }
+
+    /// The frames sent since the radio came up, and how RPQ released them.
+    pub fn transmitted(&self) -> Transmitted {
+        self.transmitted
+    }
+
+    /// Whether an MSI the caller routed raises the function's causes.
+    pub fn vector(&self) -> bool {
+        self.vector
     }
 
     /// `rtw89_core_stop`'s end for a caller that stops the station: the
@@ -1308,6 +1358,7 @@ impl<I: Io> Device for Hardware<I> {
             domain,
             reports,
             traffic,
+            transmitted,
             ..
         } = self;
         let room = rings
@@ -1336,6 +1387,7 @@ impl<I: Io> Device for Hardware<I> {
         rings
             .tx_kick_off(io, txch)
             .map_err(failed("transmit kick"))?;
+        transmitted.sent = transmitted.sent.saturating_add(1);
         if mpdu[0] & 0x0c == 0x08 && !info.is_bmc {
             traffic.tx_unicast += u64::from(length);
             traffic.tx_cnt += 1;
@@ -1377,6 +1429,7 @@ impl<I: Io> Device for Hardware<I> {
             }
         }
         for completion in completions {
+            self.transmitted.released(completion.status);
             if let Some(number) = self
                 .reports
                 .remove(&(completion.txch as u8, completion.seq))
@@ -1645,6 +1698,20 @@ impl<I: Io> Device for Hardware<I> {
 
     fn limitation(&mut self) -> Option<&'static str> {
         self.limitations.pop()
+    }
+
+    /// The frames sent and how RPQ released them ([`Transmitted`]), the
+    /// channel tuned, the RF calibrations run, and whether an MSI signals.
+    fn diagnostic(&mut self) -> Option<String> {
+        let tuned = self.chan.map_or(String::from("none"), |chan| {
+            format!("{}/{}", chan.primary(), chan.width_mhz())
+        });
+        Some(format!(
+            "{} channel={tuned} calibrations={} {}",
+            self.transmitted,
+            self.calibrations,
+            if self.vector { "msi" } else { "polled" }
+        ))
     }
 }
 

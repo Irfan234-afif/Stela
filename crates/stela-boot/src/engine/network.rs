@@ -281,18 +281,47 @@ pub struct HostNetwork {
     security: Result<Arc<stela_tls::ClientConfig>, TlsUnavailable>,
     /// The address and adapter, for the screen.
     description: String,
+    /// The adapter's driver, location and medium, for the Wi-Fi check.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    driver: &'static str,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    location: String,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    wireless: bool,
+}
+
+/// One adapter the host network tried, as the Wi-Fi check reads it
+/// (`stela_boot_core::wifi_check::Tried`).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub struct Tried {
+    pub driver: &'static str,
+    pub location: String,
+    pub wireless: bool,
+    /// The IPv4 lease, `None` for an address IPv6 alone gave; or why the
+    /// adapter got no address.
+    pub lease: core::result::Result<Option<stela_boot_core::wifi_check::Lease>, String>,
+    /// An RTL8852BE station's association once its port opened, and where
+    /// its connection stood.
+    pub associated: Option<stela_drivers::net::wifi::connection::keeper::Association>,
+    pub progress: Option<stela_drivers::net::wifi::connection::keeper::Progress>,
+    /// The adapter's own state line (`Link::diagnostic`).
+    pub state: Option<String>,
+    /// The DHCP exchange's summary, for an adapter that got no address.
+    pub dhcp: Option<String>,
 }
 
 impl HostNetwork {
     /// Try each native adapter, those with carrier first, until DHCPv4 or
     /// IPv6 SLAAC provides a usable address. A failed adapter keeps its
     /// diagnostic while the next is tried, and stays in `links` with every
-    /// adapter not tried, for the guest network ([`GuestNetwork::open`]).
+    /// adapter not tried, for the guest network ([`GuestNetwork::open`]);
+    /// what it did is added to `tried`.
     pub fn open(
         links: &mut Links,
         clock: Clock,
         handoff: &crate::handoff::Handoff,
         options: &stela_boot_core::options::System,
+        tried: &mut Vec<Tried>,
     ) -> Result<Self> {
         let security = security::native(handoff);
         match &security {
@@ -361,6 +390,9 @@ impl HostNetwork {
                         stack,
                         description,
                         security,
+                        driver,
+                        location,
+                        wireless,
                     });
                 }
                 Err(error) => {
@@ -369,19 +401,33 @@ impl HostNetwork {
                         frames.sent.get(),
                         frames.received.get()
                     ));
-                    if let Some(dhcp) = stack.dhcp_summary() {
+                    let dhcp = stack.dhcp_summary();
+                    if let Some(dhcp) = &dhcp {
                         output::arguments(format_args!(
                             "NETWORK adapter {location} dhcp: {dhcp}\n"
                         ));
                     }
                     // What the adapter's own registers and rings say then,
                     // where its driver keeps them: a dead receive or
-                    // transmit path is told apart from a silent network.
-                    if let Some(state) = stack.link_mut().diagnostic() {
+                    // transmit path is told apart from a silent network. A
+                    // Wi-Fi station says where its connection stood.
+                    let state = stack.link_mut().diagnostic();
+                    if let Some(state) = &state {
                         output::arguments(format_args!(
                             "NETWORK adapter {location} state: {state}\n"
                         ));
                     }
+                    let device = &stack.link_mut().device;
+                    tried.push(Tried {
+                        driver,
+                        location: location.clone(),
+                        wireless,
+                        lease: Err(format!("{error}")),
+                        associated: device.associated(),
+                        progress: device.progress(),
+                        state,
+                        dhcp,
+                    });
                     failures.push(match error {
                         stela_runtime::net::NetError::NoCarrier => {
                             stela_drivers::probe::no_link(&location, wireless)
@@ -415,6 +461,33 @@ impl HostNetwork {
     /// The address and adapter, as the screen names them.
     pub fn describe(&self) -> &str {
         &self.description
+    }
+
+    /// What the Wi-Fi check reads of the adapter that got the address: its
+    /// IPv4 lease, and for an RTL8852BE station its association, where its
+    /// connection stands and its own state line.
+    #[cfg(feature = "diagnostics")]
+    pub fn tried(&mut self) -> Tried {
+        let lease = self
+            .stack
+            .config()
+            .map(|config| stela_boot_core::wifi_check::Lease {
+                address: config.address.address(),
+                prefix: config.address.prefix_len(),
+                router: config.router,
+            });
+        let state = self.stack.link_mut().diagnostic();
+        let device = &self.stack.link_mut().device;
+        Tried {
+            driver: self.driver,
+            location: self.location.clone(),
+            wireless: self.wireless,
+            lease: Ok(lease),
+            associated: device.associated(),
+            progress: device.progress(),
+            state,
+            dhcp: None,
+        }
     }
 
     /// The connectivity check's POST (`--network-check`), waiting for its
@@ -585,6 +658,30 @@ impl HostNetwork {
 /// borrow never overlaps another.
 #[derive(Clone)]
 pub struct Shared(pub Rc<RefCell<HostNetwork>>);
+
+/// The network check's POST to `url` over the host's network
+/// (`--network-check`), its lines logged: any HTTP status proves the path
+/// end to end; only a transport failure (link, DHCP, DNS, TCP, malformed
+/// reply) fails it, and is returned.
+#[cfg(feature = "diagnostics")]
+pub(super) fn check(network: &Shared, url: &str) -> Result<(), NetError> {
+    match network.0.borrow_mut().post_url(url, &[], "text/plain", b"") {
+        Ok(body) => {
+            output::arguments(format_args!(
+                "NETWORK CHECK body bytes={} sha256={}\n",
+                body.len(),
+                stela_formats::sha256(&body)
+            ));
+            output::arguments(format_args!("NETWORK CHECK passed\n"));
+            Ok(())
+        }
+        Err(NetError::Status(_)) => {
+            output::arguments(format_args!("NETWORK CHECK passed\n"));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// The restore client's way to Apple's signing service (TSS): one POST
 /// at a time, moved along by each host service without waiting, so no

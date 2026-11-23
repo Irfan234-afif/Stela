@@ -157,11 +157,16 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
     if options.gpu_check {
         gpu::check();
     }
-    // As the GPU check: the adapters have started, nothing of the guest's
-    // storage is opened yet.
+    // As the GPU check: the adapters have started and the host's network
+    // has its lease, nothing of the guest's storage is opened yet.
     #[cfg(feature = "diagnostics")]
     if options.wifi_check {
-        wifi_check::check(&host.devices.rtl8852b);
+        wifi_check::check(
+            &host.devices.rtl8852b,
+            &host.devices.host_network,
+            &host.devices.network_tried,
+            options.network_check.as_deref(),
+        );
     }
     let storage = open_storage(handoff, &options, &mut host);
     // A single-user boot is a console, which draws through no GPU; without
@@ -491,7 +496,11 @@ fn open_host(
             }
         ));
     }
-    let wants_network = (options.install.is_some() && !offline) || options.network_check.is_some();
+    // The Wi-Fi check's lease comes from the mount's own network, as the
+    // network check's does.
+    let wants_network = (options.install.is_some() && !offline)
+        || options.network_check.is_some()
+        || options.wifi_check;
     let mut devices = start_devices(
         handoff,
         options,
@@ -595,27 +604,17 @@ fn open_host(
             range.guest, range.bytes, range.host
         ));
     }
+    // The Wi-Fi check makes its own POST, over the station, once it knows
+    // the lease came over it.
     #[cfg(feature = "diagnostics")]
-    if let Some(url) = &options.network_check {
+    if let Some(url) = &options.network_check
+        && !options.wifi_check
+    {
         let Some(Ok(network)) = &devices.host_network else {
             output::fatal("the network check failed")
         };
-        // Any HTTP status proves the path end to end; only a transport
-        // failure (link, DHCP, DNS, TCP, malformed reply) fails the check.
-        let checked = network.0.borrow_mut().post_url(url, &[], "text/plain", b"");
-        match checked {
-            Ok(body) => {
-                output::arguments(format_args!(
-                    "NETWORK CHECK body bytes={} sha256={}\n",
-                    body.len(),
-                    stela_formats::sha256(&body)
-                ));
-                output::arguments(format_args!("NETWORK CHECK passed\n"))
-            }
-            Err(stela_runtime::net::NetError::Status(_)) => {
-                output::arguments(format_args!("NETWORK CHECK passed\n"))
-            }
-            Err(error) => output::fatal(format_args!("the network check failed: {error}")),
+        if let Err(error) = network::check(network, url) {
+            output::fatal(format_args!("the network check failed: {error}"))
         }
     }
     OpenedHost {
@@ -3136,6 +3135,10 @@ struct HostDevices {
     /// reports.
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     rtl8852b: Vec<stela_drivers::probe::Rtl8852b>,
+    /// Each adapter the host's network tried and got no address over, in
+    /// order, which the Wi-Fi check reports.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    network_tried: Vec<network::Tried>,
 }
 
 /// Probe the host's devices once, with the native services when the
@@ -3161,6 +3164,7 @@ fn start_devices(
     let mut host_usb = None;
     let mut host_bluetooth: Option<bluetooth::HostBluetooth> = None;
     let mut rtl8852b = Vec::new();
+    let mut network_tried = Vec::new();
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -3222,10 +3226,17 @@ fn start_devices(
             let owned_preboot = options.preboot.clone();
             let owned_usb = options.usb_storage.clone();
             let owned_wifi = wifi_network(handoff, options);
-            // The option parser refused a channel the driver does not tune.
-            let wifi_channel = options
-                .wifi_check_channel
-                .and_then(stela_boot_core::options::WifiCheckChannel::channel);
+            // The Wi-Fi check listens on its channel, 36 at 80 MHz unless
+            // it names one, before the station starts; the option parser
+            // refused a channel the driver does not tune.
+            let wifi_channel = options.wifi_check.then(|| {
+                options
+                    .wifi_check_channel
+                    .and_then(stela_boot_core::options::WifiCheckChannel::channel)
+                    .unwrap_or_else(
+                        stela_drivers::net::wifi::realtek::ax::radio::Plan::default_channel,
+                    )
+            });
             let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
                 stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
@@ -3444,18 +3455,24 @@ fn start_devices(
             // install needs it, and the guest takes one of the others.
             let network = wants_network.then(|| {
                 crate::status::begin("Getting a network address");
-                network::HostNetwork::open(&mut links, host_clock, handoff, options)
-                    .inspect(|network| crate::status::done(network.describe()))
-                    .map(|network| network::Shared(Rc::new(RefCell::new(network))))
-                    .inspect_err(|error| {
-                        output::arguments(format_args!("host network refusal: {error}\n"));
-                        // The step ends with the first line; each adapter's
-                        // line and the advice follow on lines of their own.
-                        let text = error.to_string();
-                        let mut lines = text.lines();
-                        crate::status::warn(lines.next().unwrap_or_default());
-                        lines.for_each(crate::status::info);
-                    })
+                network::HostNetwork::open(
+                    &mut links,
+                    host_clock,
+                    handoff,
+                    options,
+                    &mut network_tried,
+                )
+                .inspect(|network| crate::status::done(network.describe()))
+                .map(|network| network::Shared(Rc::new(RefCell::new(network))))
+                .inspect_err(|error| {
+                    output::arguments(format_args!("host network refusal: {error}\n"));
+                    // The step ends with the first line; each adapter's
+                    // line and the advice follow on lines of their own.
+                    let text = error.to_string();
+                    let mut lines = text.lines();
+                    crate::status::warn(lines.next().unwrap_or_default());
+                    lines.for_each(crate::status::info);
+                })
             });
             // The guest's adapter is its own, one the mount's client left.
             // Without one the Mac boots with no network, which is reported
@@ -3532,5 +3549,6 @@ fn start_devices(
         host_disks,
         fdr: fdr_device,
         rtl8852b,
+        network_tried,
     }
 }

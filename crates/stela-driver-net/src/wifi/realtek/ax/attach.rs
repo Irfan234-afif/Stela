@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020 Realtek Corporation
 // Copyright(c) 2020 Realtek Corporation
-//! One RTL8852BE a boot given a `--wifi` network finds: taken through stage
-//! 1 ([`bootstrap`]) and powered off again, as `rtw89_chip_info_setup`
-//! leaves it at probe, then through stage 2 ([`radio`]) as rtw89 brings its
-//! interface up: tuned to one channel, listened to for a while, and powered
-//! off again, so the next operating system finds it cold. No station runs
-//! on it yet: association is a later step.
+//! One RTL8852BE a boot given a `--wifi` network finds, taken from its
+//! registers to a kept station: stage 1 ([`bootstrap`]) and the power-off
+//! that closes `rtw89_chip_info_setup` at probe, then the interface coming
+//! up as rtw89 brings it up ([`Hardware::start`]) under the softMAC station
+//! ([`Realtek`]) that the connection keeper keeps joined to the network.
+//! For the Wi-Fi check, a listen comes between them: stage 2 ([`radio`])
+//! tunes one channel, listens for a while, and powers the chip off again,
+//! and the station's start powers it on afresh.
 //!
 //! [`admit`] decides before any access whether the chip may be powered on:
 //! the read before power-on answered, and the image holds a suit for the
@@ -19,28 +21,34 @@
 //! before the claim rather than in the power-on. [`run`] is stage 1, timing each
 //! stage and, when one fails, reading the registers that say where the chip
 //! stood ([`Read`]) before rtw89's power-off; once stage 1 reached the
-//! efuse, it is the power-off that closes `rtw89_chip_info_setup`, and stage
-//! 2 follows on the chip that power-off left cold.
+//! efuse, it is the power-off that closes `rtw89_chip_info_setup`, and the
+//! listen, when asked, and the station follow on the chip that power-off
+//! left cold. The station transmits, so it starts only with the network's
+//! regulation ([`Join`]); without it the chip stays off.
 //!
 //! What the boot learned is an [`Outcome`]: [`Outcome::lines`] for its log,
-//! [`Outcome::summary`] for the Wi-Fi check, [`Outcome::no_station`] for the
-//! probe's account. What the device may still reach afterwards, the
-//! register interface with its owner, the rings and the H2C channel, is
-//! [`Kept`], for the rest of the boot.
+//! [`Outcome::summary`] for the Wi-Fi check, [`Outcome::unattached`] for the
+//! probe's account of a chip that runs no station. What the device may
+//! still reach afterwards is [`Kept`], for the rest of the boot: the
+//! station, or the register interface with its owner, the rings and the
+//! H2C channel.
 //!
 //! What an outcome proves is what each stage proves ([`bootstrap`],
-//! [`radio`]): the firmware reported FREERTOS_DONE, every efuse byte was
-//! answered, and the listen counted what RXQ held; a beacon with a BSSID
-//! proves the radio receives.
+//! [`radio`], [`Hardware::start`]): the firmware reported FREERTOS_DONE,
+//! every efuse byte was answered, the listen counted what RXQ held, and the
+//! station's interface came up; a beacon with a BSSID proves the radio
+//! receives, and only the keeper's association proves it transmits.
 use super::{
     super::{
         firmware::ParseError,
         identity::{self, Chip, IdentityError, Observed, Profile, StageError, Unpowered},
+        station::{Realtek, Wifi},
     },
     bootstrap::{self, Claim, Failure, Firmware, Observer, Progress, Report, Stage, Stage1},
     fwdl::{self, Attempt, Downloaded, FwSecure},
     h2c::Channel,
     h2creg::Mailbox,
+    hardware::{self, Hardware, Settings},
     io::{self, Io, Registers},
     listen::{Bss, Counts, Heard},
     pci::ring::Rings,
@@ -48,12 +56,13 @@ use super::{
     registers::*,
 };
 use crate::{
-    Clock,
+    Clock, Mac,
     bus::{
         dma::{mapping::DmaDomain, memory::PageSource},
         pci::ConfigSpace,
     },
     firmware::Provider,
+    wifi::{network::Network, regulatory::database::Country},
 };
 use alloc::{
     boxed::Box,
@@ -63,12 +72,7 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-
-/// Why the probe lists an RTL8852BE whose stage 1 reached the efuse and
-/// was powered off as it should among the functions no driver here runs.
-pub const NO_STATION: &str = "Realtek RTL8852BE (Linux rtw89_8852be): stage 1 ran its firmware \
-                              and read its efuse, stage 2 tuned its radio and listened, then \
-                              powered it off; no station driver here yet";
+use stela_driver_base::entropy::Entropy;
 
 /// Why the chip was left as it was, before stage 1 began.
 #[derive(Debug)]
@@ -198,13 +202,28 @@ pub fn quiesce<I: Io + ?Sized>(io: &mut I, cut: u8) -> Result<Found, Refusal> {
     Ok(Found::PoweredOff)
 }
 
-/// What stage 1 borrows of the machine.
+/// What the attach borrows of the machine.
 #[derive(Clone, Copy)]
 pub struct Inputs<'a> {
     pub firmware: &'a dyn Provider,
-    pub pages: &'a dyn PageSource,
-    /// The clock the stages are timed by.
+    /// The rings' and frames' memory, which the station keeps for the boot.
+    pub pages: &'static dyn PageSource,
+    /// The clock the stages are timed by, and the station runs on.
     pub clock: Clock,
+}
+
+/// What the station takes beside the chip.
+pub struct Join {
+    /// The network the keeper joins.
+    pub network: Network,
+    /// regulatory.db's rules for the network's country, or the world's
+    /// (`00`) when it names none, which the station's channels and TX
+    /// power follow.
+    pub country: Country,
+    /// The source of each handshake's SNonce.
+    pub entropy: Arc<dyn Entropy>,
+    /// An MSI the caller routed raises the function's causes.
+    pub vector: bool,
 }
 
 /// When each stage began, from stage 1's start.
@@ -321,8 +340,8 @@ pub enum Outcome {
     /// Stage 1 did not begin: the chip was left as it was, or as a failed
     /// [`quiesce`] left it, with bus mastering off.
     Refused(Refusal),
-    /// Stage 1 reached the efuse, then the chip was powered off, and
-    /// stage 2 ran on it.
+    /// Stage 1 reached the efuse, then the chip was powered off; the listen
+    /// and the station followed.
     Reached {
         found: Found,
         report: Box<Report>,
@@ -330,8 +349,11 @@ pub enum Outcome {
         mailbox: Mailbox,
         timings: Timings,
         power_off: Result<(), power::Error>,
-        /// Stage 2, once stage 1's power-off left the chip cold.
+        /// Stage 2's listen, when the boot asked for one and stage 1's
+        /// power-off left the chip cold.
         radio: Option<Box<radio::Outcome>>,
+        /// The station's start.
+        station: Started,
     },
     /// Stage 1 stopped at `stage`, and the chip was powered off where
     /// rtw89 powers it off.
@@ -349,37 +371,77 @@ pub enum Outcome {
     },
 }
 
-/// What the device may still reach after stage 1, for the rest of the
-/// boot: the register interface with its owner, and the rings and channel
-/// once allocated.
-pub struct Kept<'a, I> {
-    pub io: I,
-    pub rings: Option<Rings>,
-    pub channel: Option<Channel<'a>>,
+/// How the station's start went, once stage 1 reached the efuse.
+#[derive(Debug)]
+pub enum Started {
+    /// The interface came up ([`Hardware::start`]) and the keeper keeps the
+    /// station joined to the network; `vector` when an MSI signals it.
+    Up { vector: bool },
+    /// No start was tried, and why: no regulation or entropy for it, an
+    /// address no station takes, or a power-off before it that failed. The
+    /// chip stays as that power-off left it.
+    NotTried(String),
+    /// The interface's coming up stopped, or the station refused it.
+    Stopped {
+        error: String,
+        /// What the bring-up learned before it stopped.
+        report: Box<radio::Report>,
+        /// The closing power-off, `None` when the chip was never powered on.
+        power_off: Option<Result<(), power::Error>>,
+    },
+}
+
+/// What the device may still reach after the attach, for the rest of the
+/// boot.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "made once per attach and moved straight to its keeper"
+)]
+pub enum Kept<I: Io> {
+    /// The station, which holds the register interface with its owner, the
+    /// rings and the channel.
+    Station(Box<Wifi<Hardware<I>>>),
+    /// The register interface with its owner, and the rings and channel
+    /// once allocated.
+    Owners {
+        io: I,
+        rings: Option<Rings>,
+        channel: Option<Channel<'static>>,
+    },
+    /// Nothing: the station refused the hardware it was given, which went
+    /// with it, its rings' memory kept for good as a dropped ring's is.
+    Released,
 }
 
 /// Stage 1, then the power-off that closes `rtw89_chip_info_setup`, then
-/// stage 2 as `plan` asks ([`radio::run`]), for a chip [`admit`] admitted
-/// and [`quiesce`] found as `found`.
+/// stage 2's listen when `plan` asks for one ([`radio::run`]), then the
+/// station's start for `join` ([`Hardware::start`], [`Realtek::keep`]), for a
+/// chip [`admit`] admitted and [`quiesce`] found as `found`.
 ///
 /// # Safety
 /// [`bootstrap::bring_up`]'s contract holds for `io`, `config`, `domain`,
-/// `observed` and `inputs.pages`, and the caller keeps what [`Kept`] holds
-/// for the rest of the boot: the chip may reach its rings until then.
-pub unsafe fn run<'a, I: Io, C: ConfigSpace + ?Sized>(
+/// `observed` and `inputs.pages`, `join.vector` says the function raises a
+/// routed MSI, and the caller keeps what [`Kept`] holds for the rest of the
+/// boot: the chip may reach its rings until then.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the claim's parts, the listen's plan and the station's network"
+)]
+pub unsafe fn run<I: Io, C: ConfigSpace + ?Sized>(
     io: I,
     config: &mut C,
     domain: Arc<dyn DmaDomain>,
     observed: Observed,
     found: Found,
-    inputs: &Inputs<'a>,
-    plan: &radio::Plan<'_>,
-) -> (Outcome, Kept<'a, I>) {
+    inputs: &Inputs<'_>,
+    plan: Option<&radio::Plan<'_>>,
+    join: Result<Join, String>,
+) -> (Outcome, Kept<I>) {
     let mut watch = Watch::new(inputs.clock);
     let claim = Claim {
         io,
         source: inputs.pages,
-        domain,
+        domain: domain.clone(),
         observed,
     };
     // SAFETY: forwarded from the caller.
@@ -387,38 +449,71 @@ pub unsafe fn run<'a, I: Io, C: ConfigSpace + ?Sized>(
         Ok(mut stage1) => {
             watch.timings.ended = watch.now();
             let power_off = stage1.power_off();
-            let Stage1 {
-                report,
-                mut io,
-                mut rings,
-                mut channel,
-                mailbox,
-            } = stage1;
-            let radio = power_off.is_ok().then(|| {
-                let held = radio::Held {
-                    io: &mut io,
-                    rings: &mut rings,
-                    channel: &mut channel,
-                };
-                // SAFETY: forwarded from the caller, for the function stage 1
-                // brought up, its rings and channel, its DMA stopped by the
-                // power-off; `rings` stays kept below.
-                Box::new(unsafe {
-                    radio::run(held, config, &report, inputs.firmware, plan, &mut ())
-                })
+            let radio = match (&power_off, plan) {
+                (Ok(()), Some(plan)) => {
+                    let Stage1 {
+                        report,
+                        io,
+                        rings,
+                        channel,
+                        ..
+                    } = &mut stage1;
+                    let held = radio::Held { io, rings, channel };
+                    // SAFETY: forwarded from the caller, for the function
+                    // stage 1 brought up, its rings and channel, its DMA
+                    // stopped by the power-off; `rings` stays kept below.
+                    Some(Box::new(unsafe {
+                        radio::run(held, config, report, inputs.firmware, plan, &mut ())
+                    }))
+                }
+                _ => None,
+            };
+            let report = Box::new(stage1.report.clone());
+            let mailbox = stage1.mailbox;
+            // The station starts on a chip the last power-off left cold.
+            let cold = match (&power_off, radio.as_deref().map(|radio| &radio.power_off)) {
+                (Err(error), _) => Err(format!("powering it off after stage 1 failed ({error:?})")),
+                (Ok(()), Some(Some(Err(error)))) => Err(format!(
+                    "powering it off after stage 2's listen failed ({error:?})"
+                )),
+                (Ok(()), _) => Ok(()),
+            };
+            let address = Mac(report.info.efuse.addr);
+            let ready = cold.and(join).and_then(|join| {
+                if address.is_multicast() || address.0 == [0; 6] {
+                    Err(format!(
+                        "the efuse's address {} is no station's",
+                        Masked(&address.0)
+                    ))
+                } else {
+                    Ok(join)
+                }
             });
+            let (station, kept) = match ready {
+                Err(why) => {
+                    let Stage1 {
+                        io, rings, channel, ..
+                    } = stage1;
+                    let kept = Kept::Owners {
+                        io,
+                        rings: Some(rings),
+                        channel: Some(channel),
+                    };
+                    (Started::NotTried(why), kept)
+                }
+                // SAFETY: forwarded from the caller: the function stage 1
+                // brought up, its rings and channel, its DMA stopped by the
+                // last power-off; `pages` and `domain` are the claim's.
+                Ok(join) => unsafe { start(stage1, config, domain, inputs, join) },
+            };
             let outcome = Outcome::Reached {
                 found,
-                report: Box::new(report),
+                report,
                 mailbox,
                 timings: watch.timings,
                 power_off,
                 radio,
-            };
-            let kept = Kept {
-                io,
-                rings: Some(rings),
-                channel: Some(channel),
+                station,
             };
             (outcome, kept)
         }
@@ -441,8 +536,81 @@ pub unsafe fn run<'a, I: Io, C: ConfigSpace + ?Sized>(
                 timings: watch.timings,
                 power_off,
             };
-            (outcome, Kept { io, rings, channel })
+            (outcome, Kept::Owners { io, rings, channel })
         }
+    }
+}
+
+/// The station on the chip stage 1 brought up and a power-off left cold:
+/// the interface coming up ([`Hardware::start`]), then the softMAC station
+/// the keeper keeps joined to `join.network`.
+///
+/// # Safety
+/// [`Hardware::start`]'s contract holds for `stage1`, `config`, `domain`
+/// and `inputs.pages`, and `join.vector` says the function raises a routed
+/// MSI.
+unsafe fn start<I: Io, C: ConfigSpace + ?Sized>(
+    stage1: Stage1<'static, I>,
+    config: &mut C,
+    domain: Arc<dyn DmaDomain>,
+    inputs: &Inputs<'_>,
+    join: Join,
+) -> (Started, Kept<I>) {
+    let settings = Settings {
+        alpha2: join.network.country,
+        vector: join.vector,
+    };
+    // SAFETY: forwarded from the caller.
+    let hardware = match unsafe {
+        Hardware::start(
+            stage1,
+            inputs.pages,
+            domain,
+            config,
+            inputs.firmware,
+            &settings,
+        )
+    } {
+        Ok(hardware) => hardware,
+        Err(failure) => {
+            let hardware::Failure {
+                error,
+                report,
+                power_off,
+                io,
+                rings,
+                channel,
+            } = *failure;
+            let started = Started::Stopped {
+                error: error.to_string(),
+                report,
+                power_off,
+            };
+            let kept = Kept::Owners {
+                io,
+                rings: Some(rings),
+                channel: Some(channel),
+            };
+            return (started, kept);
+        }
+    };
+    let address = hardware.address();
+    let vector = hardware.vector();
+    // The address was checked as `Station::new` and `Scanner::new` check
+    // it, so the station takes the hardware.
+    match Realtek::new(hardware, address, join.country, inputs.clock) {
+        Ok(radio) => (
+            Started::Up { vector },
+            Kept::Station(Box::new(radio.keep(join.network, join.entropy))),
+        ),
+        Err(error) => (
+            Started::Stopped {
+                error: format!("station: {error}"),
+                report: Box::default(),
+                power_off: None,
+            },
+            Kept::Released,
+        ),
     }
 }
 
@@ -455,8 +623,20 @@ pub struct Summary {
     pub efuse: Option<EfuseRead>,
     /// The stage stage 1 stopped at, or was refused before, and why.
     pub stopped: Option<(Stage, String)>,
-    /// Stage 2, once it ran.
+    /// Stage 2's listen, once it ran.
     pub radio: Option<RadioRan>,
+    /// The station's start, once stage 1 reached the efuse.
+    pub station: Option<StationRan>,
+}
+
+/// How the station's start went, for the Wi-Fi check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StationRan {
+    /// The interface came up and the keeper joins the network; `vector`
+    /// when an MSI signals it.
+    Up { vector: bool },
+    /// No station runs, and why.
+    Down(String),
 }
 
 /// What stage 2 gave the Wi-Fi check.
@@ -533,16 +713,33 @@ pub struct EfuseRead {
 
 /// Why the function runs no station, for the probe's account.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NoStation(pub String);
+pub struct Unattached(pub String);
 
-impl fmt::Display for NoStation {
+impl fmt::Display for Unattached {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
+impl Started {
+    /// Why no station runs, or `None` when one does.
+    fn down(&self) -> Option<String> {
+        match self {
+            Self::Up { .. } => None,
+            Self::NotTried(why) => Some(format!("started no station: {why}")),
+            Self::Stopped {
+                error, power_off, ..
+            } => Some(format!(
+                "station's start stopped at {error}; {}",
+                powered_off(power_off.as_ref())
+            )),
+        }
+    }
+}
+
 impl Outcome {
-    /// The firmware stage, the efuse stage and where stage 1 stopped.
+    /// The firmware stage, the efuse stage, where stage 1 stopped, the
+    /// listen and the station's start.
     pub fn summary(&self) -> Summary {
         match self {
             Self::Refused(refusal) => Summary {
@@ -553,12 +750,14 @@ impl Outcome {
                     format!("left off before power-on: {refusal}"),
                 )),
                 radio: None,
+                station: None,
             },
             Self::Reached {
                 report,
                 mailbox,
                 timings,
                 radio,
+                station,
                 ..
             } => Summary {
                 firmware: Some(ran(
@@ -578,6 +777,10 @@ impl Outcome {
                 }),
                 stopped: None,
                 radio: radio.as_deref().map(RadioRan::of),
+                station: Some(match station {
+                    Started::Up { vector } => StationRan::Up { vector: *vector },
+                    down => StationRan::Down(down.down().unwrap_or_default()),
+                }),
             },
             Self::Stopped {
                 stage,
@@ -595,42 +798,17 @@ impl Outcome {
                 efuse: None,
                 stopped: Some((*stage, short(error))),
                 radio: None,
+                station: None,
             },
         }
     }
 
-    /// Why the function runs no station, or `None` when stage 1 reached the
-    /// efuse and the chip was powered off as it should: then it is
-    /// [`NO_STATION`].
-    pub fn no_station(&self) -> Option<NoStation> {
+    /// Why the function runs no station, or `None` when its station's
+    /// interface came up and the keeper keeps it.
+    pub fn unattached(&self) -> Option<Unattached> {
         let why = match self {
             Self::Refused(refusal) => format!("RTL8852B left off before power-on: {refusal}"),
-            Self::Reached {
-                power_off: Ok(()),
-                radio,
-                ..
-            } => match radio.as_deref() {
-                None => return None,
-                Some(radio::Outcome {
-                    stopped: Some((stage, error)),
-                    power_off,
-                    ..
-                }) => format!(
-                    "RTL8852B stage 2 stopped at {stage}: {error}; {}",
-                    radio_powered_off(power_off.as_ref())
-                ),
-                Some(radio::Outcome {
-                    power_off: Some(Err(error)),
-                    ..
-                }) => format!("RTL8852B stage 2 listened, but powering it off failed: {error:?}"),
-                Some(_) => return None,
-            },
-            Self::Reached {
-                power_off: Err(error),
-                ..
-            } => {
-                format!("RTL8852B stage 1 reached the efuse, but powering it off failed: {error:?}")
-            }
+            Self::Reached { station, .. } => format!("RTL8852B {}", station.down()?),
             Self::Stopped {
                 stage,
                 error,
@@ -642,7 +820,7 @@ impl Outcome {
                 powered_off(power_off.as_ref())
             ),
         };
-        Some(NoStation(why))
+        Some(Unattached(why))
     }
 
     /// The log's lines, each without its newline, the PCI location for the
@@ -657,6 +835,7 @@ impl Outcome {
                 timings,
                 power_off,
                 radio,
+                station,
             } => {
                 let efuse = &report.info.efuse;
                 let hal = &report.info.hal;
@@ -701,13 +880,14 @@ impl Outcome {
                         Ok(()) => String::from("powered off after stage 1, as rtw89's probe ends"),
                         Err(error) => format!(
                             "powering off after stage 1 failed: {error:?}; its rings and claim stay \
-                             kept, and stage 2 does not run"
+                             kept, and neither the listen nor the station runs"
                         ),
                     },
                 ];
                 if let Some(radio) = radio {
                     lines.extend(radio_lines(radio));
                 }
+                lines.extend(station_lines(station));
                 lines
             }
             Self::Stopped {
@@ -756,6 +936,51 @@ impl Outcome {
             }
         }
     }
+}
+
+/// The station's lines: its interface up, or why none came up, with what
+/// the bring-up learned and logged when it stopped.
+fn station_lines(station: &Started) -> Vec<String> {
+    match station {
+        Started::Up { vector } => alloc::vec![format!(
+            "station: the interface came up, {}; the keeper joins the network",
+            if *vector {
+                "its causes signalled by MSI"
+            } else {
+                "polled"
+            }
+        )],
+        Started::NotTried(why) => {
+            alloc::vec![format!("station: none started: {why}; the chip stays off")]
+        }
+        Started::Stopped {
+            error,
+            report,
+            power_off,
+        } => {
+            let mut lines = alloc::vec![format!("station: the start stopped at {error}")];
+            for warning in report.warnings() {
+                lines.push(format!("station warning: {warning}"));
+            }
+            for chunk in report.registers.chunks(8) {
+                lines.push(format!("station registers: {}", registers(chunk)));
+            }
+            lines.push(format!("station: {}", powered_off(power_off.as_ref())));
+            lines
+        }
+    }
+}
+
+/// Key registers as `NAME=value`, or why one was not read.
+fn registers(reads: &[radio::Read]) -> String {
+    let values: Vec<String> = reads
+        .iter()
+        .map(|read| match read.value {
+            Ok(value) => format!("{}={value:#x}", read.name),
+            Err(error) => format!("{} not read ({error:?})", read.name),
+        })
+        .collect();
+    values.join(" ")
 }
 
 /// Stage 2's lines: the plan's headline, the regulation, each stage's
@@ -867,14 +1092,7 @@ fn radio_lines(radio: &radio::Outcome) -> Vec<String> {
         }
     }
     for chunk in report.registers.chunks(8) {
-        let values: Vec<String> = chunk
-            .iter()
-            .map(|read| match read.value {
-                Ok(value) => format!("{}={value:#x}", read.name),
-                Err(error) => format!("{} not read ({error:?})", read.name),
-            })
-            .collect();
-        lines.push(format!("stage 2 registers: {}", values.join(" ")));
+        lines.push(format!("stage 2 registers: {}", registers(chunk)));
     }
     lines.push(radio_powered_off(radio.power_off.as_ref()));
     lines
@@ -898,7 +1116,7 @@ fn headline(tuned: &str, heard: &Heard) -> String {
         None => String::new(),
     };
     format!(
-        "rtw89: RTL8852B tuned to {tuned}, heard {} beacons in {seconds}{strongest}; no station yet",
+        "rtw89: RTL8852B tuned to {tuned}, heard {} beacons in {seconds}{strongest}",
         heard.beacons()
     )
 }
@@ -953,9 +1171,9 @@ fn counts(counts: &Counts) -> String {
 /// How stage 2's power-off went.
 fn radio_powered_off(power_off: Option<&Result<(), power::Error>>) -> String {
     match power_off {
-        Some(Ok(())) => String::from(
-            "powered off after stage 2, so the next system finds it cold; no station driver here yet",
-        ),
+        Some(Ok(())) => {
+            String::from("powered off after stage 2's listen, so the station starts on a cold chip")
+        }
         Some(Err(error)) => format!("powering off after stage 2 failed: {error:?}"),
         None => String::from("stage 2 never powered it on"),
     }
