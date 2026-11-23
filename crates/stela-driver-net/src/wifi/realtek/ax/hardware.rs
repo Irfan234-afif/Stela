@@ -60,8 +60,13 @@
 //!   category in mac80211's order.
 //! - [`Device::watchdog`] is the subset of `rtw89_track_work` that runs
 //!   here: the traffic statistics (`rtw89_traffic_stats_track`) and, outside
-//!   a scan, `rtw89_phy_ra_update`; DIG, CFO and DPK tracking are a later
-//!   step's, at [`Hardware::track`].
+//!   a scan, the thermal meters, the environment monitor, DIG and DPK
+//!   tracking ([`Hardware::track`], from [`super::dynamic`] and
+//!   [`rfk::track`]), `rtw89_phy_ra_update`, then CFO tracking, whose
+//!   timer's work [`Device::coexist`] runs once due. [`Device::prepare_transmit`]'s
+//!   calibration and a scan's start suspend DIG; the association and the
+//!   scan's end resume it, as `rtw89_core_sta_link_add`,
+//!   `rtw89_core_sta_link_assoc` and rtw89's hardware scan do.
 //!
 //! What this leaves out, and why:
 //! - `rtw89_mac_bf_assoc`, beamformee CSI: the advertisement's VHT and HE
@@ -93,6 +98,7 @@ use super::{
     c2h::C2h,
     cam::{self, Cipher as CamCipher, Key},
     capabilities::{self, Chip},
+    dynamic::{self, Ewma, RssiAverage},
     elements::{Board, Elements},
     h2c::{
         Channel as H2c,
@@ -403,27 +409,8 @@ impl<I> fmt::Display for Stopped<I> {
     }
 }
 
-/// `DECLARE_EWMA(name, precision, weight_rcp)`: Linux's moving average.
-#[derive(Clone, Copy, Debug, Default)]
-struct Ewma {
-    internal: u64,
-}
-
-impl Ewma {
-    /// `ewma_*_add` with `precision` fractional bits and a weight of one
-    /// over 2^`shift`.
-    fn add(&mut self, value: u64, precision: u32, shift: u32) {
-        self.internal = if self.internal == 0 {
-            value << precision
-        } else {
-            (((self.internal << shift) - self.internal) + (value << precision)) >> shift
-        };
-    }
-
-    fn read(&self, precision: u32) -> u64 {
-        self.internal >> precision
-    }
-}
+/// `DECLARE_EWMA(tp, 10, 2)`: a throughput average in Mbps.
+type ThroughputAverage = Ewma<10, 2>;
 
 /// `rtwdev->stats` as `rtw89_traffic_stats_calc` keeps them over the
 /// watchdog's two seconds: unicast data bytes and frames each way.
@@ -433,9 +420,8 @@ struct Traffic {
     rx_unicast: u64,
     tx_cnt: u64,
     rx_cnt: u64,
-    /// `DECLARE_EWMA(tp, 10, 2)`.
-    tx_tp: Ewma,
-    rx_tp: Ewma,
+    tx_tp: ThroughputAverage,
+    rx_tp: ThroughputAverage,
 }
 
 /// `rtw89_get_traffic_level` over `RTW89_TFC_INTERVAL_2SEC`.
@@ -455,15 +441,27 @@ impl Traffic {
     /// (`RTW89_TFC_MID` and up, as `rtw89_enter_lps_track` reads them).
     fn track(&mut self) -> bool {
         // rtw89_bytes_to_mbps over two seconds.
-        self.tx_tp.add(self.tx_unicast >> 18, 10, 1);
-        self.rx_tp.add(self.rx_unicast >> 18, 10, 1);
-        let tx = traffic_level(self.tx_tp.read(10), self.tx_cnt);
-        let rx = traffic_level(self.rx_tp.read(10), self.rx_cnt);
+        self.tx_tp.add(self.tx_unicast >> 18);
+        self.rx_tp.add(self.rx_unicast >> 18);
+        let tx = traffic_level(self.tx_tp.read(), self.tx_cnt);
+        let rx = traffic_level(self.rx_tp.read(), self.rx_cnt);
         self.tx_unicast = 0;
         self.rx_unicast = 0;
         self.tx_cnt = 0;
         self.rx_cnt = 0;
         tx >= TFC_MID || rx >= TFC_MID
+    }
+
+    /// What CFO tracking reads of the statistics: the throughputs, and no
+    /// trigger frame, which `rtw89_stats_trigger_frame` counts from the
+    /// trigger frames' user info: the station parses none, so
+    /// `rx_tf_periodic` stays 0 and CFO's trigger-based hold never starts.
+    fn dynamic(&self) -> dynamic::Traffic {
+        dynamic::Traffic {
+            tx_throughput: self.tx_tp.read() as u32,
+            rx_throughput: self.rx_tp.read() as u32,
+            rx_tf_periodic: 0,
+        }
     }
 }
 
@@ -570,9 +568,13 @@ pub struct Hardware<I = NativeIo> {
     /// beacons (`FIF_BCN_PRBRESP_PROMISC`).
     rx_fltr: u32,
     promiscuous: bool,
-    /// `rtwsta_link->avg_rssi`: `DECLARE_EWMA(rssi, 10, 16)`.
-    rssi: Ewma,
+    /// `rtwsta_link->avg_rssi`, the peer's: DIG's lowest RSSI and the RA's.
+    rssi: RssiAverage,
     traffic: Traffic,
+    /// The clock at the station's last service ([`Device::coexist`]).
+    now: u64,
+    /// When `rtw89_phy_cfo_track_work` runs next, while CFO's timer runs.
+    cfo_due: Option<u64>,
     calibrations: u32,
     vector: bool,
     limitations: Vec<&'static str>,
@@ -704,8 +706,10 @@ impl<I: Io> Hardware<I> {
             calibrate: false,
             rx_fltr: DEFAULT_AX_RX_FLTR,
             promiscuous: false,
-            rssi: Ewma::default(),
+            rssi: RssiAverage::new(),
             traffic: Traffic::default(),
+            now: 0,
+            cfo_due: None,
             calibrations: 0,
             vector: settings.vector,
             limitations: Vec::new(),
@@ -840,17 +844,76 @@ impl<I: Io> Hardware<I> {
             .map_err(failed("RX filter"))
     }
 
-    /// The seam where the radio's tracking runs in `rtw89_track_work`, after
-    /// the traffic statistics and outside a scan, before the RA update, in
-    /// rtw89's order: the environment monitor and DIG (`rtw89_phy_dig`),
-    /// the chip's RF tracking (`rtw89_core_rfk_track`, `rtw8852b_dpk_track`),
-    /// then CFO tracking (`rtw89_phy_cfo_track`). Their steps are ported
-    /// apart (`ax/dynamic.rs` and `rtw8852b/rfk/dpk.rs`), and nothing runs
-    /// here until they are wired in; [`Hardware::scanning`]'s end is where
-    /// rtw89 sets DIG's bypass, and [`Traffic`] holds the statistics they
-    /// read.
+    /// What `rtw89_track_work` runs of the radio's tracking before the RA
+    /// update, after the traffic statistics and outside a scan, in its
+    /// order: the thermal meters (`rtw89_phy_stat_track`), the environment
+    /// monitor (`rtw89_phy_env_monitor_track`), DIG (`rtw89_phy_dig`), then
+    /// the chip's RF tracking (`rtw89_core_rfk_track`, `rtw8852b_dpk_track`)
+    /// with the thermal averages. On the channel tuned, or rtw89's default
+    /// before any.
     fn track(&mut self) -> Result<(), String> {
+        let link = self.dm_link();
+        let chan = self.chan.map_or(radio::DEFAULT_CHANNEL, |chan| chan.rfk());
+        let Self { io, running, .. } = self;
+        let Running {
+            state,
+            thermal,
+            dynamic,
+            ..
+        } = running;
+        thermal
+            .update(io, state.is_tssi_mode)
+            .map_err(failed("thermal"))?;
+        dynamic
+            .env_monitor_track(io)
+            .map_err(failed("environment monitor"))?;
+        dynamic.dig(io, link, chan).map_err(failed("DIG"))?;
+        rfk::track(io, state, thermal.read()).map_err(failed("RF tracking"))
+    }
+
+    /// `rtw89_phy_cfo_track`, after the RA update: the CFO the PPDU
+    /// statuses reported applied, or CFO's timer started, whose work
+    /// [`Device::coexist`] runs once due.
+    fn track_cfo(&mut self) -> Result<(), String> {
+        let link = self.dm_link();
+        let traffic = self.traffic.dynamic();
+        let Self { io, running, .. } = self;
+        if let Some(ms) = running
+            .dynamic
+            .cfo_track(io, link, traffic)
+            .map_err(failed("CFO"))?
+        {
+            self.cfo_due = Some(self.now + u64::from(ms) * 1000);
+        }
         Ok(())
+    }
+
+    /// `rtw89_phy_cfo_track_work` once its timer is due at `now`: the CFO
+    /// applied again and the timer started over, until CFO tracking stops
+    /// it. Its `rtw89_leave_ps_mode` has nothing to leave: the station
+    /// never enters power save.
+    fn cfo_work(&mut self, now: u64) -> Result<(), String> {
+        if self.cfo_due.is_none_or(|due| now < due) {
+            return Ok(());
+        }
+        let link = self.dm_link();
+        let traffic = self.traffic.dynamic();
+        let Self { io, running, .. } = self;
+        let again = running
+            .dynamic
+            .cfo_track_work(io, link, traffic, |_| Ok(()))
+            .map_err(failed("CFO"))?;
+        self.cfo_due = again.map(|ms| now + u64::from(ms) * 1000);
+        Ok(())
+    }
+
+    /// What the tracking reads of the station: its AP once associated, and
+    /// that AP's RSSI average (`rtw89_phy_stat_rssi_update`'s `rssi_min`).
+    fn dm_link(&self) -> dynamic::Link {
+        dynamic::Link {
+            stations: u8::from(self.peer.is_some()),
+            rssi_min: self.rssi.read() as u8,
+        }
     }
 
     /// What rtw89 keeps of its own side of the link for the RA.
@@ -859,7 +922,7 @@ impl<I: Io> Hardware<I> {
             band: rated.band,
             mac_id: self.link.mac_id,
             er_cap: rated.er_cap,
-            rssi: self.rssi.read(10) as u8,
+            rssi: self.rssi.read() as u8,
             tx_nss: self.stage1.info.hal.tx_nss,
         }
     }
@@ -900,7 +963,7 @@ impl<I: Io> Hardware<I> {
             band,
             mac_id: self.link.mac_id,
             er_cap,
-            rssi: self.rssi.read(10) as u8,
+            rssi: self.rssi.read() as u8,
             tx_nss: self.stage1.info.hal.tx_nss,
         };
         let info = ra::RaInfo::sta_update(&sta, &link, false);
@@ -1177,6 +1240,13 @@ impl<I: Io> Device for Hardware<I> {
         let ra = Ra::assoc(&rated.sta, &self.ra_link(&rated));
         self.send_ra(&ra)?;
         self.rated = Some(rated);
+        // rtw89_phy_dig_resume(rtwdev, false), which ends the association.
+        let link = self.dm_link();
+        let Self { io, running, .. } = self;
+        running
+            .dynamic
+            .dig_resume(io, link, false)
+            .map_err(failed("DIG"))?;
         sta::bss_assoc(&mut self.io, &self.link).map_err(failed("port"))
     }
 
@@ -1184,7 +1254,7 @@ impl<I: Io> Device for Hardware<I> {
     fn left(&mut self) -> Result<(), String> {
         let peer = self.peer.take();
         self.rated = None;
-        self.rssi = Ewma::default();
+        self.rssi = RssiAverage::new();
         let Self {
             io,
             rings,
@@ -1253,6 +1323,7 @@ impl<I: Io> Device for Hardware<I> {
             mailbox,
             state,
             inputs,
+            ..
         } = running;
         let txpwr = Power {
             tables: &power.tables,
@@ -1279,7 +1350,8 @@ impl<I: Io> Device for Hardware<I> {
     }
 
     /// `rtw8852b_rfk_channel` on a channel tuned outside a scan, before its
-    /// first frame.
+    /// first frame, then `rtw89_phy_dig_suspend`, as
+    /// `rtw89_core_sta_link_add` runs them for a station's AP.
     fn prepare_transmit(&mut self) -> Result<(), String> {
         if !core::mem::take(&mut self.calibrate) {
             return Ok(());
@@ -1300,6 +1372,8 @@ impl<I: Io> Device for Hardware<I> {
             mailbox,
             state,
             inputs,
+            dynamic,
+            ..
         } = running;
         let tssi = tssi::Inputs {
             efuse: &stage1.info.tssi,
@@ -1327,6 +1401,7 @@ impl<I: Io> Device for Hardware<I> {
             },
         )
         .map_err(failed("calibration"))?;
+        dynamic.dig_suspend(io).map_err(failed("DIG"))?;
         self.calibrations += 1;
         Ok(())
     }
@@ -1633,8 +1708,17 @@ impl<I: Io> Device for Hardware<I> {
         Ok(())
     }
 
+    /// The clock at each of the station's services: CFO's timer
+    /// (`rtw89_phy_cfo_track_work`, queued `cfo_timer_ms` on) runs here
+    /// once due, as the Device has no timer of its own.
+    fn coexist(&mut self, now: u64) -> Result<(), String> {
+        self.now = now;
+        self.cfo_work(now)
+    }
+
     /// `rtw89_track_work`'s subset: the traffic statistics, then outside a
-    /// scan [`Hardware::track`] and `rtw89_phy_ra_update`.
+    /// scan [`Hardware::track`] (thermal, environment monitor, DIG, RF
+    /// tracking), `rtw89_phy_ra_update` and CFO tracking, in its order.
     fn watchdog(&mut self, scanning: bool, _stbc: bool) -> Result<Watched, String> {
         let busy = self.traffic.track();
         if scanning {
@@ -1645,11 +1729,15 @@ impl<I: Io> Device for Hardware<I> {
             let ra = Ra::update(&rated.sta, &self.ra_link(&rated), RC_SUPP_RATES_CHANGED);
             self.send_ra(&ra)?;
         }
+        self.track_cfo()?;
         Ok(Watched { level: 0, busy })
     }
 
-    /// `rtw89_core_scan_start` and `rtw89_core_scan_complete` of a software
-    /// scan.
+    /// `rtw89_hw_scan_start` and `rtw89_hw_scan_complete_cb` around the
+    /// station's software scan: `rtw89_core_scan_start` and
+    /// `rtw89_core_scan_complete` (which has the next DIG skipped), then
+    /// `rtw89_phy_dig_suspend` as the scan starts and
+    /// `rtw89_phy_dig_resume` with the floor DIG last set as it ends.
     fn scanning(&mut self, scanning: bool) -> Result<(), String> {
         self.scanning = scanning;
         let address = scanning.then_some(self.link.mac_addr);
@@ -1668,6 +1756,7 @@ impl<I: Io> Device for Hardware<I> {
                 mailbox,
                 state,
                 inputs,
+                ..
             } = running;
             let tssi = tssi::Inputs {
                 efuse: &stage1.info.tssi,
@@ -1689,7 +1778,16 @@ impl<I: Io> Device for Hardware<I> {
         if scanning {
             self.send_addr_cam(address)?;
         }
-        Ok(())
+        let link = self.dm_link();
+        let Self { io, running, .. } = self;
+        let dynamic = &mut running.dynamic;
+        if scanning {
+            dynamic.dig_suspend(io)
+        } else {
+            dynamic.scan_complete();
+            dynamic.dig_resume(io, link, true)
+        }
+        .map_err(failed("DIG"))
     }
 
     fn signals(&self) -> bool {
@@ -1763,8 +1861,11 @@ impl<I: Io> Hardware<I> {
     }
 
     /// `rtw89_core_rx_to_mac80211` of one frame: a frame that failed its CRC
-    /// is dropped, the FCS cut, the signal its PPDU status gave. The peer's
-    /// average RSSI and the traffic statistics count it.
+    /// is dropped, the FCS cut, the signal its PPDU status gave. The traffic
+    /// statistics count it, and a PPDU status A1-matched to the AP's MAC ID
+    /// gives the AP's average RSSI its `rssi_avg`
+    /// (`rtw89_core_rx_process_phy_ppdu_iter`) and CFO tracking its CFO
+    /// (`rtw89_phy_cfo_parse`).
     fn frame(&mut self, frame: Delivered<Vec<u8>>) -> Option<Received> {
         let Delivered {
             status,
@@ -1776,11 +1877,15 @@ impl<I: Io> Hardware<I> {
             return None;
         }
         let length = bytes.len().checked_sub(FCS_LEN).filter(|&n| n >= 10)?;
-        if let (Some(ppdu), Some(peer)) = (ppdu, &self.peer)
+        if let Some(ppdu) = ppdu
+            && self.peer.is_some()
             && ppdu.to_self
-            && bytes[10..16] == peer.addr
+            && ppdu.mac_id == self.link.mac_id
         {
-            self.rssi.add(ppdu.rssi_avg.into(), 10, 4);
+            self.rssi.add(ppdu.rssi_avg.into());
+            if let Some(cfo) = ppdu.cfo {
+                self.running.dynamic.cfo_parse(cfo, ppdu.mac_id);
+            }
         }
         if bytes[0] & 0x0c == 0x08 && bytes[4..10] == self.link.mac_addr {
             self.traffic.rx_unicast += length as u64;

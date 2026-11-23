@@ -20,16 +20,17 @@ use crate::{
                 c2h::RaRpt,
                 elements::{Id, tests as elm},
                 h2c::{H2C_CAT_MAC, H2C_CAT_OUTSRC},
-                io::CR_BASE,
+                io::{CR_BASE, field},
                 mac::port::NET_TYPE_INFRA,
                 model::{AID, Ap, Chip as Model, Command, Protection, Sent, Shared},
                 pci::{
                     release::{TX_DONE, TX_RETRY_LIMIT},
-                    tests::{Domain, Placement, Source},
+                    tests::{Access, Domain, Placement, Source},
                 },
+                registers::{SWSI_DATA_ADDR_V1, SWSI_DATA_V1, WLAN_XTAL_SI_CTRL},
                 rtw8852b::rfk::{
                     ntfy::{H2C_CL_OUTSRC_RF_FW_NOTIFY, H2C_FUNC_OUTSRC_RF_GET_MCCCH},
-                    reg::{B_P0_TSSI_OFT, R_P0_TSSI_TRK},
+                    reg::{B_P0_TSSI_OFT, R_P0_TSSI_TRK, R_TXAGC_BB, RR_TM},
                 },
                 txwd::*,
             },
@@ -930,4 +931,98 @@ fn data_waiting_together_on_five_ghz_leaves_as_one_amsdu() {
         joined.frame.len()
     );
     assert_ne!(joined.info.unwrap()[2] & INFO2_SEC_HW_ENC, 0);
+}
+
+/// The first access in `log` that `found` names.
+fn first(log: &[Access], what: &str, found: impl Fn(&Access) -> bool) -> usize {
+    log.iter()
+        .position(found)
+        .unwrap_or_else(|| panic!("no {what} in {} accesses", log.len()))
+}
+
+#[test]
+fn the_watchdog_tracks_in_rtw89s_order_and_leaves_a_scan_alone() {
+    let (mut hardware, chip) = hardware();
+    hardware
+        .tune(&definition(36, 5180, Width::Mhz80, 5210), false, 2000)
+        .unwrap();
+    // No station added: DIG runs. A crystal off its default, which CFO tracking without an AP steps
+    // back toward it.
+    let cfo = &mut hardware.running.dynamic.cfo;
+    let default = cfo.crystal_cap_default;
+    cfo.crystal_cap = default + 2;
+    chip.logging(true);
+    hardware.watchdog(true, false).unwrap();
+    assert_eq!(chip.log(), [], "a scan's watchdog tracks nothing");
+    hardware.watchdog(false, false).unwrap();
+    let log = chip.log();
+    let read = |at: u32| move |access: &Access| matches!(*access, Access::Read { register, .. } if register == at);
+    let wrote = |at: u32| move |access: &Access| matches!(*access, Access::Write { register, .. } if register == at);
+    // The thermal meters: TSSI's report, or RF RR_TM triggered.
+    let thermal = first(&log, "thermal reading", |access| {
+        read(CR_BASE + 0x1c10)(access)
+            || matches!(*access, Access::Write { register, value, .. }
+                if register == CR_BASE + SWSI_DATA_V1 && field(value, SWSI_DATA_ADDR_V1) == RR_TM)
+    });
+    let monitor = first(&log, "IFS-CLM report", read(CR_BASE + dynamic::IFSCNT));
+    let dig = first(&log, "PD floor", wrote(CR_BASE + dynamic::SEG0R_PD_V1));
+    let dpk = first(&log, "DPK track", read(CR_BASE + R_TXAGC_BB));
+    let cfo = first(&log, "crystal cap", wrote(WLAN_XTAL_SI_CTRL));
+    assert!(
+        thermal < monitor && monitor < dig && dig < dpk && dpk < cfo,
+        "{thermal} {monitor} {dig} {dpk} {cfo}"
+    );
+    assert_eq!(hardware.running.dynamic.cfo.crystal_cap, default + 1);
+}
+
+#[test]
+fn the_association_resumes_dig_and_feeds_it_the_aps_rssi() {
+    let mut bench = connected(Protection::Wpa2Psk);
+    let hardware = bench.wifi.radio_mut().device_mut();
+    // Suspended as the AP's channel was calibrated, resumed at the
+    // association; the AP's frames, A1-matched to its MAC ID, are its
+    // average at the rssi_avg __rtw8852bx_convert_rpl_to_rssi gives their
+    // PPDU statuses: IE01's FD average, 120.
+    assert!(!hardware.running.dynamic.dig.pause_dig);
+    assert_eq!(
+        hardware.dm_link(),
+        dynamic::Link {
+            stations: 1,
+            rssi_min: 120
+        }
+    );
+    // A scan suspends DIG; its end resumes it and skips the next DIG.
+    hardware.scanning(true).unwrap();
+    assert!(hardware.running.dynamic.dig.pause_dig);
+    hardware.scanning(false).unwrap();
+    let dig = hardware.running.dynamic.dig;
+    assert!(!dig.pause_dig && dig.bypass_dig);
+    hardware.watchdog(false, false).unwrap();
+    assert!(!hardware.running.dynamic.dig.bypass_dig);
+}
+
+#[test]
+fn a_busy_link_runs_cfo_tracking_on_its_timer() {
+    let (mut hardware, _) = hardware();
+    let start = 10_000_000;
+    hardware.coexist(start).unwrap();
+    // More than CFO_TP_UPPER's 100 Mbps sent: the enhanced state, its
+    // timer started.
+    hardware.traffic.tx_tp.add(400);
+    hardware.watchdog(false, false).unwrap();
+    let period = u64::from(hardware.running.dynamic.cfo.cfo_timer_ms) * 1000;
+    assert_eq!(period, 250_000);
+    assert_eq!(hardware.cfo_due, Some(start + period));
+    hardware.coexist(start + period - 1).unwrap();
+    assert_eq!(hardware.cfo_due, Some(start + period));
+    hardware.coexist(start + period).unwrap();
+    assert_eq!(hardware.cfo_due, Some(start + 2 * period));
+    // Quiet: the watchdogs bring the average under CFO_TP_LOWER, and the
+    // next work stops the timer.
+    while hardware.traffic.dynamic().tx_throughput > 50 {
+        hardware.watchdog(false, false).unwrap();
+    }
+    hardware.watchdog(false, false).unwrap();
+    hardware.coexist(start + 2 * period).unwrap();
+    assert_eq!(hardware.cfo_due, None);
 }

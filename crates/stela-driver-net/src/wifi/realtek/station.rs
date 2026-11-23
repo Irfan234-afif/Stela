@@ -278,7 +278,8 @@ pub trait Device {
     fn stream_change(&mut self) -> Option<bool> {
         None
     }
-    /// A look at the Bluetooth arbiter's timers, at `now`.
+    /// A look at the hardware's timers at `now`, once each service: the
+    /// Bluetooth arbiter's, or the radio tracking's.
     fn coexist(&mut self, _now: u64) -> Result<(), String> {
         Ok(())
     }
@@ -630,6 +631,12 @@ impl<D: Device> Realtek<D> {
     pub fn keep(self, network: Network, entropy: Arc<dyn Entropy>) -> Wifi<D> {
         let clock = self.clock;
         Keeper::keep(self, network, entropy, clock)
+    }
+
+    /// The device, for its models.
+    #[cfg(test)]
+    pub(crate) fn device_mut(&mut self) -> &mut D {
+        &mut self.device
     }
 
     fn hardware<T>(result: Result<T, String>) -> Result<T, Error> {

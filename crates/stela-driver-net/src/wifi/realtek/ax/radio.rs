@@ -35,9 +35,12 @@
 //! 6. [`Stage::Coex`]: `rtw89_btc_ntfy_init`, as the plan's WL-only init
 //!    ([`coex::init_wl_only`]), where rtw89 passes `BTC_MODE_NORMAL`.
 //! 7. [`Stage::DmInit`]: the subset of `rtw89_phy_dm_init` (phy.c) that
-//!    writes the radio's state: `rtw89_chip_bb_sethw`
+//!    writes the radio's state: `rtw89_phy_stat_init`'s thermal meters
+//!    ([`Thermal::init`]), `rtw89_chip_bb_sethw`
 //!    (`__rtw8852bx_bb_sethw`, [`bb_sethw`]: the sounding bits, the MAC ID
-//!    power limits and the RPL bias the channel switch reads),
+//!    power limits and the RPL bias the channel switch reads), the
+//!    environment monitor, the PHY status IE bitmaps, DIG and CFO on
+//!    rtw89's default channel ([`Dynamic::init`], [`DEFAULT_CHANNEL`]),
 //!    `rtw89_chip_rfk_hw_init` (NULL), `rtw89_phy_init_rf_nctl`
 //!    ([`phy::init_rf_nctl`]), `rtw89_chip_rfk_init` ([`rfk::init`]) and
 //!    `rtw89_chip_set_txpwr_ctrl` ([`rtw8852b_txpower::set_txpwr_ctrl`]).
@@ -68,13 +71,11 @@
 //! the interface up through them too, then tunes as its station asks.
 //!
 //! What this leaves out, and why:
-//! - The rest of `rtw89_phy_dm_init`: the statistics, diagnostics, CCX and
-//!   NHM monitors, the PHY status IE bitmaps (`rtw89_physts_parsing_init`),
-//!   DIG, CFO, EDCCA, channel info, UL TB, antenna diversity, the RFE GPIO,
-//!   `rtw89_chip_power_trim` and `rtw89_chip_cfg_txrx_path`. They tune
-//!   dynamic mechanisms, TX power trims and the TX/RX path from the BB
-//!   tables' defaults; the PHY status header that carries the RSSI comes
-//!   whatever IEs the bitmaps select.
+//! - The rest of `rtw89_phy_dm_init`: the packet statistics, diagnostics,
+//!   NHM (which an RTL8852B does not support), EDCCA, channel info, UL TB,
+//!   antenna diversity, the RFE GPIO, `rtw89_chip_power_trim` and
+//!   `rtw89_chip_cfg_txrx_path`. They tune dynamic mechanisms, TX power
+//!   trims and the TX/RX path from the BB tables' defaults.
 //! - What `rtw89_core_start` runs after `rtw89_hci_start`: the track works,
 //!   `rtw89_chip_rfk_init_late` (NULL for an RTL8852B), the BTC radio state,
 //!   the firmware log and BA CAM H2Cs, and TAS.
@@ -98,6 +99,7 @@ use super::{
     bootstrap::Report as Stage1,
     coex,
     dle::{self, PreInit},
+    dynamic::{Dynamic, Thermal},
     efuse::Info,
     elements::{self, Board, Elements, Id},
     fwdl::{self, Downloaded},
@@ -167,6 +169,14 @@ pub const SCAN_RX_FLTR: u32 =
 pub const LISTEN_US: u64 = 2_000_000;
 /// The most RXQ buffers one drain takes: every RX BD four times.
 pub const DRAIN_LIMIT: u32 = 4 * ring::RXBD_NUM_MAX;
+/// `rtw89_get_default_chandef`'s channel, what `rtw89_chan_get` gives
+/// before any channel is set: 2.4 GHz channel 1, `NL80211_CHAN_NO_HT`.
+/// DIG starts from it at the DM init.
+pub const DEFAULT_CHANNEL: rfk::Channel = rfk::Channel {
+    band: rfk::Band::Ghz2,
+    width: rfk::Bandwidth::Mhz20,
+    number: 1,
+};
 
 /// How far stage 2 got: each step of [`run`], in its order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -777,6 +787,12 @@ pub struct Running {
     /// What a channel switch reads besides the channel: the BB gain table's
     /// values, the efuse gains, the RPL biases and the RX antennas.
     pub inputs: channel::Inputs,
+    /// `rtwdev->phystat`'s thermal meters, as `rtw89_phy_stat_init` left
+    /// them.
+    pub thermal: Thermal,
+    /// The tracking `rtw89_phy_dm_init` set up: the environment monitor,
+    /// DIG and CFO.
+    pub dynamic: Dynamic,
 }
 
 /// [`run`]'s stages, each begun through `begin`, what each learns put in
@@ -838,6 +854,7 @@ unsafe fn bring_up<I: Io, C: ConfigSpace + ?Sized>(
         mut mailbox,
         mut state,
         inputs,
+        ..
     } = unsafe {
         power_up(
             io, rings, h2c, config, stage1, suit, &tables, report, powered, begin,
@@ -1009,10 +1026,13 @@ pub unsafe fn power_up<I: Io, C: ConfigSpace + ?Sized>(
     );
 
     begin(Stage::DmInit);
+    let mut state = Box::<State>::default();
+    let thermal = Thermal::init(io, state.is_tssi_mode).map_err(Error::Io)?;
     let (offset_base, rssi_base) = bb_sethw(io).map_err(Error::Io)?;
     report.bases = Some((offset_base, rssi_base));
+    let dynamic =
+        Dynamic::init(io, cut, info.efuse.xtal_cap, DEFAULT_CHANNEL, false).map_err(Error::Io)?;
     phy::init_rf_nctl(io, tables, board, &mut report.phy_warnings).map_err(Error::Phy)?;
-    let mut state = Box::<State>::default();
     let refused = rfk::init(
         io,
         &mut MacScheduler {
@@ -1038,6 +1058,8 @@ pub unsafe fn power_up<I: Io, C: ConfigSpace + ?Sized>(
             antenna_rx: info.hal.antenna_rx,
             monitor: false,
         },
+        thermal,
+        dynamic,
     })
 }
 
