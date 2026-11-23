@@ -166,6 +166,7 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
             &host.devices.host_network,
             &host.devices.network_tried,
             options.network_check.as_deref(),
+            options.wifi_check_ser,
         );
     }
     let storage = open_storage(handoff, &options, &mut host);

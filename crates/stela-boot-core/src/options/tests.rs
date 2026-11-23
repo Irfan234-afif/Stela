@@ -141,6 +141,29 @@ fn the_wifi_check_channel_names_a_tuned_channel_round_trips_and_needs_the_check(
 }
 
 #[test]
+fn the_wifi_check_recovery_stage_round_trips_and_needs_the_check() {
+    let text = "--system --wifi home --wifi-check --wifi-check-ser --network-check http://a/";
+    let options = System::parse(text).unwrap();
+    assert!(options.wifi_check_ser);
+    assert_eq!(System::parse(&options.to_string()), Ok(options));
+    assert!(!System::default().wifi_check_ser);
+    assert!(
+        !System::parse("--system --wifi home --wifi-check")
+            .unwrap()
+            .wifi_check_ser
+    );
+    assert_eq!(
+        System::parse("--system --wifi home --wifi-check --wifi-check-ser --wifi-check-ser")
+            .unwrap_err(),
+        Error::DuplicateWifiCheckSer
+    );
+    assert_eq!(
+        System::parse("--system --wifi home --wifi-check-ser").unwrap_err(),
+        Error::Constraint(Constraint::WifiCheckSerDependency)
+    );
+}
+
+#[test]
 fn restart_at_stop_round_trips_beside_a_check_and_is_given_once() {
     for text in [
         "--system --restart-at-stop",

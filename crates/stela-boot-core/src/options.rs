@@ -47,6 +47,7 @@ pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
 pub const WIFI_CHECK_CHANNEL: &str = "--wifi-check-channel";
+pub const WIFI_CHECK_SER: &str = "--wifi-check-ser";
 pub const USB4_APPROVE: &str = "--usb4-approve";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
@@ -320,6 +321,10 @@ pub struct System {
     /// The channel the Wi-Fi check listens on, channel 36 at 80 MHz without
     /// it (`--wifi-check-channel PRIMARY[/WIDTH]`).
     pub wifi_check_channel: Option<WifiCheckChannel>,
+    /// After the Wi-Fi check's lease, crash the RTL8852BE's firmware and
+    /// check that the chip comes up cold, rejoins and gets a new lease
+    /// (`--wifi-check-ser`).
+    pub wifi_check_ser: bool,
     /// Check exclusively owned conventional HDA after ExitBootServices.
     pub audio_check: Option<AudioCheck>,
     /// Explicit whole-controller handoff for the audio check's physical clock.
@@ -426,6 +431,7 @@ impl Default for System {
             restart_at_stop: false,
             wifi_check: false,
             wifi_check_channel: None,
+            wifi_check_ser: false,
             audio_check: None,
             audio_own_hpet: false,
             native_pci_own_ioapic: false,
@@ -935,6 +941,7 @@ impl fmt::Display for System {
         line.flag("--restart-at-stop", self.restart_at_stop)?;
         line.flag("--wifi-check", self.wifi_check)?;
         line.value(WIFI_CHECK_CHANNEL, self.wifi_check_channel)?;
+        line.flag(WIFI_CHECK_SER, self.wifi_check_ser)?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
         line.flag("--native-pci-own-ioapic", self.native_pci_own_ioapic)?;

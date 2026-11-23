@@ -398,6 +398,15 @@ impl<L: Link, C: Clock> Stack<L, C> {
         ))
     }
 
+    /// Starts DHCPv4 over from discovery, as a client does once its link
+    /// came back: the next poll drops the lease, and [`Self::dhcp`] waits
+    /// for a new one. An address set by hand stays.
+    pub fn rediscover(&mut self) {
+        if let Some(dhcp) = self.dhcp {
+            self.sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+        }
+    }
+
     /// Whether DHCP is getting a new lease for one lost less than
     /// [`DHCP_WAIT_US`] ago: IPv4 is expected back, so a lookup waits for
     /// it rather than failing.

@@ -218,6 +218,7 @@ impl ParseState<'_> {
                 flag(&mut options.restart_at_stop, Error::DuplicateRestartAtStop)?;
             }
             "--wifi-check" => flag(&mut options.wifi_check, Error::DuplicateWifiCheck)?,
+            WIFI_CHECK_SER => flag(&mut options.wifi_check_ser, Error::DuplicateWifiCheckSer)?,
             WIFI_CHECK_CHANNEL => {
                 let channel = value()
                     .and_then(WifiCheckChannel::parse)

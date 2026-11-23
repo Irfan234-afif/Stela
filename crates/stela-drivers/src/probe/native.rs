@@ -650,10 +650,11 @@ pub(super) struct RealtekAx {
     pub(super) outcome: realtek_wifi::ax::attach::Outcome,
     /// The station, when its interface came up.
     pub(super) station: Option<Located<RealtekAxWifi>>,
-    /// The function, its BAR2 mapping, its requester's preparation or DMA
-    /// attachment, and without a station the register interface, rings
-    /// and channel once stage 1 ran: kept for the rest of the boot,
-    /// whatever happened.
+    /// The function (with a station, its configuration space is the
+    /// station's, for a cold re-init), its BAR2 mapping, its requester's
+    /// preparation or DMA attachment, and without a station the register
+    /// interface, rings and channel once stage 1 ran: kept for the rest of
+    /// the boot, whatever happened.
     pub(super) kept: Box<dyn Any>,
 }
 
@@ -829,13 +830,26 @@ pub(super) unsafe fn realtek_ax_wifi(
         )
     };
     let (station, kept): (_, Box<dyn Any>) = match kept {
-        attach::Kept::Station(wifi) => (
-            Some(Located {
-                location: alloc::format!("{address}"),
-                link: *wifi,
-            }),
-            Box::new((function, attachment, owner)),
-        ),
+        attach::Kept::Station(mut wifi) => {
+            // A firmware halt or watchdog brings the chip up cold again
+            // (`ax::ser`), which programs its configuration space as the
+            // start did: the station takes the function's own.
+            let restart = realtek_wifi::ax::hardware::Restart {
+                config: Box::new(function.into_config()),
+                firmware: inputs.firmware,
+            };
+            // SAFETY: `restart.config` is the configuration space of the
+            // function whose BAR2 the station's register interface reaches,
+            // which nothing else here programs while the station holds it.
+            unsafe { wifi.radio_mut().device_mut().restartable(restart) };
+            (
+                Some(Located {
+                    location: alloc::format!("{address}"),
+                    link: *wifi,
+                }),
+                Box::new((attachment, owner)),
+            )
+        }
         kept => (None, Box::new((function, attachment, owner, kept))),
     };
     Ok(RealtekAx {

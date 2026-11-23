@@ -26,6 +26,12 @@
 //! TX path the air never acknowledged shows. A lease that came over
 //! another adapter fails the check: the RTL8852B was never tried.
 //!
+//! With `--wifi-check-ser`, a recovery stage follows the lease ([`Stage::Ser`],
+//! [`Recovery`]): the station's firmware is asked to crash, its receive
+//! must report the halt and the chip's cold re-init, the carrier must drop
+//! and come back as the keeper joins again, DHCP must lease again, and the
+//! station must count one cold re-init.
+//!
 //! A cut of 0 (CAV) fails the check: linux-firmware's RTL8852B container
 //! holds images for cuts 1 and 2, and rtw89 takes the newest image whose cut
 //! is not above the chip's, so CAV silicon has none and stage 1 leaves it
@@ -65,6 +71,9 @@ pub enum Stage {
     Station,
     /// DHCP leased the host's network an IPv4 address over the station.
     Lease,
+    /// Asked to (`--wifi-check-ser`): the station's firmware crashed on
+    /// purpose, the chip brought up cold, rejoined and leased again.
+    Ser,
 }
 
 impl Stage {
@@ -76,11 +85,13 @@ impl Stage {
             Self::Radio => "radio",
             Self::Station => "station",
             Self::Lease => "lease",
+            Self::Ser => "ser",
         }
     }
 }
 
-/// The last stage this image's driver reaches.
+/// The last stage this image's driver reaches, beside the recovery stage
+/// a check asks for ([`Stage::Ser`]).
 pub const DRIVEN: Stage = Stage::Lease;
 
 /// The name the network's log gives an RTL8852BE station's adapter.
@@ -141,6 +152,54 @@ pub struct Network<'a> {
     /// The `--network-check` POST over the lease's adapter, when the boot
     /// asked for one: `Err` says why it failed.
     pub check: Option<Result<(), &'a str>>,
+    /// The recovery stage after the lease, when the boot asked for it
+    /// (`--wifi-check-ser`).
+    pub recovery: Option<Recovery<'a>>,
+}
+
+/// A step of the recovery stage, in its order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryStep {
+    /// The firmware asked to crash (`rtw89_fw_h2c_trigger_cpu_exception`).
+    Trigger,
+    /// The station's receive reported the halt and the cold re-init.
+    Halt,
+    /// The association went with the firmware: the carrier dropped.
+    CarrierDown,
+    /// The keeper joined the network again: the carrier came back.
+    Rejoin,
+    /// DHCP leased the host's network an address again.
+    Lease,
+}
+
+impl RecoveryStep {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Halt => "halt",
+            Self::CarrierDown => "carrier down",
+            Self::Rejoin => "rejoin",
+            Self::Lease => "lease",
+        }
+    }
+}
+
+/// The recovery stage as it ran on the station that held the lease: what
+/// each step gave, up to one that did not complete.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Recovery<'a> {
+    /// The station's report of its firmware's halt and its cold re-init.
+    pub halted: Option<&'a str>,
+    /// Milliseconds from the trigger to the halt's report, to the carrier's
+    /// loss, to its return and to the new lease.
+    pub took_ms: [Option<u64>; 4],
+    /// The new IPv4 lease.
+    pub lease: Option<Lease>,
+    /// The cold re-inits the station's chip went through since its radio
+    /// came up.
+    pub recoveries: Option<u32>,
+    /// The step that did not complete, and why.
+    pub stopped: Option<(RecoveryStep, &'a str)>,
 }
 
 /// The check's outcome.
@@ -277,9 +336,11 @@ pub fn report<'a, L: fmt::Display>(
     } else if let Some(Err(why)) = network.check {
         Verdict::Failed(format!("the network check over Wi-Fi failed: {why}"))
     } else {
-        // A diagnostics-only stage past the lease, such as a firmware
-        // recovery the check triggers, goes here, before the verdict.
-        lines.push(format!("WIFI CHECK reached {}; restarting", DRIVEN.name()));
+        let last = match network.recovery {
+            Some(_) => Stage::Ser,
+            None => DRIVEN,
+        };
+        lines.push(format!("WIFI CHECK reached {}; restarting", last.name()));
         Verdict::Passed
     };
     Report { lines, verdict }
@@ -330,7 +391,10 @@ fn station(
                 lease.address,
                 lease.prefix
             ));
-            Ok(())
+            match &network.recovery {
+                Some(recovery) => recovered(location, recovery, lines),
+                None => Ok(()),
+            }
         }
         (Ok(None), _) => stop(
             lines,
@@ -372,6 +436,57 @@ fn stopped(
         why,
         network,
     }
+}
+
+/// The recovery stage's lines for the station at `location`: the halt its
+/// receive reported, the carrier's loss and return, and the new lease with
+/// the cold re-inits counted, which must be one; or the step it stopped at.
+fn recovered(
+    location: &dyn fmt::Display,
+    recovery: &Recovery<'_>,
+    lines: &mut Vec<String>,
+) -> Result<(), Short> {
+    let stage = Stage::Ser.name();
+    let after = |at: usize| {
+        recovery.took_ms[at].map_or(String::from("unmeasured"), |ms| format!("{ms} ms"))
+    };
+    if let Some(halted) = recovery.halted {
+        lines.push(format!(
+            "WIFI CHECK {location} stage={stage} halted after {}: {halted}",
+            after(0)
+        ));
+    }
+    if recovery.took_ms[1].is_some() || recovery.took_ms[2].is_some() {
+        lines.push(format!(
+            "WIFI CHECK {location} stage={stage} carrier down after {}, back after {}",
+            after(1),
+            after(2)
+        ));
+    }
+    if let Some(lease) = recovery.lease {
+        let router = lease
+            .router
+            .map_or(String::from("none"), |router| format!("{router}"));
+        let recoveries = recovery
+            .recoveries
+            .map_or(String::from("unread"), |count| format!("{count}"));
+        lines.push(format!(
+            "WIFI CHECK {location} stage={stage} lease address={}/{} router={router} after {} \
+             recoveries={recoveries}",
+            lease.address,
+            lease.prefix,
+            after(3)
+        ));
+    }
+    let why = match (recovery.stopped, recovery.recoveries) {
+        (Some((step, why)), _) => format!("{}: {why}", step.name()),
+        (None, Some(1)) => return Ok(()),
+        (None, Some(count)) => {
+            format!("the station counted {count} cold re-inits where one ran")
+        }
+        (None, None) => String::from("the station's cold re-inits were not read"),
+    };
+    Err(stopped(location, lines, Stage::Ser, why, true))
 }
 
 /// The station stage's line: the network by its masked name, the AP, the

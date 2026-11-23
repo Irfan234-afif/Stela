@@ -392,6 +392,28 @@ impl Adapter {
         }
     }
 
+    /// Asks an RTL8852BE station's firmware to crash
+    /// (`rtw89_fw_h2c_trigger_cpu_exception`), for the Wi-Fi check's
+    /// recovery stage: its halt comes at a later receive, which brings the
+    /// chip up cold. `None` for any other adapter.
+    pub fn crash_firmware(&mut self) -> Option<Result<(), String>> {
+        match self {
+            Self::RealtekAxWifi(device) => {
+                Some(device.link.radio_mut().device_mut().trigger_cpu_exception())
+            }
+            _ => None,
+        }
+    }
+
+    /// How many cold re-inits an RTL8852BE station's chip went through
+    /// since its radio came up.
+    pub fn recoveries(&self) -> Option<u32> {
+        match self {
+            Self::RealtekAxWifi(device) => Some(device.link.radio().device().recoveries()),
+            _ => None,
+        }
+    }
+
     /// Where the adapter is, for logs.
     pub fn location(&self) -> &str {
         match self {

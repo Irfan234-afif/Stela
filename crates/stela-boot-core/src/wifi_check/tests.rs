@@ -180,12 +180,15 @@ fn stages_are_ordered_and_named_as_the_log_prints_them() {
         Stage::Radio,
         Stage::Station,
         Stage::Lease,
+        Stage::Ser,
     ];
     assert!(stages.windows(2).all(|pair| pair[0] < pair[1]));
     let names: Vec<_> = stages.iter().map(|stage| stage.name()).collect();
     assert_eq!(
         names,
-        ["cut", "firmware", "efuse", "radio", "station", "lease"]
+        [
+            "cut", "firmware", "efuse", "radio", "station", "lease", "ser"
+        ]
     );
     assert_eq!(DRIVEN, Stage::Lease);
 }
@@ -198,6 +201,7 @@ fn a_station_that_got_a_lease_passes_with_each_stage_in_its_words() {
     let network = Network {
         tried: &tried,
         check: Some(Ok(())),
+        recovery: None,
     };
     let report = report([(AT, cut(1, Some(&summary)))], &network);
     assert_eq!(report.verdict, Verdict::Passed);
@@ -245,6 +249,7 @@ fn the_listen_is_a_diagnostic_the_station_decides() {
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     // The listen ran and heard frames, but no beacon.
     let silent = Summary {
@@ -324,6 +329,7 @@ fn a_station_that_did_not_start_or_associate_names_where_it_stopped() {
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     let why = "connection at waiting to scan; 3 scans, the last heard 12 BSSes and did not find \
@@ -364,6 +370,7 @@ fn a_station_that_did_not_start_or_associate_names_where_it_stopped() {
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     assert_eq!(
@@ -389,6 +396,7 @@ fn a_station_that_did_not_start_or_associate_names_where_it_stopped() {
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     assert!(
@@ -417,6 +425,7 @@ fn a_lease_that_did_not_come_names_dhcp_and_one_over_ethernet_says_to_unplug_it(
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     let lines = &checked.lines[checked.lines.len() - 4..];
@@ -439,6 +448,7 @@ fn a_lease_that_did_not_come_names_dhcp_and_one_over_ethernet_says_to_unplug_it(
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     assert_eq!(
@@ -454,6 +464,7 @@ fn a_lease_that_did_not_come_names_dhcp_and_one_over_ethernet_says_to_unplug_it(
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     assert_eq!(
@@ -473,6 +484,7 @@ fn a_lease_that_did_not_come_names_dhcp_and_one_over_ethernet_says_to_unplug_it(
     let network = Network {
         tried: &tried,
         check: Some(Err("DNS: no answer")),
+        recovery: None,
     };
     let checked = report([(AT, cut(1, Some(&summary)))], &network);
     assert_eq!(
@@ -527,6 +539,7 @@ fn a_chip_that_stopped_names_the_stage_it_did_not_reach_and_why() {
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let mixed = report(
         [
@@ -610,6 +623,7 @@ fn a_cut_past_rtw89s_names_and_an_unmeasured_download_still_pass() {
     let network = Network {
         tried: &tried,
         check: None,
+        recovery: None,
     };
     let report = report(
         [(
@@ -630,4 +644,117 @@ fn a_cut_past_rtw89s_names_and_an_unmeasured_download_still_pass() {
     );
     assert!(report.lines[1].contains("freertos_done=unmeasured"));
     assert!(report.lines[2].contains(" acv=unread "));
+}
+
+/// What `rtw89` says as its firmware halts and the chip comes up cold.
+const HALTED: &str =
+    "rtw89: firmware halted (err status 0x3000, SER_EV_L2_RESET), cold re-init 1/3";
+
+/// The recovery stage that ran to its end: the halt, the carrier lost and
+/// back, a new lease and one cold re-init.
+fn recovery<'a>() -> Recovery<'a> {
+    Recovery {
+        halted: Some(HALTED),
+        took_ms: [Some(12), Some(13), Some(4_210), Some(5_034)],
+        lease: Some(Lease {
+            address: Ipv4Addr::new(192, 168, 1, 24),
+            ..lease()
+        }),
+        recoveries: Some(1),
+        stopped: None,
+    }
+}
+
+#[test]
+fn the_recovery_stage_after_the_lease_crashes_rejoins_and_leases_again() {
+    let summary = reached();
+    let associated = associated();
+    let tried = [station(Ok(Some(lease())), Some(&associated), None)];
+    let network = Network {
+        tried: &tried,
+        check: Some(Ok(())),
+        recovery: Some(recovery()),
+    };
+    let report = report([(AT, cut(1, Some(&summary)))], &network);
+    assert_eq!(report.verdict, Verdict::Passed);
+    let tail = &report.lines[report.lines.len() - 5..];
+    assert_eq!(
+        tail,
+        [
+            "WIFI CHECK 0000:03:00.0 stage=lease address=192.168.1.23/24 router=192.168.1.1",
+            &format!("WIFI CHECK 0000:03:00.0 stage=ser halted after 12 ms: {HALTED}"),
+            "WIFI CHECK 0000:03:00.0 stage=ser carrier down after 13 ms, back after 4210 ms",
+            "WIFI CHECK 0000:03:00.0 stage=ser lease address=192.168.1.24/24 router=192.168.1.1 \
+             after 5034 ms recoveries=1",
+            "WIFI CHECK reached ser; restarting",
+        ]
+    );
+}
+
+#[test]
+fn a_recovery_that_stopped_names_its_step_and_one_that_counted_otherwise_fails() {
+    let summary = reached();
+    let associated = associated();
+    let tried = [station(Ok(Some(lease())), Some(&associated), None)];
+    let checked = |recovery: Recovery<'_>| {
+        let network = Network {
+            tried: &tried,
+            check: None,
+            recovery: Some(recovery),
+        };
+        report([(AT, cut(1, Some(&summary)))], &network)
+    };
+
+    // The firmware never reported its halt.
+    let silent = checked(Recovery {
+        halted: None,
+        took_ms: [None; 4],
+        lease: None,
+        recoveries: Some(0),
+        stopped: Some((RecoveryStep::Halt, "no halt came within 5 s of the trigger")),
+    });
+    assert_eq!(
+        silent.lines.last().unwrap(),
+        "WIFI CHECK 0000:03:00.0 stopped before stage=ser: halt: no halt came within 5 s of the \
+         trigger"
+    );
+    assert_eq!(
+        silent.verdict,
+        Verdict::Failed(String::from(
+            "1 of 1 RTL8852B stopped before stage=ser: halt: no halt came within 5 s of the \
+             trigger"
+        ))
+    );
+
+    // It halted and came up cold, but never joined again.
+    let alone = checked(Recovery {
+        took_ms: [Some(12), Some(13), None, None],
+        lease: None,
+        stopped: Some((RecoveryStep::Rejoin, "no carrier within 50 s")),
+        ..recovery()
+    });
+    let lines = &alone.lines[alone.lines.len() - 3..];
+    assert!(lines[0].contains(" stage=ser halted after 12 ms: "));
+    assert_eq!(
+        lines[1],
+        "WIFI CHECK 0000:03:00.0 stage=ser carrier down after 13 ms, back after unmeasured"
+    );
+    assert_eq!(
+        lines[2],
+        "WIFI CHECK 0000:03:00.0 stopped before stage=ser: rejoin: no carrier within 50 s"
+    );
+
+    // Every step ran, but the chip was brought up cold twice.
+    let twice = checked(Recovery {
+        recoveries: Some(2),
+        ..recovery()
+    });
+    assert_eq!(
+        twice.verdict,
+        Verdict::Failed(String::from(
+            "1 of 1 RTL8852B stopped before stage=ser: the station counted 2 cold re-inits where \
+             one ran"
+        ))
+    );
+    assert!(!twice.lines.iter().any(|line| line.contains("reached")));
 }

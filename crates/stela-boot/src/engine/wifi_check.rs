@@ -5,24 +5,29 @@
 //! lease the host's network got over it (`stela_boot_core::wifi_check`),
 //! then the verdict, and the boot stops before the guest's storage is
 //! opened. With `--network-check`, the check's POST goes over the station
-//! once the lease came over it. The options that select the check also
-//! restart the PC at the stop (`stop::restart_at_stop`), so the log is
-//! stored and the PC returns to its own boot order.
+//! once the lease came over it. With `--wifi-check-ser`, a recovery stage
+//! follows the lease: the station's firmware is asked to crash, and the
+//! chip must come up cold, rejoin and lease again
+//! (`network::HostNetwork::recover_station`). The options that select the
+//! check also restart the PC at the stop (`stop::restart_at_stop`), so the
+//! log is stored and the PC returns to its own boot order.
 use super::network::{Shared, Tried};
 use crate::{Result, output};
 use alloc::{string::ToString, vec::Vec};
-use stela_boot_core::wifi_check::{self, Network, Reached, Verdict};
+use stela_boot_core::wifi_check::{self, Network, Reached, Recovery, Verdict};
 use stela_drivers::{net::wifi::realtek::identity, probe::Rtl8852b};
 
 /// Report `chips` and what the host's network did with their stations,
 /// `tried` the adapters it got no address over, POSTing to `url` over the
-/// station that got the lease, and stop: passed when every function
-/// reached the stage this image drives, failed naming why otherwise.
+/// station that got the lease and, with `ser`, crashing its firmware and
+/// checking its recovery, and stop: passed when every function reached
+/// the last stage asked for, failed naming why otherwise.
 pub(super) fn check(
     chips: &[Rtl8852b],
     network: &Option<Result<Shared>>,
     tried: &[Tried],
     url: Option<&str>,
+    ser: bool,
 ) -> ! {
     let summaries: Vec<_> = chips
         .iter()
@@ -37,6 +42,15 @@ pub(super) fn check(
     let posted = match (url, network, &leased) {
         (Some(url), Some(Ok(shared)), Some(leased)) if leased.driver == wifi_check::DRIVER => {
             Some(super::network::check(shared, url).map_err(|error| error.to_string()))
+        }
+        _ => None,
+    };
+    // The recovery stage runs on a station that holds an IPv4 lease.
+    let recovered = match (ser, network, &leased) {
+        (true, Some(Ok(shared)), Some(leased))
+            if leased.driver == wifi_check::DRIVER && matches!(leased.lease, Ok(Some(_))) =>
+        {
+            Some(shared.0.borrow_mut().recover_station())
         }
         _ => None,
     };
@@ -59,6 +73,16 @@ pub(super) fn check(
         check: posted
             .as_ref()
             .map(|posted| posted.as_ref().map(|_| ()).map_err(|why| why.as_str())),
+        recovery: recovered.as_ref().map(|recovered| Recovery {
+            halted: recovered.halted.as_deref(),
+            took_ms: recovered.took_ms,
+            lease: recovered.lease,
+            recoveries: recovered.recoveries,
+            stopped: recovered
+                .stopped
+                .as_ref()
+                .map(|(step, why)| (*step, why.as_str())),
+        }),
     };
     let report = wifi_check::report(
         chips.iter().zip(&summaries).map(|(chip, summary)| {

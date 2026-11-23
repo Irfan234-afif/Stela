@@ -76,6 +76,7 @@ pub enum Error {
     DuplicateWifiCheck,
     WifiCheckChannel,
     DuplicateWifiCheckChannel,
+    DuplicateWifiCheckSer,
     MissingEcid,
     Ecid,
     MissingStorage,
@@ -127,6 +128,7 @@ pub enum Constraint {
     UnexpectedRestoreInputs,
     WifiDependency,
     WifiCheckChannelDependency,
+    WifiCheckSerDependency,
     Ipv4Gateway,
     InstallSourceDependency,
     InstallConfiguration,
@@ -205,6 +207,7 @@ impl Error {
                  that an RTL8852B tunes"
             }
             Self::DuplicateWifiCheckChannel => "duplicate --wifi-check-channel",
+            Self::DuplicateWifiCheckSer => "duplicate --wifi-check-ser",
             Self::MissingEcid => "missing ECID",
             Self::Ecid => "--ecid takes one nonzero ECID",
             Self::MissingStorage => "missing ANS storage partition",
@@ -251,6 +254,7 @@ impl Constraint {
             Self::UnexpectedRestoreInputs => "restore inputs require explicit --restore-study",
             Self::WifiDependency => "--wifi-key and --wifi-country configure a --wifi network",
             Self::WifiCheckChannelDependency => "--wifi-check-channel configures the --wifi-check",
+            Self::WifiCheckSerDependency => "--wifi-check-ser extends the --wifi-check",
             Self::Ipv4Gateway => "--ipv4-gateway needs --ipv4 and another address of its subnet",
             Self::InstallSourceDependency => {
                 "--install-source names the partition of an --install medium"
