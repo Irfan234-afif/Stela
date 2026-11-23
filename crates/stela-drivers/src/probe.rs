@@ -1806,13 +1806,19 @@ fn first_of(scanned: Vec<Vec<Function>>, first: Option<Address>) -> (Vec<Vec<Fun
     (rest, found)
 }
 
-/// The handoff a wired network adapter attaches with: it signals arriving
-/// frames with [`Handoff::network`] where the engine gave one, which makes
-/// the host's service due, rather than with a disk's completion signal,
-/// which only sends the disks looking for completions.
+/// The message a network adapter's MSI sends: [`Handoff::network`] where
+/// the engine gave one, which makes the host's service due, rather than a
+/// disk's completion signal, which only sends the disks looking for
+/// completions.
+fn network_signal(handoff: &Handoff) -> Option<crate::bus::irq::MsiMessage> {
+    handoff.network.or(handoff.completion)
+}
+
+/// The handoff a wired network adapter attaches with, its completion
+/// signal the network's ([`network_signal`]).
 fn network_handoff(handoff: &Handoff) -> Handoff {
     Handoff {
-        completion: handoff.network.or(handoff.completion),
+        completion: network_signal(handoff),
         ..handoff.clone()
     }
 }
@@ -2893,12 +2899,13 @@ unsafe fn attach_native(
                     .push((address, function.class, NO_WIFI_NETWORK));
                 return;
             };
-            // SAFETY: as for tg3 below.
+            // SAFETY: as for tg3 below. Its MSI makes the host's network
+            // service due, as a wired adapter's does.
             match unsafe {
                 realtek_ax_wifi(
                     services,
                     address,
-                    inputs.handoff.completion,
+                    network_signal(inputs.handoff),
                     wifi,
                     &devices.regulatory,
                 )
@@ -3270,6 +3277,42 @@ mod tests {
         assert_eq!(wired.mapped, handoff.mapped);
         handoff.network = None;
         assert_eq!(network_handoff(&handoff).completion, Some(disk));
+    }
+
+    /// An RTL8852BE's MSI sends the engine's network message, which makes
+    /// the host's network service due, as a wired adapter's does, or the
+    /// disks' completion message when the engine gave none.
+    #[test]
+    fn an_rtl8852be_signals_on_the_network_message() {
+        use crate::bus::irq::MsiMessage;
+        let disk = MsiMessage {
+            address: 0xfee0_0000,
+            data: 0x62,
+        };
+        let frames = MsiMessage {
+            address: 0xfee0_0000,
+            data: 0x63,
+        };
+        let mut handoff = Handoff {
+            ecam: Vec::new(),
+            mapped: Vec::new(),
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: Some(disk),
+            network: Some(frames),
+        };
+        assert_eq!(network_signal(&handoff), Some(frames));
+        assert_eq!(
+            network_signal(&handoff),
+            network_handoff(&handoff).completion
+        );
+        handoff.network = None;
+        assert_eq!(network_signal(&handoff), Some(disk));
+        handoff.completion = None;
+        assert_eq!(network_signal(&handoff), None);
     }
 
     /// The boot of issue 18: the mount refused both HD Audio controllers
