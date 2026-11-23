@@ -92,7 +92,9 @@ pub fn encrypt(frame: &mut alloc::vec::Vec<u8>, key: &Key, iv: [u8; 3]) {
     seed.zeroize();
 }
 
-fn rc4(key: &[u8], data: &mut [u8]) {
+/// RC4 over `data` in place under `key`: WEP's cipher, and TKIP's under the
+/// key its mixing gives each frame.
+pub(super) fn rc4(key: &[u8], data: &mut [u8]) {
     let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
     let mut j = 0u8;
     for i in 0..256 {

@@ -12,7 +12,8 @@
 //! Hardware-key acknowledgements and software replay checks.
 //!
 //! This layer does not implement a WPA handshake or software data encryption;
-//! `wep` encrypts only the shared-key authentication challenge response. A
+//! `wep` encrypts only the shared-key authentication challenge response, and
+//! `tkip` decrypts only what a chip refusing TKIP keys leaves the host. A
 //! vendor must report successful hardware key installation only after its real
 //! firmware acknowledgement, and verified integrity only from the applicable
 //! negotiated RX status. Unknown evidence is refused. No hardware replay flag
@@ -32,6 +33,7 @@ use stela_crypto::{Sha256, digest::Digest};
 pub mod aggregate;
 pub mod management;
 pub mod michael;
+pub mod tkip;
 pub mod tx;
 pub mod unicast_management;
 pub mod wep;

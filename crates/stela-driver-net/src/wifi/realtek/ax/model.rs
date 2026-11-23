@@ -854,7 +854,22 @@ pub(crate) enum Protection {
     Wpa2Psk,
     /// WPA3-Personal: AKM 00-0f-ac:8, CCMP, PMF required with BIP-CMAC-128.
     Wpa3Sae,
+    /// WPA/WPA2-Personal mixed mode, as the user's ISP router runs it: an RSN
+    /// element with a TKIP group cipher, TKIP and CCMP pairwise, AKM
+    /// 00-0f-ac:2 and no capabilities, beside WPA's vendor element offering
+    /// the same under 00-50-f2.
+    Mixed,
 }
+
+/// The RSN and WPA elements of the user's mixed-mode network as Windows'
+/// `WlanGetNetworkBssList` gave them, each after its ID and length.
+pub(crate) const MIXED_RSN: [u8; 24] = [
+    1, 0, 0, 0x0f, 0xac, 2, 2, 0, 0, 0x0f, 0xac, 2, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+];
+pub(crate) const MIXED_WPA: [u8; 26] = [
+    0, 0x50, 0xf2, 1, 1, 0, 0, 0x50, 0xf2, 2, 2, 0, 0, 0x50, 0xf2, 2, 0, 0x50, 0xf2, 4, 1, 0, 0,
+    0x50, 0xf2, 2,
+];
 
 /// The user's AP as the model plays it: 5 GHz channel 36 at 80 MHz
 /// (center 42), HT, VHT and HE, beaconing every 100 TU. It hears what the
@@ -935,19 +950,35 @@ impl Ap {
         let akm = match self.protection {
             Protection::Wpa2Psk => 2,
             Protection::Wpa3Sae => 8,
+            Protection::Mixed => return [&[48, MIXED_RSN.len() as u8][..], &MIXED_RSN].concat(),
         };
         let mut body = vec![
             1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac,
         ];
         body.push(akm);
         match self.protection {
-            Protection::Wpa2Psk => body.extend_from_slice(&[0, 0]),
             // MFPR and MFPC, no PMKID, BIP-CMAC-128.
             Protection::Wpa3Sae => body.extend_from_slice(&[0xc0, 0, 0, 0, 0, 0x0f, 0xac, 6]),
+            _ => body.extend_from_slice(&[0, 0]),
         }
         let mut element = vec![48, body.len() as u8];
         element.extend_from_slice(&body);
         element
+    }
+
+    /// The elements of the AP's security that its beacon and message 3
+    /// carry: the RSN element, then in mixed mode WPA's vendor element, as
+    /// hostapd's `wpa_ie` keeps both for a WPA2 station.
+    pub(crate) fn security(&self) -> Vec<u8> {
+        [self.rsn(), self.wpa()].concat()
+    }
+
+    /// WPA's vendor element, which a mixed-mode AP beacons after WMM's.
+    fn wpa(&self) -> Vec<u8> {
+        if self.protection != Protection::Mixed {
+            return Vec::new();
+        }
+        [&[221, MIXED_WPA.len() as u8][..], &MIXED_WPA].concat()
     }
 
     /// The HT, VHT and HE capabilities and operations, and WMM's
@@ -1004,6 +1035,7 @@ impl Ap {
         frame.extend_from_slice(&[5, 4, 0, 1, 0, 0]);
         frame.extend_from_slice(&self.rsn());
         frame.extend_from_slice(&self.operation());
+        frame.extend_from_slice(&self.wpa());
         frame
     }
 

@@ -3,7 +3,8 @@
 //! The RTL8852B under the generic Realtek station, on the whole-chip model
 //! ([`super::super::model`]) brought up through stage 1 and stage 2, with
 //! the model's AP, the user's: WPA2-PSK (or WPA3-SAE with PMF required) and
-//! CCMP on 5 GHz channel 36 at 80 MHz, HT, VHT and HE.
+//! CCMP on 5 GHz channel 36 at 80 MHz, HT, VHT and HE, or WPA/WPA2 mixed mode
+//! with a TKIP group cipher, as the user's ISP router runs it.
 extern crate std;
 
 use super::*;
@@ -38,9 +39,9 @@ use crate::{
             identity::tests::observed,
             station::{Realtek, Wifi},
         },
-        security::PacketNumber,
+        security::{PacketNumber, michael, tkip},
         station::Phase,
-        supplicant::tests::Authenticator,
+        supplicant::{Akm, tests::Authenticator},
     },
 };
 use alloc::{rc::Rc, vec};
@@ -132,7 +133,7 @@ fn bench(protection: Protection) -> Bench {
     let database = regdb(&[(*b"ID", &RULES)]);
     let country = database.select(*b"ID").unwrap();
     let secret = match protection {
-        Protection::Wpa2Psk => Secret::Psk(Zeroizing::new([0; 32])),
+        Protection::Wpa2Psk | Protection::Mixed => Secret::Psk(Zeroizing::new([0; 32])),
         Protection::Wpa3Sae => Secret::parse(&ap.password).unwrap(),
     };
     let network = Network {
@@ -238,19 +239,20 @@ fn data(
 
 impl Bench {
     /// The station associated with the AP and through its 4-way handshake
-    /// with a new authenticator, the port open; the GTK is 0x50.., and under
-    /// PMF the IGTK 0x77... The authenticator, for the group handshakes
-    /// that follow.
+    /// with a new authenticator, the port open; the GTK is 0x50.. (32 bytes
+    /// of it under a TKIP group), and under PMF the IGTK 0x77... Message 3
+    /// carries the AP's security elements, in mixed mode WPA's beside the
+    /// RSN element. The authenticator, for the group handshakes that follow.
     fn join(&mut self) -> Authenticator {
         assert!(self.associated(), "no association");
         let from = self.chip.sent_count();
         let local = self.local;
         let protection = self.ap.protection;
-        let rsn = self.ap.rsn();
+        let rsn = self.ap.security();
         let security = Security::select(&rsn, true).unwrap();
         let pmk = match protection {
-            Protection::Wpa2Psk => Zeroizing::new([0; 32]),
             Protection::Wpa3Sae => self.ap.pmk().expect("SAE accepted"),
+            _ => Zeroizing::new([0; 32]),
         };
         let mut ap =
             Authenticator::between(security.suites(), pmk, Mac(AP), local, security.element());
@@ -295,13 +297,13 @@ impl Bench {
     /// `sequence` and the PTK's packet number `pn`, `gtk` under `index`
     /// and, under PMF, a new IGTK beside it (ID 4 beside GTK 1, 5 beside
     /// GTK 2); the station's message 2 checked by the authenticator.
-    fn rekey(&mut self, ap: &mut Authenticator, sequence: u16, pn: u8, index: u8, gtk: [u8; 16]) {
+    fn rekey(&mut self, ap: &mut Authenticator, sequence: u16, pn: u8, index: u8, gtk: &[u8]) {
         let from = self.chip.sent_count();
         let mut igtk = Vec::new();
         if self.ap.protection == Protection::Wpa3Sae {
             igtk = igtk_kde(3 + index, [!gtk[0]; 16]);
         }
-        let message = ap.group_message_1_with(index, &gtk, &igtk);
+        let message = ap.group_message_1_with(index, gtk, &igtk);
         let frame = data(
             self.local.0,
             sequence,
@@ -959,8 +961,8 @@ fn a_scan_notifies_tssi_and_calibrates_only_outside_it() {
 }
 
 #[test]
-fn the_advertisement_leaves_out_the_beamformee_bits_and_tkip_is_refused() {
-    let (mut hardware, _) = hardware();
+fn the_advertisement_leaves_out_the_beamformee_bits() {
+    let (hardware, _) = hardware();
     let (elements, maps) = hardware.advertisement(Band::Ghz5);
     let vht = elements.windows(2).position(|w| w == [191, 12]).unwrap();
     let cap = u32::from_le_bytes(elements[vht + 2..vht + 6].try_into().unwrap());
@@ -972,15 +974,272 @@ fn the_advertisement_leaves_out_the_beamformee_bits_and_tkip_is_refused() {
         .unwrap();
     assert_eq!(elements[he + 3 + 6 + 4] & HE_PHY_CAP4_BEAMFORMEE, 0);
     assert_eq!(maps[0].rx, 0xfffa);
+}
+
+/// A TKIP GTK as the mixed-mode AP's authenticator hands it out, 32 bytes
+/// from `first`: the temporal key, then the Michael key the AP signs with.
+fn tkip_gtk(first: u8) -> [u8; 32] {
+    core::array::from_fn(|i| first.wrapping_add(i as u8))
+}
+
+/// A broadcast data frame from the AP, QoS or not, at `sequence`, IPv4's
+/// `body` behind its LLC, sealed as the AP seals group traffic under TKIP
+/// GTK `gtk` with key `index` at TSC `tsc`: Michael's MIC under the GTK's
+/// signing half (one bit off when `spoiled`) and the ICV behind it, all of
+/// it under RC4.
+fn tkip_broadcast(
+    qos: bool,
+    sequence: u16,
+    body: &[u8],
+    (gtk, index): (&[u8; 32], u8),
+    tsc: u64,
+    spoiled: bool,
+) -> Vec<u8> {
+    let mut frame = vec![if qos { 0x88 } else { 0x08 }, 0x42, 0, 0];
+    frame.extend([0xff; 6]);
+    frame.extend(AP);
+    frame.extend(AP);
+    frame.extend((sequence << 4).to_le_bytes());
+    if qos {
+        frame.extend([0, 0]);
+    }
+    let mut msdu = vec![0xaa, 0xaa, 3, 0, 0, 0, 8, 0];
+    msdu.extend(body);
+    let mut mic = michael::michael(gtk[16..24].try_into().unwrap(), &[0xff; 6], &AP, 0, &msdu);
+    if spoiled {
+        mic[0] ^= 1;
+    }
+    msdu.extend(mic);
+    frame.extend(tkip::encrypt(
+        gtk[..16].try_into().unwrap(),
+        &AP,
+        tsc,
+        index,
+        &msdu,
+    ));
+    frame
+}
+
+/// A DHCP message to the broadcast address as IPv4 carries it, `op` its
+/// BOOTP op, a request from port 68 to 67 or a reply back, and `kind` its
+/// message type.
+fn dhcp(op: u8, kind: u8) -> Vec<u8> {
+    let mut packet = vec![0x45, 0, 0, 48, 0, 0, 0, 0, 64, 17, 0, 0, 0, 0, 0, 0];
+    packet.extend([255; 4]);
+    let (from, to) = if op == 1 { (68u16, 67u16) } else { (67, 68) };
+    packet.extend(from.to_be_bytes());
+    packet.extend(to.to_be_bytes());
+    packet.extend([0, 28, 0, 0]);
+    packet.extend([op, 1, 6, 0, 0x5d, 0xa7, 0x0a, 0x1a]);
+    packet.extend([53, 1, kind, 255]);
+    packet.extend([0; 8]);
+    packet
+}
+
+impl Bench {
+    /// Serve the air `rounds` times, five milliseconds apart.
+    fn serve(&mut self, rounds: usize) {
+        for _ in 0..rounds {
+            self.wifi.carrier();
+            self.ap.serve(&self.chip);
+            crate::test_clock::advance(CLOCK, 5_000);
+        }
+    }
+
+    /// A TKIP broadcast from the AP, as the chip hands it over: undecrypted,
+    /// RTL8852B having taken no TKIP key.
+    fn hear_tkip(&mut self, frame: &[u8]) {
+        self.hear(frame, false);
+        self.serve(2);
+    }
+
+    /// The station's diagnostic.
+    fn diagnostic(&mut self) -> String {
+        self.wifi.diagnostic().unwrap_or_default()
+    }
+}
+
+#[test]
+fn a_mixed_wpa_network_joins_under_ccmp_and_keeps_its_tkip_group_key_in_the_host() {
+    let mut bench = bench(Protection::Mixed);
+    bench.join();
+    // RSN over WPA's vendor element, CCMP pairwise under the TKIP group,
+    // with HE and 80 MHz kept, which a TKIP pairwise key would have cost.
+    let joined = bench.wifi.associated().unwrap();
+    assert_eq!(
+        (joined.pairwise, joined.group, joined.akm, joined.width),
+        (Cipher::Ccmp128, Cipher::Tkip, Akm::Psk, Width::Mhz80)
+    );
+    let request = bench
+        .sent()
+        .into_iter()
+        .find(|sent| sent.frame[0] == 0x00)
+        .unwrap();
+    let elements = &request.frame[24 + 4..];
+    let rsn = [
+        48, 20, 1, 0, 0, 0x0f, 0xac, 2, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+    ];
+    assert!(elements.windows(rsn.len()).any(|w| w == rsn));
+    assert!(!elements.windows(4).any(|w| w == [0, 0x50, 0xf2, 1]));
+    assert!(elements.windows(3).any(|w| w[0] == 255 && w[2] == 35));
+    // The PTK alone reaches the security CAM, as CCMP-128, and the address
+    // CAM after it holds it alone: the GTK is the host's.
+    let commands = bench.chip.commands();
+    let keys = sec_cam(&commands);
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].payload[4] & 0xf, cam::SEC_KEY_TYPE_CCMP128);
+    let last = commands
+        .iter()
+        .rev()
+        .find(|command| command.class == cam::H2C_CL_MAC_ADDR_CAM_UPDATE)
+        .unwrap();
+    let w10 = u32::from_le_bytes(last.payload[40..44].try_into().unwrap());
+    assert_eq!(w10 & cam::ADDR_CAM_W10_SEC_ENT_VALID, 0b1);
+    // Offered one, the chip refuses a TKIP key and sends nothing, as
+    // rtw89's `-EOPNOTSUPP`.
+    let sent = bench.chip.commands().len();
     let key = KeyEntry {
         entry: 1,
         index: 1,
         cipher: Cipher::Tkip,
         group: true,
         peer: Mac::BROADCAST,
-        material: &[0; 16],
+        material: &[0x50; 16],
     };
-    assert!(hardware.write_key(&key).is_err());
+    assert!(bench.wifi.radio_mut().device_mut().write_key(&key).is_err());
+    assert_eq!(bench.chip.commands().len(), sent);
+}
+
+#[test]
+fn a_mixed_wpa_station_leases_over_tkip_group_traffic_and_keeps_it_through_a_rekey() {
+    let mut bench = bench(Protection::Mixed);
+    let mut ap = bench.join();
+    let local = bench.local.0;
+    let gtk = tkip_gtk(0x50);
+    // DHCP's discover and request leave broadcast through the AP under the
+    // PTK; its offer and acknowledgement come back to everyone under the
+    // GTK, past the RSC of 7 message 3 gave, one QoS and one not.
+    for (round, (ask, answer)) in [(1u8, 2u8), (3, 5)].into_iter().enumerate() {
+        let mut ethernet = vec![0xff; 6];
+        ethernet.extend(local);
+        ethernet.extend([8, 0]);
+        ethernet.extend(dhcp(1, ask));
+        let before = best_effort(&bench).len();
+        bench.wifi.transmit(&ethernet).unwrap();
+        assert!(bench.run(|bench| best_effort(bench).len() > before));
+        let sent = &best_effort(&bench)[before];
+        assert_eq!(sent.frame[1] & 0x41, 0x41, "to the DS, protected");
+        assert_eq!(sent.frame[4..10], AP);
+        assert_eq!(sent.frame[16..22], [0xff; 6]);
+        let info = sent.info.unwrap();
+        assert_eq!(
+            get(info[2], INFO2_SEC_TYPE),
+            u32::from(cam::SEC_KEY_TYPE_CCMP128)
+        );
+        let reply = dhcp(2, answer);
+        let qos = round == 0;
+        bench.hear_tkip(&tkip_broadcast(
+            qos,
+            10 + round as u16,
+            &reply,
+            (&gtk, 1),
+            8 + round as u64,
+            false,
+        ));
+        let ethernet = bench.wifi.receive().unwrap().expect("the DHCP answer");
+        assert_eq!(ethernet[..6], [0xff; 6]);
+        assert_eq!(ethernet[6..12], AP);
+        assert_eq!(ethernet[12..14], [8, 0]);
+        assert_eq!(ethernet[14..], reply);
+    }
+    assert!(
+        bench
+            .diagnostic()
+            .contains("tkip group decrypted=2 icv-failures=0 michael-failures=0")
+    );
+    // A group rekey to GTK 2, TKIP as well: it stays in the host too, the
+    // port stays open, and group traffic under it passes, beside unicast
+    // under the PTK.
+    let gtk2 = tkip_gtk(0x90);
+    bench.rekey(&mut ap, 4, 1, 2, &gtk2);
+    assert_eq!(sec_cam(&bench.chip.commands()).len(), 1);
+    assert!(bench.wifi.carrier());
+    let arp = [0, 1, 8, 0, 6, 4, 0, 1];
+    bench.hear_tkip(&tkip_broadcast(true, 20, &arp, (&gtk2, 2), 8, false));
+    assert_eq!(delivered(&mut bench.wifi), [0]);
+    bench.data_from_ap(local, 21, (0, 2), 0x46);
+    assert_eq!(bench.wifi.radio().station().phase(), Phase::Associated);
+}
+
+#[test]
+fn tkip_group_frames_replayed_or_failing_their_icv_are_dropped_without_a_michael_report() {
+    let mut bench = bench(Protection::Mixed);
+    bench.join();
+    let gtk = tkip_gtk(0x50);
+    let frame = tkip_broadcast(true, 2, &[0x71; 46], (&gtk, 1), 8, false);
+    bench.hear_tkip(&frame);
+    assert_eq!(delivered(&mut bench.wifi), [0x71]);
+    let from = bench.chip.sent_count();
+    // The same frame again; then one a bit flipped in flight; then one under
+    // a key the AP never gave.
+    bench.hear_tkip(&frame);
+    let mut flipped = tkip_broadcast(true, 3, &[0x72; 46], (&gtk, 1), 9, false);
+    flipped[40] ^= 0x10;
+    bench.hear_tkip(&flipped);
+    let stranger = tkip_gtk(0x11);
+    bench.hear_tkip(&tkip_broadcast(
+        true,
+        4,
+        &[0x73; 46],
+        (&stranger, 1),
+        10,
+        false,
+    ));
+    bench.serve(20);
+    assert_eq!(delivered(&mut bench.wifi), []);
+    assert_eq!(bench.answers(from), Vec::<Vec<u8>>::new());
+    let diagnostic = bench.diagnostic();
+    assert!(
+        diagnostic.contains("tkip group decrypted=1 icv-failures=2 michael-failures=0"),
+        "{diagnostic}"
+    );
+    // The next frame in order still passes.
+    bench.hear_tkip(&tkip_broadcast(true, 5, &[0x74; 46], (&gtk, 1), 11, false));
+    assert_eq!(delivered(&mut bench.wifi), [0x74]);
+}
+
+#[test]
+fn a_tkip_group_frame_failing_its_michael_is_dropped_and_reported_and_a_second_leaves_the_ap() {
+    let mut bench = bench(Protection::Mixed);
+    bench.join();
+    let gtk = tkip_gtk(0x50);
+    let from = bench.chip.sent_count();
+    bench.hear_tkip(&tkip_broadcast(true, 2, &[0x61; 46], (&gtk, 1), 8, true));
+    assert_eq!(delivered(&mut bench.wifi), []);
+    // `wpa_sm_key_request`'s error report: a request with the error bit, of
+    // the group key, under the KCK.
+    assert!(
+        bench.run(|bench| !bench.answers(from).is_empty()),
+        "no Michael report"
+    );
+    let report = &bench.answers(from)[0];
+    let info = u16::from_be_bytes([report[5], report[6]]);
+    assert_eq!(info & 0x0f08, 0x0f00, "{info:#x}");
+    let diagnostic = bench.diagnostic();
+    assert!(diagnostic.contains("michael-failures=1"), "{diagnostic}");
+    assert!(bench.wifi.carrier());
+    // A second within the minute starts countermeasures: the station leaves
+    // the AP with `WLAN_REASON_MICHAEL_MIC_FAILURE`.
+    let from = bench.chip.sent_count();
+    bench.hear_tkip(&tkip_broadcast(false, 3, &[0x62; 46], (&gtk, 1), 9, true));
+    assert!(bench.run(|bench| !bench.wifi.carrier()), "still connected");
+    let deauthentication = bench
+        .chip
+        .sent_from(from)
+        .into_iter()
+        .find(|sent| sent.frame[0] == 0xc0)
+        .expect("a deauthentication");
+    assert_eq!(deauthentication.frame[24..26], 14u16.to_le_bytes());
 }
 
 /// The voice data frames the station sent.
@@ -1209,7 +1468,7 @@ fn a_wpa3_sae_station_keeps_its_association_through_repeated_group_rekeys() {
         // GTK 2, 1, 2, ... each with its IGTK.
         let index = 2 - round % 2;
         let gtk = [0x60 + round; 16];
-        bench.rekey(&mut ap, sequence, pn, index, gtk);
+        bench.rekey(&mut ap, sequence, pn, index, &gtk);
         // The new GTK reaches the security CAM; group data under it and
         // unicast data under the PTK pass the station's checks, the second
         // rekey replacing the GTK the port opened with among them.
@@ -1260,7 +1519,7 @@ fn a_wpa3_sae_station_rides_out_lost_beacons_and_rejoins_once_its_ap_is_back() {
     bench.ap.quiet = false;
     bench.ap.gone = false;
     let mut ap = bench.join();
-    bench.rekey(&mut ap, 2, 1, 2, [0x6a; 16]);
+    bench.rekey(&mut ap, 2, 1, 2, &[0x6a; 16]);
     bench.group_data(3, 2, 0x4a);
     assert_eq!(bench.chip.attempts().len(), downloads);
 }
@@ -1269,7 +1528,7 @@ fn a_wpa3_sae_station_rides_out_lost_beacons_and_rejoins_once_its_ap_is_back() {
 fn a_firmware_halt_in_the_middle_of_a_group_rekey_is_recovered_and_keyed_again() {
     let mut bench = bench(Protection::Wpa3Sae);
     let mut ap = bench.join();
-    bench.rekey(&mut ap, 2, 1, 2, [0x61; 16]);
+    bench.rekey(&mut ap, 2, 1, 2, &[0x61; 16]);
     // The next rekey's message 1 arrives with the firmware's halt, an
     // assertion.
     let from = bench.chip.sent_count();
@@ -1291,7 +1550,7 @@ fn a_firmware_halt_in_the_middle_of_a_group_rekey_is_recovered_and_keyed_again()
         .map(|key| key.payload[8])
         .collect();
     assert!(!gtks.contains(&0x61) && !gtks.contains(&0x62), "{gtks:x?}");
-    bench.rekey(&mut ap, 2, 1, 2, [0x63; 16]);
+    bench.rekey(&mut ap, 2, 1, 2, &[0x63; 16]);
     bench.group_data(3, 2, 0x43);
     assert!(bench.wifi.carrier());
     assert_eq!(bench.wifi.radio().device().recoveries(), 1);

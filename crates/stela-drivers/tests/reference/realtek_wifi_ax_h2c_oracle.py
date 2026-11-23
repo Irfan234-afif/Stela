@@ -1180,9 +1180,10 @@ def station_oracle(reference, out):
     1. zeroed registers, CMAC0 on, MAC ID 0 on port 0 from sequence 0:
        interface up, BSSID set, association to an HE AP on 5 GHz with its
        port update, a CCMP pairwise key, a CCMP group key, a TKIP group key
-       (refused), a second CCMP group key, the first group key, the
-       pairwise key and the second group key deleted, the disconnect, the
-       BSSID cleared and the interface down;
+       and a TKIP pairwise key (both refused, mac80211 keeping them in
+       software and never deleting them here), a second CCMP group key, the
+       first group key, the pairwise key and the second group key deleted,
+       the disconnect, the BSSID cleared and the interface down;
     2. all-ones registers, MAC ID 37 on port 1 from sequence 0xfe:
        interface up over a port already on, two TX-time tables, MAC ID 37
        paused, association to a non-HE AP on 2.4 GHz, a pairwise key
@@ -2002,7 +2003,7 @@ static void free_keys(struct world *w)
 int main(int argc, char **argv)
 {
 	static struct world w;
-	struct ieee80211_key_conf k1, k2, k3, k4;
+	struct ieee80211_key_conf k1, k2, k3, k4, k5;
 	u32 cases = 0;
 	if (argc != 2)
 		return 2;
@@ -2030,15 +2031,17 @@ int main(int argc, char **argv)
 	add(&w, 6, &k2, false);
 	key(&k3, WLAN_CIPHER_SUITE_TKIP, false, 2, 0x30);
 	add(&w, 7, &k3, false);
+	key(&k5, WLAN_CIPHER_SUITE_TKIP, true, 0, 0x50);
+	add(&w, 8, &k5, true);
 	key(&k4, WLAN_CIPHER_SUITE_CCMP, false, 2, 0x40);
-	add(&w, 8, &k4, false);
-	step(9, rtw89_cam_sec_key_del(&w.dev, &w.vif, NULL, &k2, true));
-	step(10, rtw89_cam_sec_key_del(&w.dev, &w.vif, &w.sta, &k1, true));
-	step(11, rtw89_cam_sec_key_del(&w.dev, &w.vif, NULL, &k4, true));
-	step(12, rtw89_core_sta_link_disconnect(&w.dev, &w.link, &w.sta_link));
+	add(&w, 9, &k4, false);
+	step(10, rtw89_cam_sec_key_del(&w.dev, &w.vif, NULL, &k2, true));
+	step(11, rtw89_cam_sec_key_del(&w.dev, &w.vif, &w.sta, &k1, true));
+	step(12, rtw89_cam_sec_key_del(&w.dev, &w.vif, NULL, &k4, true));
+	step(13, rtw89_core_sta_link_disconnect(&w.dev, &w.link, &w.sta_link));
 	static const u8 zero[ETH_ALEN];
-	step(13, bssid_changed(&w, zero));
-	step(14, rtw89_mac_vif_deinit(&w.dev, &w.link));
+	step(14, bssid_changed(&w, zero));
+	step(15, rtw89_mac_vif_deinit(&w.dev, &w.link));
 	free_keys(&w);
 	flush(out);
 	cases++;

@@ -267,7 +267,7 @@ impl<T: Rtw88> Device for T {
     const CHIP: &'static str = "RTL8822C";
     const CHANNELS_5GHZ: &'static [u16] = &CHANNELS_5GHZ;
     /// `RTW_CAM_TKIP`, Michael left to mac80211.
-    const TKIP_GROUP: bool = true;
+    const HARDWARE_TKIP: bool = true;
 
     /// No HE: its maps name no stream.
     fn advertisement(&self, band: Band) -> (Vec<u8>, [McsMaps; 3]) {

@@ -1209,8 +1209,10 @@ impl<I: Io> Device for Hardware<I> {
     const DRIVER: &'static str = "rtw89";
     const CHIP: &'static str = "RTL8852B";
     const CHANNELS_5GHZ: &'static [u16] = &CHANNELS_5GHZ;
-    /// RTL8852B's `hw_tkip_crypto` is false: rtw89 refuses TKIP keys.
-    const TKIP_GROUP: bool = false;
+    /// RTL8852B's `hw_tkip_crypto` is false: rtw89 refuses TKIP keys, and a
+    /// TKIP group key's frames come up as the air carried them, `hw_dec`
+    /// clear, for the host to decrypt.
+    const HARDWARE_TKIP: bool = false;
 
     /// `rtw89_init_ht_cap`, `rtw89_init_vht_cap` and `rtw89_init_he_cap` as
     /// mac80211 sends them, without the beamformee bits
@@ -1806,7 +1808,9 @@ impl<I: Io> Device for Hardware<I> {
 
     /// `rtw89_cam_sec_key_add`: a CCMP-128 key in the security CAM and the
     /// link's address CAM entry; a key replacing one under the same entry
-    /// goes in first, then the old one leaves.
+    /// goes in first, then the old one leaves. A TKIP key is refused with
+    /// nothing sent, as rtw89's `-EOPNOTSUPP`; the station, knowing
+    /// [`Device::HARDWARE_TKIP`] is false, never offers one.
     fn write_key(&mut self, key: &KeyEntry<'_>) -> Result<(), String> {
         self.alive()?;
         let entry = usize::from(key.entry);

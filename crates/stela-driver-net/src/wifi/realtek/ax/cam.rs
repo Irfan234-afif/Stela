@@ -28,9 +28,12 @@
 //! by the host (`IEEE80211_KEY_FLAG_SW_MGMT_TX`), with `ccmp::seal` and
 //! `ccmp::open`.
 //!
-//! Refused here, where rtw89 would differ, and why:
-//! - TKIP: RTL8852B's `hw_tkip_crypto` is false, so rtw89 also refuses it
-//!   (`-EOPNOTSUPP`), and Stela does not run TKIP in software either.
+//! Refused here, and why:
+//! - TKIP, pairwise or group: RTL8852B's `hw_tkip_crypto` is false, so rtw89
+//!   refuses it as well (`-EOPNOTSUPP`, before anything is sent) and
+//!   mac80211 keeps the key in software. Stela's station does the same with
+//!   a TKIP group key, decrypting the AP's group frames on the host
+//!   ([`crate::wifi::security::tkip`]); it never chooses TKIP pairwise.
 //! - The IGTK (AES-CMAC, `RTW89_SEC_KEY_TYPE_BIP_CCMP128`): rtw89 puts it
 //!   in the CAM, but Stela checks BIP in software, so it stays there.
 //! - WEP, CCMP-256 and GCMP: no Stela station negotiates them.

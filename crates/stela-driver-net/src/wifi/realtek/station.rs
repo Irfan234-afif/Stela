@@ -4,8 +4,10 @@
 //! leave the MAC to mac80211, so what firmware does on other NICs happens here:
 //! a scan hops the channels as `ieee80211_scan_work` does, frames carry a
 //! host-made IV as `IEEE80211_KEY_FLAG_GENERATE_IV` asks, `Reorder` holds a
-//! Block Ack agreement's frames, and robust management frames are sealed in
-//! software as `IEEE80211_KEY_FLAG_SW_MGMT_TX` asks. [`Device`] is the hardware
+//! Block Ack agreement's frames, robust management frames are sealed in
+//! software as `IEEE80211_KEY_FLAG_SW_MGMT_TX` asks, and the frames of a TKIP
+//! group key the chip refuses are decrypted in software, as mac80211 falls
+//! back to when `set_key` returns `-EOPNOTSUPP`. [`Device`] is the hardware
 //! beneath it, which names its own descriptor, reports and association
 //! commands; rtw88's are in [`super::rtw88`].
 use super::ccmp;
@@ -200,9 +202,12 @@ pub trait Device {
     const CHIP: &'static str;
     /// The 5 GHz channels the driver registers with mac80211.
     const CHANNELS_5GHZ: &'static [u16];
-    /// Whether the key table takes a TKIP group key, Michael left to the host.
-    /// The keeper refuses a TKIP group network before it joins when not.
-    const TKIP_GROUP: bool;
+    /// Whether the key table takes a TKIP group key, rtw89's `hw_tkip_crypto`:
+    /// rtw88's takes its temporal half and decrypts, Michael left to the host.
+    /// A chip without it refuses the key in `set_key`, `-EOPNOTSUPP`, and the
+    /// host keeps it and decrypts the AP's group traffic itself, as mac80211
+    /// does ([`security::tkip`]).
+    const HARDWARE_TKIP: bool;
 
     /// The capability elements a probe and an association request carry on
     /// `band` behind the rates, HT's, VHT's, HE's and the extended
@@ -372,13 +377,27 @@ pub struct Watched {
     pub busy: bool,
 }
 
-/// One key the CAM holds.
+/// One key the station holds, in the CAM or, a TKIP key the chip refused,
+/// in the host alone.
 struct Key {
     slot: KeySlot,
     pairwise: bool,
     index: u8,
     entry: u8,
+    /// Whether the CAM took it, mac80211's `KEY_FLAG_UPLOADED_TO_HARDWARE`.
+    hardware: bool,
     material: Zeroizing<Vec<u8>>,
+}
+
+/// What the AP's TKIP group traffic came to: frames the host decrypted, as
+/// the chip left them, ICVs that failed there, and Michael failures, each
+/// reported to the AP. A station's diagnostic names them once any is
+/// counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TkipCounts {
+    decrypted: u32,
+    icv_failures: u32,
+    michael_failures: u32,
 }
 
 /// The channels the country admits, which the real check gates at each frame.
@@ -586,6 +605,7 @@ pub struct Realtek<D: Device> {
     /// Why the station's last peer went: the AP's status or reason, a
     /// frame never acknowledged, or one that never left.
     departed: Option<crate::wifi::station::Failure>,
+    tkip: TkipCounts,
 }
 
 impl<D: Device> Realtek<D> {
@@ -634,6 +654,7 @@ impl<D: Device> Realtek<D> {
             left: false,
             reported: Vec::new(),
             departed: None,
+            tkip: TkipCounts::default(),
         })
     }
 
@@ -726,8 +747,11 @@ impl<D: Device> Realtek<D> {
 
     /// `rtw_sta_remove` and `rtw_ops_bss_info_changed` of the disassociation.
     fn clear(&mut self) -> Result<(), Error> {
+        // mac80211 disables only the keys it uploaded.
         for key in core::mem::take(&mut self.keys) {
-            Self::hardware(self.device.clear_key(key.entry))?;
+            if key.hardware {
+                Self::hardware(self.device.clear_key(key.entry))?;
+            }
         }
         self.power_save(false)?;
         for agreement in &mut self.agreements {
@@ -1421,17 +1445,25 @@ impl<D: Device> Realtek<D> {
             if frame.security.icv_error {
                 return Ok(());
             }
-            if self.keys[held].material.len() == Cipher::Tkip.key_length()
-                && frame.security.decrypted
-            {
+            let tkip = self.keys[held].material.len() == Cipher::Tkip.key_length();
+            // A key the chip never took leaves its frames as they came.
+            let software = tkip && !self.keys[held].hardware && !frame.security.decrypted;
+            if tkip && (frame.security.decrypted || software) {
                 if header.fragmented() {
                     self.unsupported("a fragmented TKIP frame");
                     return Ok(());
+                }
+                if software {
+                    let Some(decrypted) = self.decrypt_tkip(&mut frame, held) else {
+                        return Ok(());
+                    };
+                    frame = decrypted;
                 }
                 match check_michael(&mut frame, &self.keys[held]) {
                     Michael::Intact => {}
                     Michael::Dropped => return Ok(()),
                     Michael::Failed => {
+                        self.tkip.michael_failures = self.tkip.michael_failures.saturating_add(1);
                         let pairwise = !multicast;
                         self.events
                             .push_back(keeper::Event::MichaelFailure { pairwise });
@@ -1447,6 +1479,46 @@ impl<D: Device> Realtek<D> {
         }
         self.order(frame, now);
         Ok(())
+    }
+
+    /// `ieee80211_crypto_tkip_decrypt` of a data frame the chip left under a
+    /// TKIP key it refused: decrypted under the key's temporal half as the AP
+    /// sent it, the IV and ICV kept, and marked decrypted as a chip marks
+    /// what it decrypted (`RX_FLAG_DECRYPTED` alone), so the Michael and
+    /// replay checks follow as for rtw88's. `None` drops a frame from
+    /// another transmitter, as mac80211 drops one with no station, or one
+    /// `ieee80211_tkip_decrypt_data` refuses, its replay check first and a
+    /// failed ICV counted, with no verdict on its Michael.
+    fn decrypt_tkip(&mut self, frame: &mut Mpdu, held: usize) -> Option<Mpdu> {
+        let header = *frame.header();
+        let transmitter = header
+            .transmitter
+            .filter(|&transmitter| Some(transmitter) == self.station.pairwise_peer())?;
+        let (number, _) =
+            PacketNumber::from_tkip_header(frame.bytes().get(header.length..)?).ok()?;
+        frame.security.pn = Some(number);
+        if self.keys[held].slot.replays(frame) {
+            return None;
+        }
+        let temporal = self.keys[held].material.first_chunk::<16>()?;
+        let mut bytes = frame.bytes().to_vec();
+        let body = bytes.get_mut(header.length..)?;
+        match security::tkip::decrypt(temporal, &transmitter.0, body) {
+            Ok(()) => {}
+            Err(security::tkip::Failure::Icv) => {
+                self.tkip.icv_failures = self.tkip.icv_failures.saturating_add(1);
+                return None;
+            }
+            Err(_) => return None,
+        }
+        let security = SecurityStatus {
+            decrypted: true,
+            integrity: Integrity::Verified,
+            ..frame.security
+        };
+        let decrypted = Mpdu::new(bytes, frame.radio.clone(), security).ok()?;
+        self.tkip.decrypted = self.tkip.decrypted.saturating_add(1);
+        Some(decrypted)
     }
 
     /// `ieee80211_sta_manage_reorder_buf` for a frame under an agreement.
@@ -1933,10 +2005,18 @@ impl<D: Device> Link for Realtek<D> {
                 String::from("the AP MLD's answer broke the last join's multi-link setup")
             }
         });
-        match (departed, self.device.diagnostic()) {
-            (Some(departed), Some(device)) => Some(format!("{departed}; {device}")),
-            (departed, device) => departed.or(device),
-        }
+        let tkip = self.tkip;
+        let tkip = (tkip != TkipCounts::default()).then(|| {
+            format!(
+                "tkip group decrypted={} icv-failures={} michael-failures={}",
+                tkip.decrypted, tkip.icv_failures, tkip.michael_failures
+            )
+        });
+        let parts: Vec<String> = [departed, tkip, self.device.diagnostic()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 }
 
@@ -1949,7 +2029,9 @@ impl<D: Device> Radio for Realtek<D> {
     const NAME: &'static str = D::DRIVER;
     /// rtw88 and rtw89 leave `max_listen_interval` at mac80211's default.
     const LISTEN_INTERVAL: u16 = 5;
-    const TKIP_GROUP: bool = D::TKIP_GROUP;
+    /// A TKIP group key is the CAM's or, where the chip refuses it, the
+    /// host's.
+    const TKIP_GROUP: bool = true;
 
     fn deferred(error: &Error) -> bool {
         matches!(error, Error::Pending)
@@ -2214,7 +2296,10 @@ impl<D: Device> Radio for Realtek<D> {
     }
 
     /// `set_key`: the key table takes CCMP-128 alone of what a station uses,
-    /// and a TKIP group key where the device says so.
+    /// and a TKIP group key where the chip takes TKIP. One that refuses it,
+    /// as `rtw89_cam_sec_key_add` does without `hw_tkip_crypto`, leaves the
+    /// TKIP group key to the host, which decrypts under it as mac80211 does
+    /// and tells the chip nothing.
     fn install_key(
         &mut self,
         pairwise: bool,
@@ -2226,18 +2311,15 @@ impl<D: Device> Radio for Realtek<D> {
         // mac80211.
         let cipher = if material.len() == Cipher::Ccmp128.key_length() {
             Cipher::Ccmp128
-        } else if D::TKIP_GROUP && !pairwise && material.len() == Cipher::Tkip.key_length() {
+        } else if !pairwise && material.len() == Cipher::Tkip.key_length() {
             Cipher::Tkip
         } else {
             return Err(Error::Lacks {
-                what: if D::TKIP_GROUP {
-                    "a key other than CCMP-128 or a TKIP group key"
-                } else {
-                    "a key other than CCMP-128"
-                },
+                what: "a key other than CCMP-128 or a TKIP group key",
                 chip: D::CHIP,
             });
         };
+        let hardware = cipher != Cipher::Tkip || D::HARDWARE_TKIP;
         let temporal = material
             .first_chunk::<16>()
             .ok_or(Error::Refused("key material"))?;
@@ -2263,23 +2345,35 @@ impl<D: Device> Radio for Realtek<D> {
             .map_err(Error::Key)?;
         let identity = ticket.identity();
         let entry = if pairwise { PAIRWISE_CAM } else { index };
-        Self::hardware(self.device.write_key(&KeyEntry {
-            entry,
-            index,
-            cipher,
-            group: !pairwise,
-            peer: if pairwise { peer } else { Mac::BROADCAST },
-            material: temporal,
-        }))?;
+        let replaced = self
+            .keys
+            .iter()
+            .position(|key| key.pairwise == pairwise && key.index == index);
+        if hardware {
+            Self::hardware(self.device.write_key(&KeyEntry {
+                entry,
+                index,
+                cipher,
+                group: !pairwise,
+                peer: if pairwise { peer } else { Mac::BROADCAST },
+                material: temporal,
+            }))?;
+        } else if let Some(old) = replaced.filter(|&old| self.keys[old].hardware) {
+            // `ieee80211_key_replace`: the key the CAM held at this index
+            // leaves it.
+            Self::hardware(self.device.clear_key(self.keys[old].entry))?;
+        }
         slot.complete_install(ticket, InstallOutcome::Accepted)
             .map_err(Error::Key)?;
-        self.keys
-            .retain(|key| !(key.pairwise == pairwise && key.index == index));
+        if let Some(old) = replaced {
+            self.keys.remove(old);
+        }
         self.keys.push(Key {
             slot,
             pairwise,
             index,
             entry,
+            hardware,
             material: Zeroizing::new(material.to_vec()),
         });
         // A group key installed while the port is open is a group

@@ -320,29 +320,33 @@ fn join_and_leave() -> Model {
         he: Some(he(HE_PHY_CAP6_PPE_THRESHOLD_PRESENT, 0, 0x39, 0x1d)),
     };
     w.assoc(&peer, 3);
-    let (m1, m2, m3, m4) = (material(0x10), material(0x20), [0x30; 32], material(0x40));
+    let (m1, m2, m4) = (material(0x10), material(0x20), material(0x40));
     let k1 = add(&mut w, Some(&peer), 5, &key(Cipher::Ccmp128, true, 0, &m1));
     let k2 = add(&mut w, None, 6, &key(Cipher::Ccmp128, false, 1, &m2));
-    // The harness's TKIP key never gets an entry: its hw_key_idx stays 0.
-    let result = cam::write_key(
-        &mut w.io,
-        &mut w.h2c,
-        &mut w.cams,
-        &mut w.link,
-        None,
-        &key(Cipher::Tkip, false, 2, &m3),
-    );
-    step(&mut w.io, 7, result.map(|_| ()));
-    w.io.mark(61, 0, 0);
-    let k4 = add(&mut w, None, 8, &key(Cipher::Ccmp128, false, 2, &m4));
-    w.clear(None, 9, k2);
-    w.clear(Some(&peer), 10, k1);
-    w.clear(None, 11, k4);
+    // The harness's TKIP keys, group and pairwise, never get an entry:
+    // their hw_key_idx stays 0, nothing is sent, and mac80211 never asks to
+    // delete them.
+    for (id, pairwise, keyidx, material) in [(7, false, 2, [0x30; 32]), (8, true, 0, [0x50; 32])] {
+        let result = cam::write_key(
+            &mut w.io,
+            &mut w.h2c,
+            &mut w.cams,
+            &mut w.link,
+            pairwise.then_some(&peer),
+            &key(Cipher::Tkip, pairwise, keyidx, &material),
+        );
+        step(&mut w.io, id, result.map(|_| ()));
+        w.io.mark(61, 0, 0);
+    }
+    let k4 = add(&mut w, None, 9, &key(Cipher::Ccmp128, false, 2, &m4));
+    w.clear(None, 10, k2);
+    w.clear(Some(&peer), 11, k1);
+    w.clear(None, 12, k4);
     w.io.mark(74, 0, 0);
     let result = sta_disconnect(&mut w.io, &mut w.h2c, &mut w.link, &peer);
-    step(&mut w.io, 12, result);
-    w.bssid(13, [0; 6]);
-    w.vif_deinit(14);
+    step(&mut w.io, 13, result);
+    w.bssid(14, [0; 6]);
+    w.vif_deinit(15);
     w.io
 }
 

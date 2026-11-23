@@ -227,8 +227,9 @@ pub trait Radio: Link {
     const NAME: &'static str;
     /// mac80211's `hw.conf.listen_interval` for this driver.
     const LISTEN_INTERVAL: u16;
-    /// Whether the radio decrypts a network's TKIP group traffic. A radio
-    /// that leaves it to software is refused such a network before it joins.
+    /// Whether the radio decrypts a network's TKIP group traffic, in its key
+    /// table or on the host. A radio that leaves it to software it does not
+    /// run is refused such a network before it joins.
     const TKIP_GROUP: bool = true;
 
     /// Whether `error` only asks to try again once queued frames drain.
