@@ -195,9 +195,6 @@ const LOOKS: usize = 4;
 const DRAIN_LIMIT: u32 = radio::DRAIN_LIMIT;
 /// `RTW89_TFC_*` traffic levels.
 const TFC_MID: u8 = 3;
-/// What the station goes without, named once each.
-const NO_POWER_SAVE: &str = "rtw89's leisure power save on an RTL8852B";
-
 fn failed<E: fmt::Debug>(step: &'static str) -> impl FnOnce(E) -> String {
     move |error| format!("{step}: {error:?}")
 }
@@ -595,7 +592,10 @@ pub struct Hardware<I = NativeIo> {
     cfo_due: Option<u64>,
     calibrations: u32,
     vector: bool,
-    limitations: Vec<&'static str>,
+    /// The station's requests for leisure power save, which this port goes
+    /// without (v1 keeps the radio awake): named in the diagnostic, where
+    /// the request once reached the keeper as the link's failure.
+    lps_declined: u32,
     transmitted: Transmitted,
     /// What stage 2 took beside the chip, which a cold re-init takes again.
     settings: Settings,
@@ -739,7 +739,7 @@ impl<I: Io> Hardware<I> {
             cfo_due: None,
             calibrations: 0,
             vector: settings.vector,
-            limitations: Vec::new(),
+            lps_declined: 0,
             transmitted: Transmitted::default(),
             settings: *settings,
             restart: None,
@@ -1899,9 +1899,11 @@ impl<I: Io> Device for Hardware<I> {
         .map_err(failed("key"))
     }
 
+    /// `rtw89_enter_lps` is not ported: the radio stays awake, as with
+    /// mac80211's power save off, and the request is only counted.
     fn set_power_save(&mut self, on: bool) -> Result<(), String> {
-        if on && !self.limitations.contains(&NO_POWER_SAVE) {
-            self.limitations.push(NO_POWER_SAVE);
+        if on {
+            self.lps_declined = self.lps_declined.saturating_add(1);
         }
         Ok(())
     }
@@ -1995,18 +1997,18 @@ impl<I: Io> Device for Hardware<I> {
         self.vector
     }
 
-    fn limitation(&mut self) -> Option<&'static str> {
-        self.limitations.pop()
-    }
-
     /// The frames sent and how RPQ released them ([`Transmitted`]), the
     /// channel tuned, the RF calibrations run, and whether an MSI signals.
     fn diagnostic(&mut self) -> Option<String> {
         let tuned = self.chan.map_or(String::from("none"), |chan| {
             format!("{}/{}", chan.primary(), chan.width_mhz())
         });
+        let lps = match self.lps_declined {
+            0 => String::new(),
+            declined => format!(" lps-declined={declined}"),
+        };
         Some(format!(
-            "{} channel={tuned} calibrations={} {}",
+            "{} channel={tuned} calibrations={} {}{lps}",
             self.transmitted,
             self.calibrations,
             if self.vector { "msi" } else { "polled" }

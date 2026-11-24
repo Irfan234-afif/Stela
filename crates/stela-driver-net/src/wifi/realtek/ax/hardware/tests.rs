@@ -1230,6 +1230,37 @@ fn a_join_the_ap_left_unanswered_is_made_again_and_its_lease_hears_no_stale_fail
     );
 }
 
+/// The fifth hardware run: two seconds after the join the link was quiet,
+/// the station asked for leisure power save, which this port goes without,
+/// and the refusal reached DHCP as the link's failure, ending a working
+/// association. The radio stays awake and the lease goes on.
+#[test]
+fn a_quiet_link_stays_awake_and_its_lease_goes_on() {
+    let mut bench = bench(Protection::Mixed);
+    bench.join();
+    // Past two watchdogs with nothing but beacons.
+    bench.serve(1000);
+    assert!(bench.wifi.carrier());
+    let diagnostic = bench.diagnostic();
+    assert!(diagnostic.contains("lps-declined="), "{diagnostic}");
+    let mut ethernet = vec![0xff; 6];
+    ethernet.extend(bench.local.0);
+    ethernet.extend([8, 0]);
+    ethernet.extend(dhcp(1, 1));
+    bench.wifi.transmit(&ethernet).unwrap();
+    let reply = dhcp(2, 2);
+    bench.hear_tkip(&tkip_broadcast(
+        true,
+        10,
+        &reply,
+        (&tkip_gtk(0x50), 1),
+        8,
+        false,
+    ));
+    let ethernet = bench.wifi.receive().unwrap().expect("the DHCP offer");
+    assert_eq!(ethernet[14..], reply);
+}
+
 #[test]
 fn tkip_group_frames_replayed_or_failing_their_icv_are_dropped_without_a_michael_report() {
     let mut bench = bench(Protection::Mixed);
