@@ -1171,6 +1171,50 @@ fn a_mixed_wpa_station_leases_over_tkip_group_traffic_and_keeps_it_through_a_rek
     assert_eq!(bench.wifi.radio().station().phase(), Phase::Associated);
 }
 
+/// The second hardware run on the user's AP: it acknowledged the first
+/// association request and both retries but answered none, the keeper
+/// joined again ten seconds later, and DHCP, which reads the link only once
+/// its carrier is up, heard the first attempt's failure in place of a frame
+/// and gave the adapter up on a working association.
+#[test]
+fn a_join_the_ap_left_unanswered_is_made_again_and_its_lease_hears_no_stale_failure() {
+    let mut bench = bench(Protection::Mixed);
+    bench.ap.unanswered = 3;
+    bench.join();
+    assert_eq!(bench.ap.unanswered, 0);
+    assert!(
+        bench
+            .diagnostic()
+            .contains("1 attempts failed, the last at association"),
+        "{}",
+        bench.diagnostic()
+    );
+    let mut ethernet = vec![0xff; 6];
+    ethernet.extend(bench.local.0);
+    ethernet.extend([8, 0]);
+    ethernet.extend(dhcp(1, 1));
+    bench.wifi.transmit(&ethernet).unwrap();
+    let reply = dhcp(2, 2);
+    bench.hear_tkip(&tkip_broadcast(
+        true,
+        10,
+        &reply,
+        (&tkip_gtk(0x50), 1),
+        8,
+        false,
+    ));
+    let ethernet = bench.wifi.receive().unwrap().expect("the DHCP offer");
+    assert_eq!(ethernet[14..], reply);
+    let diagnostic = bench.diagnostic();
+    assert!(
+        diagnostic.contains(
+            "protected unicast heard=0 unkeyed=0 icv=0 protected group heard=1 unkeyed=0 icv=0; \
+             tkip group decrypted=1 icv-failures=0 michael-failures=0"
+        ),
+        "{diagnostic}"
+    );
+}
+
 #[test]
 fn tkip_group_frames_replayed_or_failing_their_icv_are_dropped_without_a_michael_report() {
     let mut bench = bench(Protection::Mixed);

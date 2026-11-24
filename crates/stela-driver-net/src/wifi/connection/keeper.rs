@@ -1666,6 +1666,11 @@ impl<R: Radio> Keeper<R> {
             link_integrity: Vec::new(),
         };
         self.failures = 0;
+        // The stack reads the link only once its carrier is up, so a
+        // failure an earlier attempt left unreported would reach it now, on
+        // the port this attempt opened, and end that. The progress keeps it.
+        self.failure = None;
+        self.reported = None;
         Ok(())
     }
 

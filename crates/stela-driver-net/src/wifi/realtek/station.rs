@@ -400,6 +400,35 @@ struct TkipCounts {
     michael_failures: u32,
 }
 
+/// What became of the protected data frames the chip handed over, unicast
+/// (`[0]`) and group-addressed (`[1]`) apart: each heard, and those dropped
+/// under a key the station does not hold or has not installed, or for an
+/// ICV error the chip found. A station's diagnostic names them once any is
+/// counted, so that a run that heard no group traffic tells an AP that sent
+/// none from frames dropped on the way in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProtectedCounts {
+    heard: [u32; 2],
+    unkeyed: [u32; 2],
+    icv: [u32; 2],
+}
+
+impl core::fmt::Display for ProtectedCounts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (at, kind) in ["unicast", "group"].into_iter().enumerate() {
+            if at > 0 {
+                f.write_str(" ")?;
+            }
+            write!(
+                f,
+                "protected {kind} heard={} unkeyed={} icv={}",
+                self.heard[at], self.unkeyed[at], self.icv[at]
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// The channels the country admits, which the real check gates at each frame.
 struct Admitted<'a>(&'a [(Channel, u32)]);
 
@@ -606,6 +635,7 @@ pub struct Realtek<D: Device> {
     /// frame never acknowledged, or one that never left.
     departed: Option<crate::wifi::station::Failure>,
     tkip: TkipCounts,
+    protected: ProtectedCounts,
 }
 
 impl<D: Device> Realtek<D> {
@@ -655,6 +685,7 @@ impl<D: Device> Realtek<D> {
             reported: Vec::new(),
             departed: None,
             tkip: TkipCounts::default(),
+            protected: ProtectedCounts::default(),
         })
     }
 
@@ -1431,18 +1462,21 @@ impl<D: Device> Realtek<D> {
         }
         if header.protected() {
             let multicast = header.receiver.is_multicast();
+            let kind = usize::from(multicast);
+            let counts = &mut self.protected;
+            counts.heard[kind] = counts.heard[kind].saturating_add(1);
             let index = frame.bytes().get(header.length + 3).map(|byte| byte >> 6);
             let held = self
                 .keys
                 .iter()
                 .position(|key| key.pairwise != multicast && Some(key.index) == index);
-            let Some(held) = held else {
-                return Ok(());
-            };
-            let Some(key) = self.keys[held].slot.installed() else {
+            let installed = held.and_then(|held| Some((held, self.keys[held].slot.installed()?)));
+            let Some((held, key)) = installed else {
+                counts.unkeyed[kind] = counts.unkeyed[kind].saturating_add(1);
                 return Ok(());
             };
             if frame.security.icv_error {
+                counts.icv[kind] = counts.icv[kind].saturating_add(1);
                 return Ok(());
             }
             let tkip = self.keys[held].material.len() == Cipher::Tkip.key_length();
@@ -2012,7 +2046,9 @@ impl<D: Device> Link for Realtek<D> {
                 tkip.decrypted, tkip.icv_failures, tkip.michael_failures
             )
         });
-        let parts: Vec<String> = [departed, tkip, self.device.diagnostic()]
+        let protected = self.protected;
+        let protected = (protected != ProtectedCounts::default()).then(|| format!("{protected}"));
+        let parts: Vec<String> = [departed, protected, tkip, self.device.diagnostic()]
             .into_iter()
             .flatten()
             .collect();

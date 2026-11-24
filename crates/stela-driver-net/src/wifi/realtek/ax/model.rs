@@ -895,6 +895,9 @@ pub(crate) struct Ap {
     pub gone: bool,
     /// Management frames lost before the AP hears them.
     pub losses: usize,
+    /// Association requests the AP acknowledges but never answers, as the
+    /// user's AP left the first join of a hardware run.
+    pub unanswered: usize,
     /// Other channels its beacons reach, as an adjacent channel hears a
     /// strong AP.
     pub heard_on: Vec<u8>,
@@ -934,6 +937,7 @@ impl Ap {
             quiet: false,
             gone: false,
             losses: 0,
+            unanswered: 0,
             heard_on: Vec::new(),
             probed: Vec::new(),
             statuses: Vec::new(),
@@ -1128,6 +1132,7 @@ impl Ap {
             match kind {
                 0x40 => self.probed(chip, bytes),
                 0xb0 => self.authenticate(chip, bytes),
+                0x00 if self.unanswered > 0 => self.unanswered -= 1,
                 0x00 => {
                     let mut body = vec![0x11, 0, 0, 0];
                     body.extend_from_slice(&(AID | 0xc000).to_le_bytes());
