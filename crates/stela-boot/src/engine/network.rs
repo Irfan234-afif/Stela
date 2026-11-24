@@ -39,6 +39,17 @@ use stela_soc::machine::AppleDevices;
 /// original Apple guest process and its requested server.
 pub const RELAY_BUFFER: usize = 1 << 20;
 
+/// An address of the stack's as the log and the screen show it: an IPv6
+/// address made from an adapter's MAC hides what the MAC's own lines hide.
+fn shown(address: impl Into<core::net::IpAddr>) -> String {
+    match address.into() {
+        core::net::IpAddr::V6(address) => {
+            alloc::string::ToString::to_string(&stela_contracts::masked::Ipv6(address))
+        }
+        address => alloc::string::ToString::to_string(&address),
+    }
+}
+
 /// No adapter a native driver runs: what to connect, as the screen says it.
 const NO_ADAPTER: &str = "No supported network adapter. Connect wired Ethernet: most Intel and Realtek adapters, Aquantia adapters, Broadcom's BCM5720, BCM5761 and BCM5762, or a Realtek or ASIX USB adapter. With --wifi, Intel's Wi-Fi cards, MediaTek's MT7925 and Realtek's RTL8822C and RTL8852BE join a network too.";
 /// What the screen says when DHCP gives the first adapter no lease.
@@ -407,15 +418,18 @@ impl HostNetwork {
             match result {
                 Ok(config) => {
                     output::arguments(format_args!("NETWORK driver={driver}\n"));
-                    output::arguments(format_args!(
-                        "NETWORK adapter={location} addresses={:?} dns={:?}\n",
-                        config.addresses, config.dns
-                    ));
                     let addresses: Vec<String> = config
                         .addresses
                         .iter()
-                        .map(alloc::string::ToString::to_string)
+                        .map(|cidr| format!("{}/{}", shown(cidr.address()), cidr.prefix_len()))
                         .collect();
+                    let dns: Vec<String> =
+                        config.dns.iter().map(|&address| shown(address)).collect();
+                    output::arguments(format_args!(
+                        "NETWORK adapter={location} addresses={} dns={}\n",
+                        addresses.join(","),
+                        dns.join(",")
+                    ));
                     let description = format!("{} on adapter {location}", addresses.join(", "));
                     return Ok(Self {
                         stack,

@@ -7,6 +7,8 @@
 //! - [`Tail`]: a serial number's last four characters, as the screen names
 //!   a disk; too little to identify the hardware.
 //! - [`Mac`]: a MAC address's vendor half, then its last byte.
+//! - [`Ipv6`]: an IPv6 address whose interface identifier is made from a
+//!   MAC address, with the bytes [`Mac`] hides hidden there too.
 //! - [`Name`]: a name's short hash, `#` and four hex digits.
 //!
 //! [`mask_line`] does the same to text Stela relays without formatting it,
@@ -56,6 +58,28 @@ impl fmt::Display for Mac<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let [a, b, c, _, _, last] = *self.0;
         write!(f, "{a:02x}:{b:02x}:{c:02x}:..:..:{last:02x}")
+    }
+}
+
+/// An IPv6 address as `fe80::fa3d:c6ff:fe..:..20` when its interface
+/// identifier is a modified EUI-64, which RFC 4291 appendix A makes from a
+/// MAC address with `ff:fe` between its halves: the MAC's fourth and fifth
+/// bytes, which [`Mac`] hides, hidden. Any other address as it is.
+pub struct Ipv6(pub core::net::Ipv6Addr);
+
+impl fmt::Display for Ipv6 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let octets = self.0.octets();
+        if octets[11] != 0xff || octets[12] != 0xfe || self.0.to_ipv4_mapped().is_some() {
+            return write!(f, "{}", self.0);
+        }
+        // The address's own text ends in its last two groups whole: the
+        // first of them, `fe` and the MAC's fourth byte, is never zero, so
+        // no run of zeros the text shortens reaches them.
+        let text = alloc::format!("{}", self.0);
+        let mut groups = text.rsplitn(3, ':');
+        let (_, _, rest) = (groups.next(), groups.next(), groups.next());
+        write!(f, "{}:fe..:..{:02x}", rest.unwrap_or(""), octets[15])
     }
 }
 
@@ -422,6 +446,37 @@ mod tests {
     fn a_mac_keeps_its_vendor_and_last_byte() {
         let mac = [0x00, 0xe0, 0x4c, 0x12, 0x34, 0x5e];
         assert_eq!(Mac(&mac).to_string(), "00:e0:4c:..:..:5e");
+    }
+
+    #[test]
+    fn an_ipv6_address_made_from_a_mac_hides_what_the_mac_hides() {
+        let ipv6 = |text: &str| Ipv6(text.parse().unwrap()).to_string();
+        // The link-local address a station on the user's AP took.
+        assert_eq!(
+            ipv6("fe80::fa3d:c6ff:fe8a:3b20"),
+            "fe80::fa3d:c6ff:fe..:..20"
+        );
+        // A global prefix with no run of zeros to shorten, and one with.
+        assert_eq!(
+            ipv6("2001:db8:7:1:2e0:4cff:fe12:345e"),
+            "2001:db8:7:1:2e0:4cff:fe..:..5e"
+        );
+        assert_eq!(
+            ipv6("2001:db8::2e0:4cff:fe12:5e"),
+            "2001:db8::2e0:4cff:fe..:..5e"
+        );
+        // A MAC with zeros in its vendor half, and a prefix of zeros.
+        assert_eq!(ipv6("fe80::200:ff:fe00:1"), "fe80::200:ff:fe..:..01");
+        assert_eq!(ipv6("::200:ff:fe00:1"), "::200:ff:fe..:..01");
+        // Interface identifiers of no MAC, and an IPv4 address in IPv6.
+        for kept in [
+            "fe80::1",
+            "2001:db8::8f2c:61d9:a1b0:7d3e",
+            "::ffff:254.1.2.3",
+            "::",
+        ] {
+            assert_eq!(ipv6(kept), kept);
+        }
     }
 
     #[test]
