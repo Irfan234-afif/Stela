@@ -1,13 +1,30 @@
 //! The FCH watchdog of an unattended run (`stela_boot_core::fch_watchdog`)
 //! at its registers' physical addresses: the firmware's page tables reach
-//! them before its exit, and the engine's through the runtime region the
-//! loader maps by identity, which the handoff says it holds.
+//! them before its exit, and the loader's root, which maps the firmware's
+//! runtime regions by identity, after it. The engine's roots do not: its
+//! stop reaches them in the loader's root, as it calls the firmware's
+//! services (`stop_record`), where the first hardware run's stop faulted
+//! on them and the PC waited for the watchdog's own reset.
 use crate::output;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_boot_core::fch_watchdog::{self as fch, Registers};
 
 /// Whether this image may touch an armed watchdog.
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// The loader's root the engine reaches the registers in; zero in the
+/// loader, whose tables reach them.
+static ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Run `access` where the registers are mapped.
+fn mapped<T>(access: impl FnOnce(&mut Mmio) -> T) -> T {
+    match ROOT.load(Ordering::Acquire) {
+        0 => access(&mut Mmio),
+        // SAFETY: the loader's live root the handoff named, which maps the
+        // FCH's runtime region by identity (`hand_over`); only a stop calls
+        // this in the engine, and a stop resumes nothing.
+        root => unsafe { crate::engine::in_loader_root_at_stop(root, || access(&mut Mmio)) },
+    }
+}
 
 struct Mmio;
 
@@ -69,14 +86,15 @@ fn arm() -> Result<fch::Armed, fch::Refusal> {
     Ok(armed)
 }
 
-/// What the engine is told: whether the watchdog runs and its registers
-/// are `mapped` in the engine's tables. One the engine could not reach is
-/// stopped here, so that no reset leaves it running.
-pub(crate) fn hand_over(mapped: bool) -> bool {
+/// What the engine is told: whether the watchdog runs, its registers
+/// `reached` in the loader's root through a firmware runtime region. One
+/// the engine could not reach is stopped here, so that no reset leaves it
+/// running.
+pub(crate) fn hand_over(reached: bool) -> bool {
     if !ARMED.load(Ordering::Acquire) {
         return false;
     }
-    if !mapped {
+    if !reached {
         fch::stop(&mut Mmio);
         ARMED.store(false, Ordering::Release);
         output::arguments(format_args!(
@@ -87,9 +105,11 @@ pub(crate) fn hand_over(mapped: bool) -> bool {
     true
 }
 
-/// The engine's image takes the loader's word for a running watchdog.
-pub(crate) fn adopt(armed: bool) {
-    ARMED.store(armed, Ordering::Release);
+/// The engine's image takes the loader's word for a running watchdog,
+/// whose registers it reaches in the loader's `root`.
+pub(crate) fn adopt(armed: bool, root: u64) {
+    ROOT.store(root, Ordering::Release);
+    ARMED.store(armed && root != 0, Ordering::Release);
 }
 
 /// Stop the watchdog before a restart; whether one was running.
@@ -97,7 +117,7 @@ pub(crate) fn stop() -> bool {
     if !ARMED.load(Ordering::Acquire) {
         return false;
     }
-    fch::stop(&mut Mmio);
+    mapped(|registers| fch::stop(registers));
     true
 }
 
@@ -105,6 +125,6 @@ pub(crate) fn stop() -> bool {
 /// not take.
 pub(crate) fn rearm(seconds: u16) {
     if ARMED.load(Ordering::Acquire) {
-        fch::rearm(&mut Mmio, seconds);
+        mapped(|registers| fch::rearm(registers, seconds));
     }
 }

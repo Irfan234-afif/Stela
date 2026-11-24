@@ -291,7 +291,7 @@ fn start(handoff: u64) -> Started {
     if let Some(power) = &handoff.power {
         crate::stop::arm(power, handoff.tsc_hz);
     }
-    crate::fch_watchdog::adopt(handoff.fch_watchdog);
+    crate::fch_watchdog::adopt(handoff.fch_watchdog, handoff.root);
     // Before any AP: the boot processor's class, its caches, clock and
     // memory, with its heap's buffer (`HOST SPEED`).
     super::speed::calibrate_once();

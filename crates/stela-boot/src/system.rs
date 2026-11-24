@@ -455,7 +455,8 @@ struct Runtime {
 
 impl Runtime {
     /// Whether one runtime region holds `start..end`: [`Self::map`] maps
-    /// each by identity, so the engine's tables reach those bytes.
+    /// each by identity in the loader's root, which the engine's stop
+    /// enters to reach those bytes.
     fn maps(&self, start: u64, end: u64) -> bool {
         self.descriptors
             .iter()
