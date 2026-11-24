@@ -400,12 +400,13 @@ struct TkipCounts {
     michael_failures: u32,
 }
 
-/// What became of the protected data frames the chip handed over, unicast
-/// (`[0]`) and group-addressed (`[1]`) apart: each heard, and those dropped
-/// under a key the station does not hold or has not installed, or for an
-/// ICV error the chip found. A station's diagnostic names them once any is
-/// counted, so that a run that heard no group traffic tells an AP that sent
-/// none from frames dropped on the way in.
+/// What became of the protected data frames meant for the station, those
+/// to its address (`[0]`) and its AP's group-addressed ones (`[1]`) apart:
+/// each heard, and those dropped under a key the station does not hold or
+/// has not installed, or for an ICV error the chip found. A station's
+/// diagnostic names them once any is counted, so that a run that heard no
+/// group traffic tells an AP that sent none from frames dropped on the way
+/// in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ProtectedCounts {
     heard: [u32; 2],
@@ -424,6 +425,76 @@ impl core::fmt::Display for ProtectedCounts {
                 "protected {kind} heard={} unkeyed={} icv={}",
                 self.heard[at], self.unkeyed[at], self.icv[at]
             )?;
+        }
+        Ok(())
+    }
+}
+
+/// The most steps a [`JoinTrace`] keeps.
+const JOIN_TRACE: usize = 24;
+
+/// What the last join exchanged with its AP, so that a diagnostic tells an
+/// AP that never answered from an answer the station refused: each
+/// authentication or association request handed to the chip, its release
+/// report, each management frame to the station's address with its status
+/// or reason field, and why the station refused one. Each step carries the
+/// milliseconds since the join began; the first [`JOIN_TRACE`] are kept.
+#[derive(Debug, Default)]
+struct JoinTrace {
+    began: u64,
+    steps: Vec<String>,
+    more: u32,
+}
+
+impl JoinTrace {
+    fn begin(&mut self, now: u64) {
+        self.began = now;
+        self.steps.clear();
+        self.more = 0;
+    }
+
+    fn note(&mut self, now: u64, step: fmt::Arguments<'_>) {
+        if self.steps.len() >= JOIN_TRACE {
+            self.more = self.more.saturating_add(1);
+            return;
+        }
+        let ms = now.saturating_sub(self.began) / 1000;
+        self.steps.push(format!("+{ms} {step}"));
+    }
+
+    /// A management frame the station sent or heard, by its subtype, with
+    /// the status of an authentication or (re)association response and the
+    /// reason of a departure.
+    fn frame(bytes: &[u8]) -> String {
+        let field = |at: usize| {
+            bytes
+                .get(24 + at..26 + at)
+                .map(|value| u16::from_le_bytes([value[0], value[1]]))
+        };
+        let (name, field) = match bytes.first().map(|control| control & 0xfc) {
+            Some(0x00) => ("assoc request", None),
+            Some(0x10) => ("assoc response", field(2).map(|value| ("status", value))),
+            Some(0x20) => ("reassoc request", None),
+            Some(0x30) => ("reassoc response", field(2).map(|value| ("status", value))),
+            Some(0xa0) => ("disassociation", field(0).map(|value| ("reason", value))),
+            Some(0xb0) => ("authentication", field(4).map(|value| ("status", value))),
+            Some(0xc0) => ("deauthentication", field(0).map(|value| ("reason", value))),
+            Some(0xd0) => ("action", None),
+            Some(other) => return format!("management {other:#04x} len={}", bytes.len()),
+            None => return String::from("empty frame"),
+        };
+        match field {
+            Some((kind, value)) => format!("{name} {kind}={value} len={}", bytes.len()),
+            None => format!("{name} len={}", bytes.len()),
+        }
+    }
+}
+
+impl fmt::Display for JoinTrace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "last join: {}", self.steps.join(", "))?;
+        if self.more > 0 {
+            write!(f, " (+{} steps)", self.more)?;
         }
         Ok(())
     }
@@ -636,6 +707,7 @@ pub struct Realtek<D: Device> {
     departed: Option<crate::wifi::station::Failure>,
     tkip: TkipCounts,
     protected: ProtectedCounts,
+    trace: JoinTrace,
 }
 
 impl<D: Device> Realtek<D> {
@@ -686,6 +758,7 @@ impl<D: Device> Realtek<D> {
             departed: None,
             tkip: TkipCounts::default(),
             protected: ProtectedCounts::default(),
+            trace: JoinTrace::default(),
         })
     }
 
@@ -745,8 +818,10 @@ impl<D: Device> Realtek<D> {
     }
 
     fn depart(&mut self, ticket: Ticket, failure: Option<crate::wifi::station::Failure>) {
-        if failure.is_some() {
-            self.departed = failure;
+        if let Some(failure) = failure {
+            self.departed = Some(failure);
+            self.trace
+                .note(self.clock.now_us(), format_args!("left: {failure:?}"));
         }
         if let Some(failure) = failure
             && self.station.external_authentication().is_some()
@@ -1023,6 +1098,10 @@ impl<D: Device> Realtek<D> {
             if let Some(ticket) = ticket {
                 self.reporting = report;
                 self.report = self.report.wrapping_add(4);
+                self.trace.note(
+                    self.clock.now_us(),
+                    format_args!("sent {}", JoinTrace::frame(&bytes)),
+                );
                 self.station.submitted(ticket).map_err(Error::Station)?;
             }
         }
@@ -1375,6 +1454,8 @@ impl<D: Device> Realtek<D> {
                         }) => {
                             if self.reporting == Some(number) {
                                 self.reporting = None;
+                                let status = if acknowledged { "acked" } else { "unacked" };
+                                self.trace.note(now, format_args!("{status}"));
                                 self.station
                                     .management_status(acknowledged, now)
                                     .map_err(Error::Station)?;
@@ -1455,16 +1536,41 @@ impl<D: Device> Realtek<D> {
             return Ok(());
         }
         if header.control & 12 == 0 {
-            return self.management_frame(frame, now);
+            let multicast = header.receiver.is_multicast();
+            // `ieee80211_accept_frame`: a station takes what is addressed to
+            // it or to everyone; the chip hands over others' frames too.
+            if !multicast && header.receiver != self.address {
+                return Ok(());
+            }
+            if !multicast {
+                let heard = JoinTrace::frame(frame.bytes());
+                self.trace.note(now, format_args!("heard {heard}"));
+            }
+            let result = self.management_frame(frame, now);
+            if !multicast && let Err(error) = &result {
+                self.trace.note(now, format_args!("refused: {error}"));
+            }
+            return result;
         }
         if header.control & 12 != 8 || !header.data_present() {
             return Ok(());
         }
         if header.protected() {
             let multicast = header.receiver.is_multicast();
+            let ours = match multicast {
+                true => self
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| header.transmitter == Some(context.bssid())),
+                false => header.receiver == self.address,
+            };
             let kind = usize::from(multicast);
-            let counts = &mut self.protected;
-            counts.heard[kind] = counts.heard[kind].saturating_add(1);
+            let tally = |field: &mut [u32; 2]| {
+                if ours {
+                    field[kind] = field[kind].saturating_add(1);
+                }
+            };
+            tally(&mut self.protected.heard);
             let index = frame.bytes().get(header.length + 3).map(|byte| byte >> 6);
             let held = self
                 .keys
@@ -1472,11 +1578,11 @@ impl<D: Device> Realtek<D> {
                 .position(|key| key.pairwise != multicast && Some(key.index) == index);
             let installed = held.and_then(|held| Some((held, self.keys[held].slot.installed()?)));
             let Some((held, key)) = installed else {
-                counts.unkeyed[kind] = counts.unkeyed[kind].saturating_add(1);
+                tally(&mut self.protected.unkeyed);
                 return Ok(());
             };
             if frame.security.icv_error {
-                counts.icv[kind] = counts.icv[kind].saturating_add(1);
+                tally(&mut self.protected.icv);
                 return Ok(());
             }
             let tkip = self.keys[held].material.len() == Cipher::Tkip.key_length();
@@ -2048,7 +2154,8 @@ impl<D: Device> Link for Realtek<D> {
         });
         let protected = self.protected;
         let protected = (protected != ProtectedCounts::default()).then(|| format!("{protected}"));
-        let parts: Vec<String> = [departed, protected, tkip, self.device.diagnostic()]
+        let trace = (!self.trace.steps.is_empty()).then(|| format!("{}", self.trace));
+        let parts: Vec<String> = [departed, protected, tkip, trace, self.device.diagnostic()]
             .into_iter()
             .flatten()
             .collect();
@@ -2203,6 +2310,7 @@ impl<D: Device> Radio for Realtek<D> {
         let bss = observed.bss().clone();
         self.approach(&bss)?;
         let now = self.clock.now_us();
+        self.trace.begin(now);
         self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
         let mut policy = Admitted(&self.channels);
         let action = if join.request.pmf().is_some() {

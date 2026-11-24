@@ -1180,12 +1180,27 @@ fn a_mixed_wpa_station_leases_over_tkip_group_traffic_and_keeps_it_through_a_rek
 fn a_join_the_ap_left_unanswered_is_made_again_and_its_lease_hears_no_stale_failure() {
     let mut bench = bench(Protection::Mixed);
     bench.ap.unanswered = 3;
+    // The failed join's trace: three requests acknowledged, no answer.
+    assert!(bench.run(|bench| bench.diagnostic().contains("1 attempts failed")));
+    let diagnostic = bench.diagnostic();
+    assert!(
+        diagnostic.contains("1 attempts failed, the last at association"),
+        "{diagnostic}"
+    );
+    let trace = diagnostic
+        .split("last join: ")
+        .nth(1)
+        .and_then(|trace| trace.split(';').next())
+        .unwrap_or_else(|| panic!("no join trace: {diagnostic}"));
+    assert_eq!(trace.matches("sent assoc request").count(), 3, "{trace}");
+    assert_eq!(trace.matches(" acked").count(), 4, "{trace}");
+    assert!(trace.contains("heard authentication status=0"), "{trace}");
+    assert!(!trace.contains("assoc response"), "{trace}");
+    assert!(trace.ends_with("left: Timeout"), "{trace}");
     bench.join();
     assert_eq!(bench.ap.unanswered, 0);
     assert!(
-        bench
-            .diagnostic()
-            .contains("1 attempts failed, the last at association"),
+        bench.diagnostic().contains("heard assoc response status=0"),
         "{}",
         bench.diagnostic()
     );
