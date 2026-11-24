@@ -285,6 +285,12 @@ fn start(handoff: u64) -> Started {
         handoff.tsc_source,
         handoff.tsc_tolerance_ppm,
     );
+    // This image's stop starts without the power hardware the loader's was
+    // given: a stop here answered neither the power button nor a restart at
+    // the stop, and the PC waited for a forced power-off.
+    if let Some(power) = &handoff.power {
+        crate::stop::arm(power, handoff.tsc_hz);
+    }
     // Before any AP: the boot processor's class, its caches, clock and
     // memory, with its heap's buffer (`HOST SPEED`).
     super::speed::calibrate_once();
@@ -360,6 +366,22 @@ fn start(handoff: u64) -> Started {
         Ok(options) => options,
         Err(error) => output::fatal(error),
     };
+    // As the loader asks of its own stop: the engine's restarts the PC too.
+    if options.restart_at_stop || options.wifi_check {
+        crate::stop::restart_at_stop();
+    }
+    output::arguments(format_args!(
+        "HOST STOP button={} reset={:?} restart_at_stop={}\n",
+        handoff
+            .power
+            .as_ref()
+            .map_or("none", |power| match power.pm1[0] {
+                Some(_) => "pm1",
+                None => "none",
+            }),
+        handoff.power.as_ref().and_then(|power| power.reset),
+        options.restart_at_stop || options.wifi_check,
+    ));
     // A profile names the code holding the heap's blocks past the size
     // classes, not only its largest.
     if options.profile {

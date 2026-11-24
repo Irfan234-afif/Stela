@@ -28,6 +28,8 @@ const KEYBOARD_BURST: usize = 32;
 const ASSUMED_TSC_HZ: u64 = 2_000_000_000;
 const KEYBOARD_INPUT_FULL: u8 = 1 << 1;
 const KEYBOARD_PULSE_RESET: u8 = 0xfe;
+/// The PCH's and FCH's reset control register.
+const RESET_CONTROL: u16 = 0xcf9;
 
 /// How often a stopped boot reads the button. The status bit stays set
 /// until written, so no press is lost between reads.
@@ -198,12 +200,23 @@ pub(crate) fn wait() -> ! {
     }
 }
 
-/// Restart the PC: the FADT's reset register, then the 8042 keyboard
-/// controller's reset pulse, then a triple fault, each given half a second.
+/// Restart the PC: the FADT's reset register, then, unless that was it, the
+/// chipset's reset control at 0xcf9 as Linux's `BOOT_CF9_FORCE` writes it,
+/// then the 8042 keyboard controller's reset pulse, then a triple fault,
+/// each given half a second.
 pub(crate) fn restart(reset: Option<(ResetRegister, u8)>) -> ! {
     if let Some((register, value)) = reset {
         // SAFETY: the FADT's reset register; the machine resets.
         unsafe { write_reset(register, value) };
+        spin(500);
+    }
+    if !matches!(reset, Some((ResetRegister::Io(RESET_CONTROL), _))) {
+        // A hard reset: SYS_RST set first, then RST_CPU with it, keeping
+        // the register's other bits.
+        let kept = Io.in8(RESET_CONTROL) & !0x0e;
+        Io.out8(RESET_CONTROL, kept | 0x02);
+        spin(1);
+        Io.out8(RESET_CONTROL, kept | 0x0e);
         spin(500);
     }
     if Io.in8(KEYBOARD_STATUS) != 0xff {
