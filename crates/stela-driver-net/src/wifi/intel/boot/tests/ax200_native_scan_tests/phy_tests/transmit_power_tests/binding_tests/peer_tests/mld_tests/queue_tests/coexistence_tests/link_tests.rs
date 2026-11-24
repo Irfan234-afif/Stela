@@ -749,6 +749,7 @@ fn raise_as<'n>(
             ssid: b"test".to_vec(),
             secret,
             country,
+            band: None,
         },
         entropy: Arc::new(FixedEntropy::default()),
     };

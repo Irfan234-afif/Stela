@@ -63,6 +63,7 @@ fn join() -> Join {
             ssid: SSID.to_vec(),
             secret: Secret::Psk(Zeroizing::new([0; 32])),
             country: Some(*b"ID"),
+            band: None,
         },
         country: regdb(&[(*b"ID", &rules)]).select(*b"ID").unwrap(),
         entropy: Arc::new(FixedEntropy::default()),

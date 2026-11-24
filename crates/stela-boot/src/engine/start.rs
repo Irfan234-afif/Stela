@@ -3082,6 +3082,7 @@ fn wifi_network(
         ssid: ssid.as_bytes().to_vec(),
         secret,
         country,
+        band: options.wifi_band.map(|band| band.0),
     })
 }
 

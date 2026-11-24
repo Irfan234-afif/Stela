@@ -370,6 +370,7 @@ fn wifi(rules: &[(u32, u32, u8, u16)], channel: u16) -> (Wifi<Model>, Model) {
         ssid: SSID.to_vec(),
         secret: Secret::Psk(Zeroizing::new([0; 32])),
         country: None,
+        band: None,
     };
     let radio = Realtek::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
     (

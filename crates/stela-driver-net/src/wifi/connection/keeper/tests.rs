@@ -206,6 +206,7 @@ impl<const TKIP: bool> Scripted<TKIP> {
             ssid: b"test".to_vec(),
             secret: Secret::Psk(Zeroizing::new([0; 32])),
             country: None,
+            band: None,
         };
         let clock = Clock {
             ticks_per_microsecond: 1,
@@ -450,4 +451,38 @@ fn a_kept_station_waits_longer_than_its_radio_or_a_wired_phy() {
     let keeper = Scripted::<false>::hearing(mixed());
     assert_eq!(keeper.link.carrier_wait_us(), crate::WIRED_CARRIER_WAIT_US);
     assert!(keeper.carrier_wait_us() > crate::WIRED_CARRIER_WAIT_US);
+}
+
+/// The user's AP: its 2.4 GHz BSS heard stronger than its 5 GHz one.
+#[test]
+fn a_network_held_to_a_band_is_joined_on_that_band_alone() {
+    let five = Bss {
+        bssid: Mac([2, 0, 0, 0, 0, 2]),
+        channel: CHANNEL_44,
+        signal_dbm: Some(-55),
+        ..mixed()
+    };
+    let chosen = |keeper: &Keeper<Scripted<true>>| keeper.progress().chosen.map(|c| c.channel);
+    // Held to no band: the strongest BSS, on 2.4 GHz.
+    let mut keeper = Scripted::<true>::hearing(mixed());
+    keeper.link.bss.push(five.clone());
+    assert_eq!(first_failure(&mut keeper), "no advertisement");
+    assert_eq!(chosen(&keeper), Some(CHANNEL_1));
+    // Held to 5 GHz: the weaker BSS there.
+    let mut keeper = Scripted::<true>::hearing(mixed());
+    keeper.link.bss.push(five);
+    keeper.network.band = Some(Band::Ghz5);
+    assert_eq!(first_failure(&mut keeper), "no advertisement");
+    assert_eq!(chosen(&keeper), Some(CHANNEL_44));
+    // Held to 6 GHz, where the network is not: refused before it is asked
+    // for an advertisement, and its next scan does not ask for it by name.
+    let mut keeper = Scripted::<true>::hearing(mixed());
+    keeper.network.band = Some(Band::Ghz6);
+    assert_eq!(
+        first_failure(&mut keeper),
+        "scripted: test is heard only off the 6 GHz band it is held to"
+    );
+    assert_eq!(keeper.link.advertised.get(), 0);
+    assert_eq!(chosen(&keeper), None);
+    assert!(!keeper.directed);
 }

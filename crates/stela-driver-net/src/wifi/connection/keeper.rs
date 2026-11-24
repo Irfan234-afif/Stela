@@ -395,6 +395,15 @@ fn failure_delay_us(failures: u32) -> u64 {
     seconds * 1_000_000
 }
 
+/// A band as a report names it.
+fn band_name(band: Band) -> &'static str {
+    match band {
+        Band::Ghz2 => "2.4 GHz",
+        Band::Ghz5 => "5 GHz",
+        Band::Ghz6 => "6 GHz",
+    }
+}
+
 /// `cfg80211_6ghz_power_type_valid`: whether a client may use the 6 GHz
 /// `bss` under the flags its channel has among `channels`.
 fn power_type_usable(bss: &Bss, channels: &[(Channel, u32)]) -> bool {
@@ -907,7 +916,8 @@ impl<R: Radio> Keeper<R> {
 
     /// Join the strongest BSS of the network whose security the station
     /// supports, after an SAE exchange when that is the security. A 6 GHz
-    /// BSS whose power type its channel bars is not one cfg80211 connects to.
+    /// BSS whose power type its channel bars is not one cfg80211 connects
+    /// to, and a network held to one band is joined only on that band.
     fn choose(&mut self, now: u64) {
         let mut best: Option<(R::Handle, &Bss, Security)> = None;
         let mut refusal = None;
@@ -916,6 +926,16 @@ impl<R: Radio> Keeper<R> {
         let observed = self.link.bss();
         for &(handle, bss) in &observed {
             if bss.ssid.as_deref() != Some(&self.network.ssid[..]) {
+                continue;
+            }
+            if let Some(band) = self.network.band.filter(|&band| band != bss.channel.band) {
+                // Why a BSS on the band was refused says more, when one was.
+                refusal.get_or_insert_with(|| {
+                    format!(
+                        "is heard only off the {} band it is held to",
+                        band_name(band)
+                    )
+                });
                 continue;
             }
             if bss.channel.band == Band::Ghz6 && !power_type_usable(bss, &six) {

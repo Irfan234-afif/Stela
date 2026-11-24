@@ -4221,6 +4221,7 @@ mod tests {
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
             country: None,
+            band: None,
         };
         let address = Address {
             segment: 0,
@@ -4436,6 +4437,7 @@ mod tests {
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
             country: None,
+            band: None,
         };
         let address = Address {
             segment: 0,
@@ -4539,6 +4541,7 @@ mod tests {
             ssid: b"test".to_vec(),
             secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
             country: None,
+            band: None,
         };
         let address = Address {
             segment: 0,

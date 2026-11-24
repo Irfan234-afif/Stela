@@ -223,6 +223,7 @@ fn secondary_igtk_waits_for_the_keepers_last_handshake_reply() {
             ssid: b"x".to_vec(),
             secret: Secret::parse(b"correct horse battery").unwrap(),
             country: None,
+            band: None,
         },
         Arc::new(Fixed),
         crate::Clock {

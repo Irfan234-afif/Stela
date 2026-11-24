@@ -411,6 +411,33 @@ fn wifi_names_escape_spaces_and_the_key_path_defaults() {
 }
 
 #[test]
+fn the_wifi_band_names_one_band_in_ghz_round_trips_and_needs_a_network() {
+    use stela_drivers::net::wifi::Band;
+    for (word, band) in [("2.4", Band::Ghz2), ("5", Band::Ghz5), ("6", Band::Ghz6)] {
+        let text = format!("--system --wifi home --wifi-country ID --wifi-band {word}");
+        let options = round_trip(&text);
+        assert_eq!(options.wifi_band, Some(WifiBand(band)), "{text}");
+        assert_eq!(options.to_string(), text);
+    }
+    assert_eq!(System::default().wifi_band, None);
+    for word in ["2", "2.4GHz", "5.0", "60", ""] {
+        assert_eq!(
+            System::parse(&format!("--system --wifi home --wifi-band {word}")).unwrap_err(),
+            Error::WifiBand,
+            "{word}"
+        );
+    }
+    assert_eq!(
+        System::parse("--system --wifi home --wifi-band 5 --wifi-band 2.4").unwrap_err(),
+        Error::DuplicateWifiBand
+    );
+    assert_eq!(
+        System::parse("--system --wifi-band 5").unwrap_err(),
+        Error::Constraint(Constraint::WifiDependency)
+    );
+}
+
+#[test]
 fn static_ipv4_and_dns_round_trip_and_stay_in_their_subnet() {
     let text = "--system --ipv4 192.168.1.20/24 --ipv4-gateway 192.168.1.1 --dns 1.1.1.1,2606:4700:4700::1111";
     let options = round_trip(text);

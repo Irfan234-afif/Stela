@@ -57,6 +57,8 @@ pub enum Error {
     DuplicateWifiKey,
     WifiCountry,
     DuplicateWifiCountry,
+    WifiBand,
+    DuplicateWifiBand,
     Usb4Approve,
     DuplicateUsb4Approve,
     Ipv4,
@@ -185,6 +187,8 @@ impl Error {
             Self::DuplicateWifiKey => "duplicate --wifi-key",
             Self::WifiCountry => "--wifi-country needs a two-letter country",
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
+            Self::WifiBand => "--wifi-band needs a band in GHz: 2.4, 5 or 6",
+            Self::DuplicateWifiBand => "duplicate --wifi-band",
             Self::Usb4Approve => "--usb4-approve needs a device UUID",
             Self::DuplicateUsb4Approve => "duplicate --usb4-approve",
             Self::Ipv4 => "--ipv4 needs a host ADDRESS/PREFIX, such as 192.168.1.20/24",
@@ -252,7 +256,9 @@ impl Constraint {
                 "--restore-study requires --bundle, --storage, --restore-source, --restore-manifest and --restore-identity; refuses --preboot/--survey"
             }
             Self::UnexpectedRestoreInputs => "restore inputs require explicit --restore-study",
-            Self::WifiDependency => "--wifi-key and --wifi-country configure a --wifi network",
+            Self::WifiDependency => {
+                "--wifi-key, --wifi-country and --wifi-band configure a --wifi network"
+            }
             Self::WifiCheckChannelDependency => "--wifi-check-channel configures the --wifi-check",
             Self::WifiCheckSerDependency => "--wifi-check-ser extends the --wifi-check",
             Self::Ipv4Gateway => "--ipv4-gateway needs --ipv4 and another address of its subnet",

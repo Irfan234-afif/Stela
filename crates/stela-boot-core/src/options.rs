@@ -46,6 +46,7 @@ pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
+pub const WIFI_BAND: &str = "--wifi-band";
 pub const WIFI_CHECK_CHANNEL: &str = "--wifi-check-channel";
 pub const WIFI_CHECK_SER: &str = "--wifi-check-ser";
 pub const USB4_APPROVE: &str = "--usb4-approve";
@@ -352,6 +353,10 @@ pub struct System {
     /// The ISO 3166-1 alpha-2 regulatory country, uppercase
     /// (`--wifi-country XX`).
     pub wifi_country: Option<String>,
+    /// The one band the network is joined on, as wpa_supplicant's
+    /// `setband` holds a station to it (`--wifi-band 2.4|5|6`); without it,
+    /// the network's strongest BSS on any band.
+    pub wifi_band: Option<WifiBand>,
     /// The mount network's IPv4 address, set by hand instead of by DHCP
     /// (`--ipv4 ADDRESS/PREFIX`).
     pub ipv4: Option<StaticIpv4>,
@@ -442,6 +447,7 @@ impl Default for System {
             ssid: None,
             wifi_key: None,
             wifi_country: None,
+            wifi_band: None,
             ipv4: None,
             ipv4_gateway: None,
             dns: Vec::new(),
@@ -498,6 +504,33 @@ impl StaticIpv4 {
 impl fmt::Display for StaticIpv4 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.address, self.prefix)
+    }
+}
+
+/// A `--wifi-band` word: the band's frequency in GHz, `2.4`, `5` or `6`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiBand(pub stela_drivers::net::wifi::Band);
+
+impl WifiBand {
+    pub fn parse(word: &str) -> Option<Self> {
+        use stela_drivers::net::wifi::Band;
+        Some(Self(match word {
+            "2.4" => Band::Ghz2,
+            "5" => Band::Ghz5,
+            "6" => Band::Ghz6,
+            _ => return None,
+        }))
+    }
+}
+
+impl fmt::Display for WifiBand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use stela_drivers::net::wifi::Band;
+        f.write_str(match self.0 {
+            Band::Ghz2 => "2.4",
+            Band::Ghz5 => "5",
+            Band::Ghz6 => "6",
+        })
     }
 }
 
@@ -912,6 +945,7 @@ impl fmt::Display for System {
                 .filter(|&path| path != DEFAULT_WIFI_KEY),
         )?;
         line.value(WIFI_COUNTRY, self.wifi_country.as_deref())?;
+        line.value(WIFI_BAND, self.wifi_band)?;
         line.value(IPV4, self.ipv4)?;
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;

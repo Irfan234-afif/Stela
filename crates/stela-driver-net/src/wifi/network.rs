@@ -1,6 +1,7 @@
 //! The Wi-Fi network the mount's configuration names (`--wifi`, `--wifi-key`,
-//! `--wifi-country`), for whichever Wi-Fi adapter joins it. The secret
-//! never appears in `Debug` output.
+//! `--wifi-country`, `--wifi-band`), for whichever Wi-Fi adapter joins it.
+//! The secret never appears in `Debug` output.
+use super::Band;
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 use zeroize::Zeroizing;
@@ -17,6 +18,10 @@ pub struct Network {
     /// An ISO 3166 alpha-2 country code in uppercase ASCII; none leaves the
     /// adapter firmware's default regulatory domain.
     pub country: Option<[u8; 2]>,
+    /// The band whose BSSes the station joins (`--wifi-band`), as
+    /// wpa_supplicant's `setband` holds a station to one; none joins the
+    /// network's strongest BSS on any band.
+    pub band: Option<Band>,
 }
 
 impl fmt::Debug for Network {
@@ -28,6 +33,7 @@ impl fmt::Debug for Network {
                 "country",
                 &self.country.map(|code| [code[0] as char, code[1] as char]),
             )
+            .field("band", &self.band)
             .finish()
     }
 }
@@ -181,6 +187,7 @@ mod tests {
             ssid: b"Home".to_vec(),
             secret: Secret::parse(b"hunter22").unwrap(),
             country: Some(*b"US"),
+            band: None,
         };
         let shown = alloc::format!("{config:?}");
         assert!(shown.contains("Home") && !shown.contains("hunter22"));

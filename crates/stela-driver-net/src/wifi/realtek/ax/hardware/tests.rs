@@ -140,6 +140,7 @@ fn bench(protection: Protection) -> Bench {
         ssid: SSID.to_vec(),
         secret,
         country: None,
+        band: None,
     };
     let radio = Realtek::new(hardware, local, country, CLOCK).unwrap();
     Bench {
