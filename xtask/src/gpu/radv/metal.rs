@@ -236,6 +236,7 @@ fn service(hosted: &Hosted, physical: vk::PhysicalDevice) -> Result<Service> {
         decode_pvrtc_kernel: entry!("stela_metal_decode_pvrtc_kernel"),
         reorder_blocks_kernel: entry!("stela_metal_reorder_blocks_kernel"),
         decode_astc_kernel: entry!("stela_metal_decode_astc_kernel"),
+        compose_kernel: entry!("stela_metal_compose_kernel"),
         release: entry!("stela_metal_release"),
         buffer_reads: entry!("stela_metal_buffer_reads"),
         nir_options,
