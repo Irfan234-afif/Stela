@@ -162,7 +162,9 @@ pub(crate) fn wait() -> ! {
         .load(Ordering::Acquire)
         .then_some(RESTART_AT_STOP_MILLIS / BUTTON_MILLIS);
     let button = power.filter(|power| power.acpi_mode(&mut Io));
-    let keyboard = Io.in8(KEYBOARD_STATUS) != 0xff;
+    // A run that restarts by itself never reads the 8042's ports, which a
+    // PC without one may trap to its firmware's USB keyboard emulation.
+    let keyboard = restart_after.is_none() && Io.in8(KEYBOARD_STATUS) != 0xff;
     if button.is_none() && !keyboard {
         if restart_after.is_some() {
             spin(RESTART_AT_STOP_MILLIS);
@@ -200,26 +202,34 @@ pub(crate) fn wait() -> ! {
     }
 }
 
-/// Restart the PC: the FADT's reset register, then, unless that was it, the
-/// chipset's reset control at 0xcf9 as Linux's `BOOT_CF9_FORCE` writes it,
-/// then the 8042 keyboard controller's reset pulse, then a triple fault,
-/// each given half a second.
+/// Restart the PC: the chipset's reset control at 0xcf9 as Linux's
+/// `BOOT_CF9_FORCE` writes it for a cold reboot, then the FADT's reset
+/// register, then the 8042 keyboard controller's reset pulse, then a
+/// triple fault, each given half a second. 0xcf9 goes first: a FADT may
+/// name the firmware's SMI command port instead (an AMI firmware on AMD's
+/// FCH names 0xb2 = 0xbe), whose handler writes 0xcf9 itself if it runs. An
+/// FCH watchdog an unattended run armed is stopped first, so the reset
+/// leaves it off, and counts again if the PC is still running.
 pub(crate) fn restart(reset: Option<(ResetRegister, u8)>) -> ! {
-    if let Some((register, value)) = reset {
+    let watchdog = crate::fch_watchdog::stop();
+    // A full reset: SYS_RST first, then RST_CPU and FULL_RST with it,
+    // keeping the register's other bits.
+    let kept = Io.in8(RESET_CONTROL) & !0x0e;
+    Io.out8(RESET_CONTROL, kept | 0x02);
+    spin(1);
+    Io.out8(RESET_CONTROL, kept | 0x0e);
+    spin(500);
+    if watchdog {
+        crate::fch_watchdog::rearm(stela_boot_core::fch_watchdog::RESTART_SECONDS);
+    }
+    if let Some((register, value)) = reset
+        && register != ResetRegister::Io(RESET_CONTROL)
+    {
         // SAFETY: the FADT's reset register; the machine resets.
         unsafe { write_reset(register, value) };
         spin(500);
     }
-    if !matches!(reset, Some((ResetRegister::Io(RESET_CONTROL), _))) {
-        // A hard reset: SYS_RST set first, then RST_CPU with it, keeping
-        // the register's other bits.
-        let kept = Io.in8(RESET_CONTROL) & !0x0e;
-        Io.out8(RESET_CONTROL, kept | 0x02);
-        spin(1);
-        Io.out8(RESET_CONTROL, kept | 0x0e);
-        spin(500);
-    }
-    if Io.in8(KEYBOARD_STATUS) != 0xff {
+    if !RESTART_AT_STOP.load(Ordering::Acquire) && Io.in8(KEYBOARD_STATUS) != 0xff {
         for _ in 0..100 {
             if Io.in8(KEYBOARD_STATUS) & KEYBOARD_INPUT_FULL == 0 {
                 break;

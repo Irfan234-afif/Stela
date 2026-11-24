@@ -30,6 +30,7 @@ mod console;
 mod cpu;
 mod engine;
 mod entropy;
+mod fch_watchdog;
 mod file_kind;
 mod firmware;
 mod handoff;

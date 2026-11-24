@@ -454,6 +454,14 @@ struct Runtime {
 }
 
 impl Runtime {
+    /// Whether one runtime region holds `start..end`: [`Self::map`] maps
+    /// each by identity, so the engine's tables reach those bytes.
+    fn maps(&self, start: u64, end: u64) -> bool {
+        self.descriptors
+            .iter()
+            .any(|&(region, pages, _, _)| region <= start && end <= region + pages * PAGE)
+    }
+
     /// Read before boot services end. Without SetVirtualAddressMap the
     /// firmware's runtime services run at their physical addresses.
     fn capture() -> Result<Self> {
@@ -658,6 +666,9 @@ pub(crate) fn boot(
     host_firmware: crate::host_firmware::Resources,
     snapshot: Option<Snapshot>,
 ) -> ! {
+    // An unattended run hands the PC back however it ends: its stop
+    // restarts it, and a hang before any stop meets the FCH's watchdog.
+    crate::fch_watchdog::arm_unattended(&options);
     // NVRAM chooses macOS or recoveryOS before any input is read. A machine
     // NVRAM holds in recovery mode waits at the startup choices, as LLB
     // waits for a restore host, until one that boots is chosen.
@@ -1163,6 +1174,10 @@ fn load(
             storage,
             host_firmware,
             power,
+            fch_watchdog: crate::fch_watchdog::hand_over(runtime.maps(
+                stela_boot_core::fch_watchdog::PM,
+                stela_boot_core::fch_watchdog::PM + stela_boot_core::fch_watchdog::SPAN,
+            )),
             efi_reset: runtime.reset,
             rsdp: storage::rsdp().unwrap_or(0),
             wifi_key: Region {

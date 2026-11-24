@@ -37,6 +37,7 @@ pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
 pub mod exit_times;
+pub mod fch_watchdog;
 #[cfg(target_arch = "x86_64")]
 pub mod fiber;
 pub mod file_kind;

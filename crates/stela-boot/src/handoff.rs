@@ -97,6 +97,9 @@ pub struct Handoff {
     pub host_firmware: crate::host_firmware::Resources,
     /// The host's ACPI power hardware, when its FADT is usable.
     pub power: Option<pc::power::HostPower>,
+    /// The FCH watchdog an unattended run armed runs, and a runtime region
+    /// maps its registers by identity (`fch_watchdog::hand_over`).
+    pub fch_watchdog: bool,
     /// The firmware's `ResetSystem` runtime service, whose regions the
     /// loader keeps mapped by identity; zero without one.
     pub efi_reset: u64,
