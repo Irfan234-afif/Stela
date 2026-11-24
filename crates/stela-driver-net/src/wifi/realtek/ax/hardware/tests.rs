@@ -1197,14 +1197,24 @@ fn a_join_the_ap_left_unanswered_is_made_again_and_its_lease_hears_no_stale_fail
     assert_eq!(trace.matches(" acked").count(), 4, "{trace}");
     assert!(trace.contains("heard authentication status=0"), "{trace}");
     assert!(!trace.contains("assoc response"), "{trace}");
+    assert!(trace.starts_with("+0 on channel "), "{trace}");
     assert!(trace.ends_with("left: Timeout"), "{trace}");
     bench.join();
     assert_eq!(bench.ap.unanswered, 0);
-    assert!(
-        bench.diagnostic().contains("heard assoc response status=0"),
-        "{}",
-        bench.diagnostic()
-    );
+    // The join that worked, and the failed one before it, each with its
+    // channel.
+    let diagnostic = bench.diagnostic();
+    let joined = |label: &str| {
+        diagnostic
+            .split(label)
+            .nth(1)
+            .and_then(|trace| trace.split(';').next())
+            .unwrap_or_else(|| panic!("no {label}: {diagnostic}"))
+    };
+    let last = joined("last join: ");
+    assert!(last.starts_with("+0 on channel "), "{last}");
+    assert!(last.contains("heard assoc response status=0"), "{last}");
+    assert!(joined("join before: ").starts_with(trace), "{diagnostic}");
     let mut ethernet = vec![0xff; 6];
     ethernet.extend(bench.local.0);
     ethernet.extend([8, 0]);

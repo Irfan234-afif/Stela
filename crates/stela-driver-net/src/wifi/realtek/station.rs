@@ -451,12 +451,13 @@ impl core::fmt::Display for ProtectedCounts {
 /// The most steps a [`JoinTrace`] keeps.
 const JOIN_TRACE: usize = 24;
 
-/// What the last join exchanged with its AP, so that a diagnostic tells an
-/// AP that never answered from an answer the station refused: each
-/// authentication or association request handed to the chip, its release
-/// report, each management frame to the station's address with its status
-/// or reason field, and why the station refused one. Each step carries the
-/// milliseconds since the join began; the first [`JOIN_TRACE`] are kept.
+/// What a join exchanged with its AP, so that a diagnostic tells an AP that
+/// never answered from an answer the station refused: the channel it joined
+/// on, each authentication or association request handed to the chip, its
+/// release report, each management frame to the station's address with its
+/// status or reason field, and why the station refused one. Each step
+/// carries the milliseconds since the join began; the first [`JOIN_TRACE`]
+/// are kept.
 #[derive(Debug, Default)]
 struct JoinTrace {
     began: u64,
@@ -510,7 +511,7 @@ impl JoinTrace {
 
 impl fmt::Display for JoinTrace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "last join: {}", self.steps.join(", "))?;
+        f.write_str(&self.steps.join(", "))?;
         if self.more > 0 {
             write!(f, " (+{} steps)", self.more)?;
         }
@@ -725,7 +726,10 @@ pub struct Realtek<D: Device> {
     departed: Option<crate::wifi::station::Failure>,
     tkip: TkipCounts,
     protected: ProtectedCounts,
+    /// The last join's steps, and the steps of the join before it: the
+    /// failed one a join that worked was made again after, when it was.
     trace: JoinTrace,
+    trace_before: Option<JoinTrace>,
     pending_join: Option<PendingJoin>,
 }
 
@@ -778,6 +782,7 @@ impl<D: Device> Realtek<D> {
             tkip: TkipCounts::default(),
             protected: ProtectedCounts::default(),
             trace: JoinTrace::default(),
+            trace_before: None,
             pending_join: None,
         })
     }
@@ -2253,11 +2258,22 @@ impl<D: Device> Link for Realtek<D> {
         });
         let protected = self.protected;
         let protected = (protected != ProtectedCounts::default()).then(|| format!("{protected}"));
-        let trace = (!self.trace.steps.is_empty()).then(|| format!("{}", self.trace));
-        let parts: Vec<String> = [departed, protected, tkip, trace, self.device.diagnostic()]
-            .into_iter()
-            .flatten()
-            .collect();
+        let trace = (!self.trace.steps.is_empty()).then(|| format!("last join: {}", self.trace));
+        let before = self
+            .trace_before
+            .as_ref()
+            .map(|trace| format!("join before: {trace}"));
+        let parts: Vec<String> = [
+            departed,
+            protected,
+            tkip,
+            trace,
+            before,
+            self.device.diagnostic(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         (!parts.is_empty()).then(|| parts.join("; "))
     }
 }
@@ -2411,7 +2427,18 @@ impl<D: Device> Radio for Realtek<D> {
         let bss = self.observed(handle)?.bss().clone();
         self.approach(&bss)?;
         let now = self.clock.now_us();
+        let last = core::mem::take(&mut self.trace);
+        if !last.steps.is_empty() {
+            self.trace_before = Some(last);
+        }
         self.trace.begin(now);
+        self.trace.note(
+            now,
+            format_args!(
+                "on channel {} ({} MHz)",
+                bss.channel.number, bss.channel.frequency_mhz
+            ),
+        );
         if bss.kind == ScanKind::Beacon {
             return self.begin(handle, join, now);
         }
