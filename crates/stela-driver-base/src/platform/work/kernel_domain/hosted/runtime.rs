@@ -182,6 +182,10 @@ impl<const N: usize> HostedExecutor<N> {
         layout.validate(count, N)?;
         // This switch backend uses RET with a replacement RSP. Linux reports
         // the actual shadow-stack state of this thread through arch_prctl.
+        // A kernel built without user shadow stacks (no
+        // CONFIG_X86_USER_SHADOW_STACK, as WSL2's, or one before 6.6) refuses
+        // the option with EINVAL: no thread can have one there.
+        const EINVAL: i64 = -22;
         let mut features = 0u64;
         // SAFETY: Linux x86-64 arch_prctl(ARCH_SHSTK_STATUS, &features).
         let result = unsafe {
@@ -193,7 +197,7 @@ impl<const N: usize> HostedExecutor<N> {
             );
             result
         };
-        if result != 0 || features != 0 {
+        if !matches!(result, 0 | EINVAL) || features != 0 {
             return Err(WorkError::Unavailable);
         }
         // SAFETY: reads the current thread's user-accessible FP controls.
