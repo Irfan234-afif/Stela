@@ -743,6 +743,9 @@ fn translation_store(
             mb(read),
             mb(held)
         )),
+        PackRead::OnDisk { held, .. } => {
+            crate::status::done(&format!("{} MB, read as macOS asks for it", mb(held)))
+        }
         PackRead::Whole(bytes) if store.writable => {
             crate::status::done(&format!("{} MB", mb(bytes)));
         }
@@ -766,6 +769,16 @@ fn translation_store(
         if store.writable && storage.is_none() {
             storage = storage::discover().ok();
         }
+    }
+    // The previous version's translations, for this first boot of a new
+    // one to compile again ahead of use.
+    if let Some(previous) = store.previous
+        && files.len() < MAX_FILES
+    {
+        files.push((
+            String::from(crate::engine::translations::PREVIOUS_FILE),
+            previous,
+        ));
     }
     (files, storage)
 }
@@ -867,6 +880,7 @@ fn load(
         gpu,
         pages,
         pages_held,
+        kept_code,
         native_resources,
         native_task_allocations,
         stack,
@@ -1111,6 +1125,7 @@ fn load(
             files,
             file_count,
             heap,
+            kept_code,
             stack,
             code,
             pool,

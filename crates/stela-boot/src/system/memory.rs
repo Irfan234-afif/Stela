@@ -39,6 +39,9 @@ pub(super) struct EngineMemory {
     pub pages: u64,
     /// The plan holds Linux to `pages` (`host_memory::held_bound`).
     pub pages_held: bool,
+    /// The heap bytes for compiled code beside the window
+    /// (`host_memory::Sizes::kept`).
+    pub kept_code: u64,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -145,15 +148,20 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let free = free_ram()?;
     let plan = crate::storage::gpu_plan();
     let gpu = plan.memory;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores, plan)?;
+    // A pack read on demand left part of its budget free: the window and
+    // the guest share it, beside the GPU's share.
+    let room = crate::engine::translations::PACK_ROOM.load(core::sync::atomic::Ordering::Acquire);
+    let sizes = stela_boot_core::host_memory::sizes_with_room(free, cores, cores, plan, room)?;
     let pages = stela_boot_core::host_memory::page_bound(&sizes, gpu);
     let held = stela_boot_core::host_memory::held_bound(&sizes, plan);
     output::arguments(format_args!(
-        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M gpu={}M aperture={}M \
-         pages={}\n",
+        "HOST MEMORY free={}M heap={}M code={}M window={}M kept={}M pool={}M guest={}M gpu={}M \
+         aperture={}M pages={}\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
+        sizes.code.window >> 20,
+        sizes.kept >> 20,
         sizes.pool >> 20,
         sizes.guest >> 20,
         sizes.gpu >> 20,
@@ -248,6 +256,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         gpu: if gpu.limits_pages() { sizes.gpu } else { 0 },
         pages,
         pages_held: held.is_some(),
+        kept_code: sizes.kept,
         native_resources,
         native_task_allocations,
         stack,

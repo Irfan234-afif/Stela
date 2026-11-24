@@ -356,7 +356,8 @@ impl Workload {
                 Command::StoreTexels { .. }
                 | Command::LoadTexels { .. }
                 | Command::DecodeBlocks { .. }
-                | Command::ReorderBlocks { .. } => self.transfers += 1,
+                | Command::ReorderBlocks { .. }
+                | Command::Compose { .. } => self.transfers += 1,
                 _ => {}
             }
         }
@@ -801,6 +802,9 @@ pub struct CommandBuffer {
     pub(crate) written: Vec<super::device::TextureId>,
     /// The IOSurface objects it uses, as the guest reported them.
     pub(crate) surfaces: Vec<super::device::SurfaceNote>,
+    /// The IOSurface objects kept in device memory it does not use whose
+    /// surface's seed changed since the guest last reported them.
+    pub(crate) seeds: Vec<super::device::SurfaceNote>,
 }
 
 impl CommandBuffer {
@@ -816,6 +820,7 @@ impl CommandBuffer {
             aligned_writes: Vec::new(),
             written: Vec::new(),
             surfaces: Vec::new(),
+            seeds: Vec::new(),
         }
     }
 

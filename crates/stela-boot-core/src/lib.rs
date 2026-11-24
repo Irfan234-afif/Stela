@@ -117,6 +117,7 @@ pub mod root_transition;
 pub mod running_record;
 pub mod screen;
 pub mod service_watch;
+pub mod shadow_fills;
 pub mod shutdown;
 pub mod smi;
 pub mod source_health;
