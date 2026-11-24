@@ -2443,6 +2443,240 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "power_on_and_off_register_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/power/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_POWER_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw8852b power C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "dlfw_quota_register_trace_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/dle/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_MAC_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 DMAC pre-init C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "coex_init_and_grant_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/coex/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_COEX_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 WL-only coex init C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "scc_init_register_trace_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/mac/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_MAC_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 full MAC init C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "channel_switch_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rtw8852b/channel/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_CHANNEL_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RTL8852B channel switch C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "pre_init_register_trace_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/pci/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_PCI_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 PCIe pre-init and ring C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "interrupt_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/interrupt/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_PCI_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 PCIe interrupt C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "h2c_headers_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_H2C_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 H2C, TXWD and C2H C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "station_h2c_bytes_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/station/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_H2C_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 station role, CAM and CMAC table H2C C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "fwdl_packets_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/fwdl/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES",
+      "STELA_RTW89_FWDL_ORACLE"
+    ],
+    "reason": "requires the pinned rtw8852b_fw-2.bin and the unchanged pinned rtw89 firmware download C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "efuse_decode_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/efuse/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_EFUSE_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 efuse, phycap and register mailbox C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "pinned_firmware_elements_build_the_tables_linux_builds",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/elements/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES",
+      "STELA_RTW89_ELEMENTS_ORACLE"
+    ],
+    "reason": "requires the pinned rtw8852b_fw-2.bin and the unchanged pinned rtw89 firmware element C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "rfk_init_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rtw8852b/rfk/calibration_tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RFK_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RTL8852B RF calibration C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "iqk_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rtw8852b/rfk/calibration_tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RFK_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RTL8852B IQ calibration C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "txpower_writes_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/txpower/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES",
+      "STELA_RTW89_TXPWR_ORACLE"
+    ],
+    "reason": "requires the pinned rtw8852b_fw-2.bin and the unchanged pinned rtw89 TX power and regulation C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "bb_and_rf_loads_match_unchanged_c_for_each_cut_and_rfe",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES",
+      "STELA_RTW89_PHY_ORACLE"
+    ],
+    "reason": "requires the pinned rtw8852b_fw-2.bin and the unchanged pinned rtw89 BB and RF table load C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "dig_and_cfo_tracking_match_unchanged_c_for_each_scripted_period",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/dynamic/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_PHY_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 DIG, CFO and environment monitor tracking C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "tssi_dpk_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rtw8852b/rfk/calibration_tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RFK_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RTL8852B TSSI, DPK and per-channel calibration C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "dpk_track_traces_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rtw8852b/rfk/calibration_tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RFK_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RTL8852B DPK tracking C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "rxdesc_matches_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/rxdesc/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_TRX_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 AX RX descriptor and PPDU status C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "txwd_addr_info_and_rpp_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/pci/release/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_TRX_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 AX TX descriptor, WD page, address info, kick-off and release report C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "ra_ba_cam_and_report_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/h2c/ra/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RA_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 RA, BA CAM and RA report C oracle"
+  },
+  {
+    "package": "stela-driver-net",
+    "test": "capabilities_match_unchanged_c",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/capabilities/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_RTW89_RA_ORACLE"
+    ],
+    "reason": "requires the unchanged pinned rtw89 HT, VHT and HE capability init C oracle"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "raw_parser_rearm_tags_and_all_ring_indices_match_unchanged_c",
     "source": "crates/stela-driver-net/src/wifi/realtek/receive/tests.rs",
     "kind": "oracle",

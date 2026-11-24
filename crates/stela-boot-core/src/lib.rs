@@ -38,6 +38,7 @@ pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
 pub mod exit_times;
+pub mod fch_watchdog;
 #[cfg(target_arch = "x86_64")]
 pub mod fiber;
 pub mod file_kind;
@@ -139,6 +140,7 @@ pub mod vfct;
 pub mod video_bios;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
+pub mod wifi_check;
 pub mod work_status;
 pub mod worker_bindings;
 pub mod writeback_placement;

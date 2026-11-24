@@ -6,7 +6,7 @@ use super::{
     bootstrap::{self, Claim},
     hardware::Hardware,
     identity::Observed,
-    station::{self, Rtl8822c, Wifi},
+    station::{self, Device, Realtek, Wifi},
 };
 use crate::{
     Clock,
@@ -53,16 +53,17 @@ pub enum AttachError {
 
 impl fmt::Display for AttachError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let chip = Hardware::CHIP;
         match self {
-            Self::NoRegulatoryDatabase => f.write_str("RTL8822C: no regulatory database"),
+            Self::NoRegulatoryDatabase => write!(f, "{chip}: no regulatory database"),
             Self::Country(alpha2, error) => write!(
                 f,
-                "RTL8822C: regulatory.db country {}: {error:?}",
+                "{chip}: regulatory.db country {}: {error:?}",
                 alpha2.escape_ascii()
             ),
-            Self::Bootstrap(error) => write!(f, "RTL8822C bring-up: {error}"),
-            Self::Hardware(error) => write!(f, "RTL8822C: {error}"),
-            Self::Station(error) => write!(f, "RTL8822C station: {error}"),
+            Self::Bootstrap(error) => write!(f, "{chip} bring-up: {error}"),
+            Self::Hardware(error) => write!(f, "{chip}: {error}"),
+            Self::Station(error) => write!(f, "{chip} station: {error}"),
         }
     }
 }
@@ -108,6 +109,6 @@ pub unsafe fn attach(
     let hardware = unsafe { Hardware::new(up, alpha2, dfs_region, inputs.vector) }
         .map_err(AttachError::Hardware)?;
     let radio =
-        Rtl8822c::new(hardware, address, country, inputs.clock).map_err(AttachError::Station)?;
+        Realtek::new(hardware, address, country, inputs.clock).map_err(AttachError::Station)?;
     Ok(radio.keep(inputs.network, inputs.entropy))
 }

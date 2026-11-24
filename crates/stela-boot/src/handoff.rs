@@ -97,6 +97,9 @@ pub struct Handoff {
     pub host_firmware: crate::host_firmware::Resources,
     /// The host's ACPI power hardware, when its FADT is usable.
     pub power: Option<pc::power::HostPower>,
+    /// The FCH watchdog an unattended run armed runs, and a runtime region
+    /// maps its registers by identity (`fch_watchdog::hand_over`).
+    pub fch_watchdog: bool,
     /// The firmware's `ResetSystem` runtime service, whose regions the
     /// loader keeps mapped by identity; zero without one.
     pub efi_reset: u64,
@@ -139,6 +142,10 @@ pub struct Handoff {
     /// for them, which the engine's census takes so that both select the
     /// same GPUs; `None` where no census ran.
     pub(crate) gpu_census: Option<stela_drivers::gpu::selection::Planned>,
+    /// Exclusive firmware RAM below 4 GiB for 32-bit device DMA the heap
+    /// cannot place (`native_memory::reserve_dma32`); empty when the boot
+    /// starts no host devices or the firmware had no room.
+    pub(crate) dma32: Region,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,

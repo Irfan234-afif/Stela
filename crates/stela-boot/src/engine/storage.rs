@@ -1787,6 +1787,10 @@ pub struct Selection<'a> {
     pub usb_disks: &'a [String],
     /// The Wi-Fi network to join; without one a Wi-Fi adapter stays down.
     pub wifi: Option<&'a stela_drivers::net::wifi::network::Network>,
+    /// The channel an RTL8852BE's stage 2 listens on before its station
+    /// starts, for the Wi-Fi check (`--wifi-check-channel`, channel 36 at
+    /// 80 MHz without one); `None` without the check.
+    pub wifi_channel: Option<stela_drivers::net::wifi::realtek::ax::rtw8852b::channel::Channel>,
     /// With `--external-disks`, the guest hub's free ports, which every disk
     /// left over fills in probe order.
     pub external: Option<usize>,
@@ -1831,6 +1835,7 @@ pub unsafe fn open(
         fdr,
         usb_disks,
         wifi,
+        wifi_channel,
         external,
         boot_disk,
         device_skips,
@@ -1870,6 +1875,7 @@ pub unsafe fn open(
             firmware,
             services,
             wifi,
+            wifi_channel,
             &mut observer,
         )
     };
@@ -2150,6 +2156,25 @@ pub unsafe fn open(
             "HOST PCI bridge {address} had bus mastering off: turned on for the devices below it\n"
         ));
     }
+    // Each RTL8852B: what was read before power-on, then how far stage 1
+    // and stage 2 took it and how its station started, line by line
+    // (`ax::attach::Outcome::lines`).
+    for chip in &devices.rtl8852b {
+        let address = chip.address;
+        match &chip.identity {
+            Ok(read) => {
+                output::arguments(format_args!("HOST WIFI IDENTITY pci={address} {read}\n"))
+            }
+            Err(error) => output::arguments(format_args!(
+                "HOST WIFI IDENTITY pci={address} not read: {error}\n"
+            )),
+        }
+        if let Some(outcome) = &chip.outcome {
+            for line in outcome.lines() {
+                output::arguments(format_args!("HOST WIFI RTL8852B pci={address} {line}\n"));
+            }
+        }
+    }
     for (address, class, why) in &devices.unsupported {
         output::arguments(format_args!(
             "HOST UNSUPPORTED pci={address} class={:02x}{:02x}{:02x}: {why}\n",
@@ -2397,6 +2422,7 @@ pub unsafe fn open(
         usb_disks,
         disks: host_disks,
         power: core::mem::take(&mut devices.power),
+        rtl8852b: core::mem::take(&mut devices.rtl8852b),
     })
 }
 
@@ -2753,6 +2779,9 @@ pub struct Opened {
     pub usb_disks: alloc::vec::Vec<Box<dyn BlockDevice>>,
     /// Every disk taken above, for its shutdown notice.
     pub disks: HostDisks,
+    /// Each RTL8852B the probe took through stage 1, for the Wi-Fi check
+    /// (`probe::Devices::rtl8852b`).
+    pub rtl8852b: alloc::vec::Vec<stela_drivers::probe::Rtl8852b>,
 }
 
 /// The host's input devices and the loader root their registers and DMA

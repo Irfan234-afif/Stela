@@ -56,6 +56,8 @@ mod store_file;
 mod topology;
 pub(crate) mod translations;
 mod usb;
+#[cfg(feature = "diagnostics")]
+mod wifi_check;
 pub(crate) mod xstate;
 
 use crate::{

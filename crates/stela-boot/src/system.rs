@@ -330,6 +330,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         || system.nor.is_some()
         || system.network_check.is_some()
         || system.gpu_check
+        || system.wifi_check
         || system.audio_check.is_some()
         || !system.usb_storage.is_empty()
         || system.input
@@ -453,6 +454,15 @@ struct Runtime {
 }
 
 impl Runtime {
+    /// Whether one runtime region holds `start..end`: [`Self::map`] maps
+    /// each by identity in the loader's root, which the engine's stop
+    /// enters to reach those bytes.
+    fn maps(&self, start: u64, end: u64) -> bool {
+        self.descriptors
+            .iter()
+            .any(|&(region, pages, _, _)| region <= start && end <= region + pages * PAGE)
+    }
+
     /// Read before boot services end. Without SetVirtualAddressMap the
     /// firmware's runtime services run at their physical addresses.
     fn capture() -> Result<Self> {
@@ -657,6 +667,9 @@ pub(crate) fn boot(
     host_firmware: crate::host_firmware::Resources,
     snapshot: Option<Snapshot>,
 ) -> ! {
+    // An unattended run hands the PC back however it ends: its stop
+    // restarts it, and a hang before any stop meets the FCH's watchdog.
+    crate::fch_watchdog::arm_unattended(&options);
     // NVRAM chooses macOS or recoveryOS before any input is read. A machine
     // NVRAM holds in recovery mode waits at the startup choices, as LLB
     // waits for a restore host, until one that boots is chosen.
@@ -840,6 +853,11 @@ fn load(
     if let Some(power) = &power {
         crate::stop::arm(power, tsc_hz);
     }
+    // The Wi-Fi check runs unattended from the PC's own boot order and
+    // hands it back the same way.
+    if system.restart_at_stop || system.wifi_check {
+        crate::stop::restart_at_stop();
+    }
     let random_seed = match crate::entropy::retain_seed() {
         Ok((region, source)) => {
             output::arguments(format_args!("HOST entropy seeded source={source}\n"));
@@ -853,6 +871,15 @@ fn load(
 
     let remapping = crate::native_dma::firmware_units()?;
     let amd_tables = crate::native_dma::reserve_amd_tables(&remapping);
+    // The low zone for 32-bit DMA, whether or not an IOMMU is described:
+    // AMD-Vi is left off on a PC whose firmware display sits behind it. It
+    // is reserved when the storage pool is, for a boot that starts host
+    // devices, after the AMD-Vi tables, which need low memory more.
+    let dma32 = if storage.is_some() {
+        crate::native_memory::reserve_dma32(&image.ram)
+    } else {
+        Region::default()
+    };
 
     let mut native_mmio = crate::native_mmio::Prepared::capture().map_err(|error| {
         output::arguments(format_args!("NATIVE MMIO unavailable capture={error}\n"));
@@ -1155,6 +1182,10 @@ fn load(
             storage,
             host_firmware,
             power,
+            fch_watchdog: crate::fch_watchdog::hand_over(runtime.maps(
+                stela_boot_core::fch_watchdog::PM,
+                stela_boot_core::fch_watchdog::PM + stela_boot_core::fch_watchdog::SPAN,
+            )),
             efi_reset: runtime.reset,
             rsdp: storage::rsdp().unwrap_or(0),
             pci_map,
@@ -1172,6 +1203,7 @@ fn load(
             gpu_pages: pages,
             gpu_pages_held: pages_held,
             gpu_census: storage::gpu_census(),
+            dma32,
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),

@@ -28,6 +28,8 @@ const KEYBOARD_BURST: usize = 32;
 const ASSUMED_TSC_HZ: u64 = 2_000_000_000;
 const KEYBOARD_INPUT_FULL: u8 = 1 << 1;
 const KEYBOARD_PULSE_RESET: u8 = 0xfe;
+/// The PCH's and FCH's reset control register.
+const RESET_CONTROL: u16 = 0xcf9;
 
 /// How often a stopped boot reads the button. The status bit stays set
 /// until written, so no press is lost between reads.
@@ -83,6 +85,20 @@ unsafe impl Sync for Hardware {}
 static HARDWARE: Hardware = Hardware(UnsafeCell::new(None));
 static ARMED: AtomicBool = AtomicBool::new(false);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+/// Whether a stop restarts the PC by itself (`--restart-at-stop`).
+static RESTART_AT_STOP: AtomicBool = AtomicBool::new(false);
+
+/// How long a stop that restarts by itself shows the stop first. The power
+/// button and Ctrl+Alt+Delete still answer meanwhile.
+const RESTART_AT_STOP_MILLIS: u64 = 5000;
+
+/// Make a later stop restart the PC by itself after
+/// [`RESTART_AT_STOP_MILLIS`], whether the boot passed or failed, so a
+/// diagnostics run returns to the PC's own boot order unattended
+/// (`--restart-at-stop`). The stop has stored the log by then.
+pub(crate) fn restart_at_stop() {
+    RESTART_AT_STOP.store(true, Ordering::Release);
+}
 
 /// Give a later stop the host's power hardware. Called once, by the boot
 /// processor, before any other processor runs Stela's code.
@@ -131,7 +147,8 @@ fn restart_keys(keys: &mut Keys) -> bool {
 /// restarted, which hands it back to its firmware. In legacy mode the
 /// firmware keeps the button. Ctrl+Alt+Delete on an 8042 keyboard restarts
 /// the PC in either mode. With neither a button to read nor an 8042 this
-/// only halts.
+/// only halts. Given [`restart_at_stop`], the PC also restarts by itself
+/// once [`RESTART_AT_STOP_MILLIS`] have passed.
 pub(crate) fn wait() -> ! {
     // SAFETY: no task resumes after a stop; interrupts stay masked.
     unsafe { asm!("cli", options(nomem, nostack)) };
@@ -140,9 +157,19 @@ pub(crate) fn wait() -> ! {
         // SAFETY: `ARMED` follows the only write.
         .then(|| unsafe { (*HARDWARE.0.get()).as_ref() })
         .flatten();
+    let reset = power.and_then(|power| power.reset);
+    let restart_after = RESTART_AT_STOP
+        .load(Ordering::Acquire)
+        .then_some(RESTART_AT_STOP_MILLIS / BUTTON_MILLIS);
     let button = power.filter(|power| power.acpi_mode(&mut Io));
-    let keyboard = Io.in8(KEYBOARD_STATUS) != 0xff;
+    // A run that restarts by itself never reads the 8042's ports, which a
+    // PC without one may trap to its firmware's USB keyboard emulation.
+    let keyboard = restart_after.is_none() && Io.in8(KEYBOARD_STATUS) != 0xff;
     if button.is_none() && !keyboard {
+        if restart_after.is_some() {
+            spin(RESTART_AT_STOP_MILLIS);
+            restart(reset);
+        }
         loop {
             // SAFETY: as above.
             unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
@@ -153,9 +180,13 @@ pub(crate) fn wait() -> ! {
         power.take_power_button(&mut Io);
     }
     let mut keys = Keys::new();
-    let reset = power.and_then(|power| power.reset);
+    let mut looks = 0u64;
     loop {
         spin(BUTTON_MILLIS);
+        looks += 1;
+        if restart_after.is_some_and(|after| looks >= after) {
+            restart(reset);
+        }
         if keyboard && restart_keys(&mut keys) {
             restart(reset);
         }
@@ -171,15 +202,34 @@ pub(crate) fn wait() -> ! {
     }
 }
 
-/// Restart the PC: the FADT's reset register, then the 8042 keyboard
-/// controller's reset pulse, then a triple fault, each given half a second.
+/// Restart the PC: the chipset's reset control at 0xcf9 as Linux's
+/// `BOOT_CF9_FORCE` writes it for a cold reboot, then the FADT's reset
+/// register, then the 8042 keyboard controller's reset pulse, then a
+/// triple fault, each given half a second. 0xcf9 goes first: a FADT may
+/// name the firmware's SMI command port instead (an AMI firmware on AMD's
+/// FCH names 0xb2 = 0xbe), whose handler writes 0xcf9 itself if it runs. An
+/// FCH watchdog an unattended run armed is stopped first, so the reset
+/// leaves it off, and counts again if the PC is still running.
 pub(crate) fn restart(reset: Option<(ResetRegister, u8)>) -> ! {
-    if let Some((register, value)) = reset {
+    let watchdog = crate::fch_watchdog::stop();
+    // A full reset: SYS_RST first, then RST_CPU and FULL_RST with it,
+    // keeping the register's other bits.
+    let kept = Io.in8(RESET_CONTROL) & !0x0e;
+    Io.out8(RESET_CONTROL, kept | 0x02);
+    spin(1);
+    Io.out8(RESET_CONTROL, kept | 0x0e);
+    spin(500);
+    if watchdog {
+        crate::fch_watchdog::rearm(stela_boot_core::fch_watchdog::RESTART_SECONDS);
+    }
+    if let Some((register, value)) = reset
+        && register != ResetRegister::Io(RESET_CONTROL)
+    {
         // SAFETY: the FADT's reset register; the machine resets.
         unsafe { write_reset(register, value) };
         spin(500);
     }
-    if Io.in8(KEYBOARD_STATUS) != 0xff {
+    if !RESTART_AT_STOP.load(Ordering::Acquire) && Io.in8(KEYBOARD_STATUS) != 0xff {
         for _ in 0..100 {
             if Io.in8(KEYBOARD_STATUS) & KEYBOARD_INPUT_FULL == 0 {
                 break;

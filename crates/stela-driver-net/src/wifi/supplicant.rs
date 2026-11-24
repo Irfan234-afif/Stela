@@ -869,6 +869,22 @@ impl Supplicant {
         self.ptk.is_some()
     }
 
+    /// The 4-way handshake's message the station waits for from the
+    /// authenticator: 1 before any came, 3 once message 2 answered message 1,
+    /// `None` once message 3 gave the keys.
+    pub fn awaited(&self) -> Option<u8> {
+        match (&self.ptk, &self.tentative) {
+            (Some(_), _) => None,
+            (None, Some(_)) => Some(3),
+            (None, None) => Some(1),
+        }
+    }
+
+    /// The association's suites.
+    pub fn suites(&self) -> Suites {
+        self.suites
+    }
+
     /// `wpa_sm_key_request` with the error bit: tells the authenticator of a
     /// failed Michael MIC, once a PTK protects the telling.
     pub fn michael_report(&mut self, pairwise: bool) -> Option<Vec<u8>> {

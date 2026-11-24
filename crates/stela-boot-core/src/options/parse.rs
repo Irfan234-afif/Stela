@@ -214,6 +214,19 @@ impl ParseState<'_> {
                 flag(&mut options.audio_own_hpet, Error::DuplicateAudioHpet)?;
             }
             "--gpu-check" => flag(&mut options.gpu_check, Error::DuplicateGpuCheck)?,
+            "--restart-at-stop" => {
+                flag(&mut options.restart_at_stop, Error::DuplicateRestartAtStop)?;
+            }
+            "--wifi-check" => flag(&mut options.wifi_check, Error::DuplicateWifiCheck)?,
+            WIFI_CHECK_SER => flag(&mut options.wifi_check_ser, Error::DuplicateWifiCheckSer)?,
+            WIFI_CHECK_CHANNEL => {
+                let channel = value()
+                    .and_then(WifiCheckChannel::parse)
+                    .ok_or(Error::WifiCheckChannel)?;
+                if options.wifi_check_channel.replace(channel).is_some() {
+                    return Err(Error::DuplicateWifiCheckChannel);
+                }
+            }
             "--native-pci-own-ioapic" => {
                 flag(
                     &mut options.native_pci_own_ioapic,

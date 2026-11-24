@@ -6,6 +6,7 @@
 use super::firmware::{Layout, ParseError};
 use crate::firmware::{self, Image, Provider, Requirement, Target};
 use alloc::{format, string::String};
+use core::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Chip {
@@ -29,6 +30,73 @@ pub const CHIP_REVISION: &str = "linux-firmware";
 
 /// `rtw_8822ce_id_table`.
 pub const RTL8822C_DEVICES: [u16; 2] = [0xc822, 0xc82f];
+
+/// `rtw89_8852be_id_table`.
+pub const RTL8852B_DEVICES: [u16; 2] = [0xb852, 0xb85b];
+
+/// The cut field of SYS_CFG1, bits 15:12 (`B_AX_CHIP_VER_MASK`, which
+/// rtw88 reads at the same offset).
+const fn cut_of(sys_cfg1: u32) -> u8 {
+    ((sys_cfg1 >> 12) & 15) as u8
+}
+
+/// `enum rtw89_cv`'s name for an rtw89 cut, or `None` past `CHIP_CFV`.
+pub fn rtw89_cut_name(cut: u8) -> Option<&'static str> {
+    ["CAV", "CBV", "CCV", "CDV", "CEV", "CFV"]
+        .get(usize::from(cut))
+        .copied()
+}
+
+/// What a boot read of an RTL8852B before any driver powered it: its PCI
+/// identity, SYS_CFG1 as `rtw89_read_chip_ver` reads it first, BAR2's size
+/// and whether the function has MSI.
+///
+/// The read changes nothing on the chip. It does not give the analog cut
+/// (ACV), which rtw89 reads through XTAL SI with register writes, and it
+/// does not show whether firmware for the cut exists or whether the chip
+/// powers on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Unpowered {
+    pub observed: Observed,
+    pub bar2_bytes: u64,
+    pub msi: bool,
+}
+
+impl Unpowered {
+    /// The cut SYS_CFG1 names, or `None` for a read that returned all ones,
+    /// a master abort, or `RTW89_R32_DEAD`, which rtw89 reads from a
+    /// register block that is off.
+    pub fn cut(&self) -> Option<u8> {
+        let word = self.observed.sys_cfg1;
+        (!matches!(word, u32::MAX | 0xdead_beef)).then(|| cut_of(word))
+    }
+}
+
+impl fmt::Display for Unpowered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let o = self.observed;
+        write!(
+            f,
+            "{:04x}:{:04x} subsystem={:04x}:{:04x} rev={:02x} bar2={:#x} msi={} sys_cfg1={:#010x}",
+            o.vendor,
+            o.device,
+            o.subsystem_vendor,
+            o.subsystem_device,
+            o.pci_revision,
+            self.bar2_bytes,
+            if self.msi { "yes" } else { "no" },
+            o.sys_cfg1,
+        )?;
+        let Some(cut) = self.cut() else {
+            return f.write_str(": the function did not answer, so no cut");
+        };
+        match rtw89_cut_name(cut) {
+            Some(name) => write!(f, " cut={cut} ({name})")?,
+            None => write!(f, " cut={cut} (past rtw89's CHIP_CFV)")?,
+        }
+        f.write_str(": read before power-on")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Profile {
@@ -63,7 +131,7 @@ impl Profile {
         }
         let chip = match observed.device {
             device if RTL8822C_DEVICES.contains(&device) => Chip::Rtl8822C,
-            0xb852 | 0xb85b => Chip::Rtl8852B,
+            device if RTL8852B_DEVICES.contains(&device) => Chip::Rtl8852B,
             _ => return Err(IdentityError::UnsupportedPci),
         };
         if observed.sys_cfg1 == u32::MAX {
@@ -84,7 +152,7 @@ impl Profile {
         self.chip
     }
     pub fn cut(self) -> u8 {
-        ((self.observed.sys_cfg1 >> 12) & 15) as u8
+        cut_of(self.observed.sys_cfg1)
     }
     pub fn firmware_name(self) -> &'static str {
         match self.chip {
@@ -232,6 +300,85 @@ pub(crate) mod tests {
         o = observed(0xb852, 1);
         o.vendor = 0x8086;
         assert_eq!(Profile::select(o), Err(IdentityError::UnsupportedPci));
+    }
+
+    #[test]
+    fn rtw89_cut_names_follow_enum_rtw89_cv() {
+        // core.h: CHIP_CAV through CHIP_CFV, then CHIP_CV_MAX.
+        let names = ["CAV", "CBV", "CCV", "CDV", "CEV", "CFV"];
+        for (cut, name) in names.into_iter().enumerate() {
+            assert_eq!(rtw89_cut_name(cut as u8), Some(name));
+        }
+        for cut in 6..=u8::MAX {
+            assert_eq!(rtw89_cut_name(cut), None);
+        }
+        for device in RTL8852B_DEVICES {
+            assert_eq!(
+                Profile::select(observed(device, 1)).map(Profile::chip),
+                Ok(Chip::Rtl8852B)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpowered_read_names_the_word_its_cut_and_what_it_did_not_read() {
+        use alloc::string::ToString;
+        let mut observed = Observed {
+            vendor: 0x10ec,
+            device: 0xb852,
+            subsystem_vendor: 0x1a3b,
+            subsystem_device: 0x5470,
+            pci_revision: 0,
+            // A cut in bits 15:12 with neighbouring bits set, which the cut
+            // must ignore and the word must keep.
+            sys_cfg1: 0x0001_1f00,
+        };
+        let read = |observed, msi| {
+            Unpowered {
+                observed,
+                bar2_bytes: 0x10_0000,
+                msi,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            read(observed, true),
+            "10ec:b852 subsystem=1a3b:5470 rev=00 bar2=0x100000 msi=yes \
+             sys_cfg1=0x00011f00 cut=1 (CBV): read before power-on"
+        );
+        observed.sys_cfg1 = 0x0000_2000;
+        assert!(
+            read(observed, false)
+                .ends_with("msi=no sys_cfg1=0x00002000 cut=2 (CCV): read before power-on")
+        );
+        observed.sys_cfg1 = 0x0000_9000;
+        assert!(
+            read(observed, true).ends_with("cut=9 (past rtw89's CHIP_CFV): read before power-on")
+        );
+        let cut = |sys_cfg1| {
+            Unpowered {
+                observed: Observed {
+                    sys_cfg1,
+                    ..observed
+                },
+                bar2_bytes: 0,
+                msi: false,
+            }
+            .cut()
+        };
+        assert_eq!(cut(0x0001_1f00), Some(1));
+        assert_eq!(cut(0xffff_0fff), Some(0));
+        assert_eq!(cut(u32::MAX), None);
+        assert_eq!(cut(0xdead_beef), None);
+        for dead in [u32::MAX, 0xdead_beef] {
+            observed.sys_cfg1 = dead;
+            let line = read(observed, true);
+            assert!(
+                line.ends_with(": the function did not answer, so no cut"),
+                "{line}"
+            );
+            assert!(!line.contains("cut="), "{line}");
+        }
     }
 
     #[test]

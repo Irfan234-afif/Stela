@@ -19,6 +19,8 @@ const PAGE_SHIFT: u8 = 12;
 pub const PAGE: usize = 1 << PAGE_SHIFT;
 
 pub mod cache;
+mod zoned;
+pub use zoned::{DMA32_END, Zoned};
 
 /// Checks that `bytes` at CPU address `cpu` map physical `physical` with an
 /// effective write-back type, reading page tables at `table_offset` past

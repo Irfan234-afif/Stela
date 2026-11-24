@@ -116,6 +116,10 @@ pub enum LinkError {
 /// autonegotiation after a PHY reset or power-up, about 3 s at 1000BASE-T
 /// and up to 5-7 s at 2.5G/5G/10GBASE-T, with margin.
 pub const WIRED_CARRIER_WAIT_US: u64 = 10_000_000;
+/// How long a Wi-Fi link may take from its start to carrier: a scan, an SAE
+/// exchange and a four-way handshake, each to the end of its budget (30, 10
+/// and 10 s), before the port opens.
+pub const WIFI_CARRIER_WAIT_US: u64 = 50_000_000;
 
 /// A raw Ethernet II link: whole frames without the FCS.
 pub trait Link {
@@ -127,7 +131,7 @@ pub trait Link {
     }
     /// How long after its start the link may take to report carrier before
     /// a missing one means no cable or no network. The default is a wired
-    /// PHY's, and every link here keeps it.
+    /// PHY's; a kept Wi-Fi station takes [`WIFI_CARRIER_WAIT_US`].
     fn carrier_wait_us(&self) -> u64 {
         WIRED_CARRIER_WAIT_US
     }

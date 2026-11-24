@@ -1,9 +1,9 @@
 use super::*;
 
 /// amdgpu's recipes whose bytes another holds, and the bundle's files and
-/// bytes with the AMD port: 437 files, 237.6 MiB.
+/// bytes with the AMD port: 439 files, 237.7 MiB.
 const AMD_SHARED: usize = 64;
-const AMD_TOTAL: (usize, usize) = (437, 249_100_660);
+const AMD_TOTAL: (usize, usize) = (439, 249_230_399);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]
@@ -34,8 +34,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());
-        // Without the AMD port: 88 files, 177.0 MiB.
-        assert_eq!((count, bytes), (88, 185_584_904), "{count} {bytes}");
+        // Without the AMD port: 90 files, 177.1 MiB.
+        assert_eq!((count, bytes), (90, 185_714_643), "{count} {bytes}");
     }
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);
@@ -97,12 +97,14 @@ fn members(selection: &Selection) -> Vec<&'static str> {
 }
 
 /// The USB Bluetooth and Ethernet files every boot reads, sorted.
-const USB: [&str; 12] = [
+const USB: [&str; 14] = [
     "intel/ibt-20-1-3.ddc",
     "intel/ibt-20-1-3.sfi",
     "mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin",
     "mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin",
     "mediatek/mt7925/BT_RAM_CODE_MT7925_1_1_hdr.bin",
+    "rtl_bt/rtl8761bu_config.bin",
+    "rtl_bt/rtl8852bu_fw.bin",
     "rtl_nic/rtl8153a-2.fw",
     "rtl_nic/rtl8153a-3.fw",
     "rtl_nic/rtl8153a-4.fw",

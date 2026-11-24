@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! An RTL8822C as the connection keeper's radio. rtw88 leaves the MAC to
-//! mac80211, so what firmware does on other NICs happens here: a scan hops the
-//! channels as `ieee80211_scan_work` does, frames carry a host-made IV as
-//! `IEEE80211_KEY_FLAG_GENERATE_IV` asks, `Reorder` holds a Block Ack
-//! agreement's frames, and robust management frames are sealed in software as
-//! `IEEE80211_KEY_FLAG_SW_MGMT_TX` asks. [`Device`] is the hardware beneath it.
-use super::{
-    bit_rate, ccmp,
-    commands::{self, RateInfo, Report},
-    descriptor::{
-        Aggregate, Packet, QSEL_MANAGEMENT, RATE_1M, RATE_6M, RATE_ID_B, RATE_ID_G, SECURITY_CCMP,
-    },
-    dynamic, templates,
-    transmit::{self, Queue},
-};
+//! A Realtek softMAC chip as the connection keeper's radio. rtw88 and rtw89
+//! leave the MAC to mac80211, so what firmware does on other NICs happens here:
+//! a scan hops the channels as `ieee80211_scan_work` does, frames carry a
+//! host-made IV as `IEEE80211_KEY_FLAG_GENERATE_IV` asks, `Reorder` holds a
+//! Block Ack agreement's frames, robust management frames are sealed in
+//! software as `IEEE80211_KEY_FLAG_SW_MGMT_TX` asks, and the frames of a TKIP
+//! group key the chip refuses are decrypted in software, as mac80211 falls
+//! back to when `set_key` returns `-EOPNOTSUPP`. [`Device`] is the hardware
+//! beneath it, which names its own descriptor, reports and association
+//! commands; rtw88's are in [`super::rtw88`].
+use super::ccmp;
 use crate::wifi::security::{
     aggregate::{OrderedGroup, Shape},
     michael,
@@ -32,7 +28,10 @@ use crate::{
             channel::{DISABLED, NO_IR},
             database::Country,
         },
-        scan::{self, Outcome, Retirement, Scanner, result::Bss},
+        scan::{
+            self, Outcome, Retirement, Scanner,
+            result::{Bss, Kind as ScanKind},
+        },
         security::{
             self, Cipher, InstallOutcome, Integrity, KeyIdentity, KeyScope, KeySlot, PacketNumber,
             ReplaySeed, SecurityStatus,
@@ -67,15 +66,9 @@ const TIMER_TICK_US: u64 = 100_000;
 const WATCHDOG_US: u64 = 2_000_000;
 /// `IEEE80211_SCAN_RESULT_EXPIRE`.
 const BSS_EXPIRY_US: u64 = 30_000_000;
-/// rtw88's sole station shares its interface's MAC ID, the first it acquires.
-pub const MAC_ID: u8 = 0;
-/// `rtw_ops_add_interface`'s first port.
-pub const PORT: u8 = 0;
 /// `RTW_SEC_DEFAULT_KEY_NUM`: group keys sit at their index, pairwise ones after.
-const PAIRWISE_CAM: u8 = 4;
-/// `RTW_CAM_TKIP` and `RTW_CAM_AES`.
-const CAM_TKIP: u8 = 2;
-const CAM_AES: u8 = 4;
+/// A [`KeyEntry`]'s entry is this logical number, which each chip maps.
+pub const PAIRWISE_CAM: u8 = 4;
 /// `WLAN_HT_SMPS_CONTROL_DISABLED` and `WLAN_HT_SMPS_CONTROL_STATIC`.
 const SMPS_DISABLED: u8 = 0;
 const SMPS_STATIC: u8 = 1;
@@ -110,74 +103,200 @@ pub struct Received {
     pub signal_dbm: Option<i8>,
 }
 
-/// What the device gave the host.
+/// What the device gave the host: a frame, or one of its own `R` reports.
 #[derive(Clone, Debug)]
-pub enum Incoming {
+pub enum Incoming<R> {
     Frame(Received),
-    Report(Report),
+    Report(R),
 }
 
-/// The key `rtw_sec_write_cam` writes to a CAM entry.
-pub struct CamKey<'a> {
+/// What a device's report tells the station.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reported {
+    /// The frame whose TX report was to name `number` went, acknowledged or
+    /// not.
+    Transmitted { number: u8, acknowledged: bool },
+    /// Firmware moved the peer's rate: `max_rc_amsdu_len`, the longest A-MSDU
+    /// that rate suits.
+    Amsdu(u16),
+}
+
+/// The access category a frame waits under, or management. Each chip maps it
+/// to its own rings, as `rtw_tx_ac_to_hwq` and `rtw89_core_get_ch_dma` do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Queue {
+    Background,
+    BestEffort,
+    Video,
+    Voice,
+    Management,
+}
+
+/// A key for the hardware's key table: `ieee80211_key_conf` as `set_key`
+/// hands it down. `entry` is logical, a group key's index or [`PAIRWISE_CAM`].
+pub struct KeyEntry<'a> {
     pub entry: u8,
     pub index: u8,
-    pub kind: u8,
+    pub cipher: Cipher,
     pub group: bool,
     pub peer: Mac,
+    /// The temporal key, without a TKIP key's Michael halves.
     pub material: &'a [u8; 16],
 }
 
+/// A management frame for the rings: what `rtw_tx_mgmt_pkt_info_update` and
+/// `rtw89_core_tx_update_mgmt_info` fill a descriptor from.
+pub struct Management<'a> {
+    /// The MPDU, its MAC header first.
+    pub mpdu: &'a [u8],
+    /// The band it leaves on.
+    pub band: Band,
+    /// The BSS's basic rates once associated, the lowest of which carries it.
+    pub basic: Option<u16>,
+    /// The number the device's TX report is to name the frame by.
+    pub report: Option<u8>,
+}
+
+/// A data or null frame to the associated AP: what
+/// `rtw_tx_data_pkt_info_update` and `rtw89_core_tx_update_data_info` fill a
+/// descriptor from.
+pub struct Data<'a> {
+    /// The MPDU, its MAC header first and numbered by the host.
+    pub mpdu: &'a [u8],
+    pub context: &'a AssociationContext,
+    /// The width the link runs at.
+    pub width: Width,
+    /// The TID of a QoS frame.
+    pub tid: Option<u8>,
+    /// The hardware seals it under the pairwise key, behind the host's IV.
+    pub protected: bool,
+    /// Its TID's transmit agreement is in force, so it may join an A-MPDU.
+    pub aggregate: bool,
+}
+
+/// What the station reads and changes of a descriptor it holds.
+pub trait Descriptor: Clone {
+    /// The TID it was queued under, which a frame outside QoS shares with
+    /// TID 0.
+    fn tid(&self) -> u8;
+    /// Whether it may join an A-MPDU.
+    fn aggregated(&self) -> bool;
+    /// Its TID's transmit agreement ended, so it leaves alone.
+    fn stop_aggregating(&mut self);
+    /// Whether the hardware seals it behind the host's IV.
+    fn protected(&self) -> bool;
+    /// Its frame grew to `size` bytes, a subframe joined to its A-MSDU.
+    fn resize(&mut self, size: usize);
+}
+
 /// What a radio's station needs of the hardware beneath it. Each operation is
-/// the hardware half of the mac80211 or rtw88 operation it names.
+/// the hardware half of the mac80211 operation it names; the descriptor, the
+/// reports and the association commands are each chip's own.
 pub trait Device {
-    /// `rtw_set_channel`. While `scanning`, no calibration follows.
+    /// What goes ahead of a frame in the rings: rtw88's `rtw_tx_pkt_info`.
+    type Descriptor: Descriptor;
+    /// One report firmware gives the host: rtw88's C2H.
+    type Report;
+    /// The longest MPDU, an A-MSDU's subframes and all, the rings take.
+    const MAX_FRAME: usize;
+    /// The driver the keeper's reports name, its `Radio::NAME`.
+    const DRIVER: &'static str;
+    /// The chip an error names.
+    const CHIP: &'static str;
+    /// The 5 GHz channels the driver registers with mac80211.
+    const CHANNELS_5GHZ: &'static [u16];
+    /// Whether the key table takes a TKIP group key, rtw89's `hw_tkip_crypto`:
+    /// rtw88's takes its temporal half and decrypts, Michael left to the host.
+    /// A chip without it refuses the key in `set_key`, `-EOPNOTSUPP`, and the
+    /// host keeps it and decrypts the AP's group traffic itself, as mac80211
+    /// does ([`security::tkip`]).
+    const HARDWARE_TKIP: bool;
+
+    /// The capability elements a probe and an association request carry on
+    /// `band` behind the rates, HT's, VHT's, HE's and the extended
+    /// capabilities among them, and the HE MCS maps the station's own HE
+    /// capabilities come from.
+    fn advertisement(&self, band: Band) -> (Vec<u8>, [McsMaps; 3]);
+    /// The descriptor of a management frame, at the BSS's lowest basic rate.
+    fn management(&self, frame: &Management<'_>) -> Self::Descriptor;
+    /// The descriptor of a data frame to the AP.
+    fn data(&self, frame: &Data<'_>) -> Self::Descriptor;
+    /// The descriptor of `ieee80211_send_nullfunc`'s null to the AP, which the
+    /// device numbers and whose TX report is to name `report`.
+    fn null(&self, frame: &Data<'_>, report: u8) -> Self::Descriptor;
+    /// What `report` tells the station, for a peer on a link `width` wide.
+    fn reported(&self, report: &Self::Report, width: Width) -> Option<Reported>;
+    /// `sta_state`'s association and `bss_info_changed` of it, for `local`
+    /// joined to `context`'s AP on a link `width` wide: all the hardware
+    /// learns of the peer, its port linked to the BSS as its AID and its
+    /// beacons' interval and DTIM period among it.
+    fn joined(
+        &mut self,
+        local: Mac,
+        context: &AssociationContext,
+        width: Width,
+    ) -> Result<(), String>;
+    /// `sta_state`'s disassociation: firmware told the peer left, ahead of the
+    /// port's reset.
+    fn left(&mut self) -> Result<(), String>;
+    /// Firmware's rate adaptation told of the peer on a link `width` wide at
+    /// the watchdog's `level`; `reset` starts its mask and level over.
+    fn refresh_rates(
+        &mut self,
+        context: &AssociationContext,
+        width: Width,
+        level: u8,
+        reset: bool,
+    ) -> Result<(), String>;
+
+    /// `config`'s channel. While `scanning`, no calibration follows.
     fn tune(
         &mut self,
         definition: &ChannelDefinition,
         scanning: bool,
         eirp_mbm: i32,
     ) -> Result<(), String>;
-    /// `rtw_chip_prepare_tx`: calibrate for the channel a frame will leave on.
+    /// `mgd_prepare_tx`: calibrate for the channel a frame will leave on.
     fn prepare_transmit(&mut self) -> Result<(), String>;
-    /// `rtw_pci_tx_write_data` and its kick. False asks to try again.
-    fn transmit(&mut self, queue: Queue, packet: &Packet, mpdu: &[u8]) -> Result<bool, String>;
-    /// `rtw_pci_rx_napi`: what arrived since the last look.
-    fn receive(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String>;
-    fn command(&mut self, command: (u32, u32)) -> Result<(), String>;
-    /// `rtw_vif_port_config` of the BSSID, AID and link state.
+    /// `tx` of `mpdu` behind `descriptor` and the kick. False asks to try
+    /// again.
+    fn transmit(
+        &mut self,
+        queue: Queue,
+        descriptor: &Self::Descriptor,
+        mpdu: &[u8],
+    ) -> Result<bool, String>;
+    /// What arrived since the last look.
+    fn receive(&mut self, sink: &mut dyn FnMut(Incoming<Self::Report>)) -> Result<(), String>;
+    /// The port's BSSID, AID and link state.
     fn set_port(&mut self, bssid: Mac, aid: u16, linked: bool) -> Result<(), String>;
-    /// `rtw_ops_configure_filter`: keep only the BSS's own beacons, or all.
+    /// `configure_filter`: keep only the BSS's own beacons, or all.
     fn filter_beacons(&mut self, own_only: bool) -> Result<(), String>;
-    /// `__rtw_conf_tx` of every access category.
+    /// `conf_tx` of every access category.
     fn set_edca(&mut self, edca: &[AccessCategory; 4], short_slot: bool) -> Result<(), String>;
-    fn write_key(&mut self, key: &CamKey<'_>) -> Result<(), String>;
+    /// `set_key`'s `SET_KEY`.
+    fn write_key(&mut self, key: &KeyEntry<'_>) -> Result<(), String>;
+    /// `set_key`'s `DISABLE_KEY` of a logical entry.
     fn clear_key(&mut self, entry: u8) -> Result<(), String>;
-    /// `rtw_fw_download_rsvd_page` and `rtw_send_rsvd_page_h2c`.
-    fn set_templates(&mut self, _templates: &templates::Templates) -> Result<(), String> {
-        Ok(())
-    }
-    /// `rtw_enter_lps` and `rtw_leave_lps`, which each stand for being there.
+    /// Entering and leaving power save, which each stand for being there.
     fn set_power_save(&mut self, _on: bool) -> Result<(), String> {
         Ok(())
     }
-    /// The beacons' interval and DTIM period.
-    fn set_beacon(&mut self, _interval_tu: u16, _dtim_period: u8) -> Result<(), String> {
-        Ok(())
-    }
-    /// `rtw_vif_smps_iter`: the next change to one stream or back to two.
+    /// The next change to one stream or back to two.
     fn stream_change(&mut self) -> Option<bool> {
         None
     }
-    /// A look at the Bluetooth arbiter's timers, at `now`.
+    /// A look at the hardware's timers at `now`, once each service: the
+    /// Bluetooth arbiter's, or the radio tracking's.
     fn coexist(&mut self, _now: u64) -> Result<(), String> {
         Ok(())
     }
-    /// `rtw_watch_dog_work`'s traffic accounts, and unless `scanning` its work
-    /// on the air, for a peer that takes STBC or not.
+    /// The watchdog's traffic accounts, and unless `scanning` its work on the
+    /// air, for a peer that takes STBC or not.
     fn watchdog(&mut self, _scanning: bool, _stbc: bool) -> Result<Watched, String> {
         Ok(Watched::default())
     }
-    /// `rtw_core_scan_start` and `rtw_core_scan_complete`'s gain.
+    /// `sw_scan_start` and `sw_scan_complete`.
     fn scanning(&mut self, _scanning: bool) -> Result<(), String> {
         Ok(())
     }
@@ -189,11 +308,26 @@ pub trait Device {
     fn limitation(&mut self) -> Option<&'static str> {
         None
     }
+    /// The hardware's own state line, with no address in it, such as what
+    /// its rings took and released ([`Link::diagnostic`]).
+    fn diagnostic(&mut self) -> Option<String> {
+        None
+    }
+    /// The firmware's loss since the last look, once the hardware dealt
+    /// with it: what it says of the loss and of the chip, which it brought
+    /// up cold or powered off for good. The peer, its keys and its
+    /// agreements went with the firmware. `None` while the firmware runs,
+    /// and always for rtw88's chips, whose firmware Stela never sees go.
+    fn recover(&mut self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug)]
 pub enum Error {
     Hardware(String),
+    /// The firmware went: what the hardware said of it.
+    Lost(String),
     Station(crate::wifi::station::Error),
     BlockAck(ba::Error),
     Data(data::Error),
@@ -201,13 +335,22 @@ pub enum Error {
     Scan(scan::Error),
     Refused(&'static str),
     Unsupported(&'static str),
+    /// What `chip` does not do.
+    Lacks {
+        what: &'static str,
+        chip: &'static str,
+    },
     /// Frames must drain before this can go on.
     Pending,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Lacks { what, chip } => write!(f, "Unsupported(\"{what} on an {chip}\")"),
+            Self::Lost(why) => f.write_str(why),
+            error => write!(f, "{error:?}"),
+        }
     }
 }
 
@@ -218,6 +361,21 @@ pub struct ManagementKey;
 struct Heard {
     observation: Arc<NativeBssObservation>,
     at: u64,
+}
+
+/// The beacon intervals a join whose BSS was heard only in a probe
+/// response waits on its channel for a beacon.
+const BEACON_WAIT_INTERVALS: u64 = 3;
+
+/// A join waiting on its BSS's channel for the beacon the association
+/// needs (its TIM's DTIM), having heard only a probe response: an active
+/// scan's 30 ms dwell rarely holds a 100 TU beacon. It begins at the beacon
+/// or at `until`, whichever comes first.
+struct PendingJoin {
+    handle: usize,
+    join: Join,
+    bssid: Mac,
+    until: u64,
 }
 
 /// A scan's walk over its channels, `ieee80211_scan_work`.
@@ -237,13 +395,127 @@ pub struct Watched {
     pub busy: bool,
 }
 
-/// One key the CAM holds.
+/// One key the station holds, in the CAM or, a TKIP key the chip refused,
+/// in the host alone.
 struct Key {
     slot: KeySlot,
     pairwise: bool,
     index: u8,
     entry: u8,
+    /// Whether the CAM took it, mac80211's `KEY_FLAG_UPLOADED_TO_HARDWARE`.
+    hardware: bool,
     material: Zeroizing<Vec<u8>>,
+}
+
+/// What the AP's TKIP group traffic came to: frames the host decrypted, as
+/// the chip left them, ICVs that failed there, and Michael failures, each
+/// reported to the AP. A station's diagnostic names them once any is
+/// counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TkipCounts {
+    decrypted: u32,
+    icv_failures: u32,
+    michael_failures: u32,
+}
+
+/// What became of the protected data frames meant for the station, those
+/// to its address (`[0]`) and its AP's group-addressed ones (`[1]`) apart:
+/// each heard, and those dropped under a key the station does not hold or
+/// has not installed, or for an ICV error the chip found. A station's
+/// diagnostic names them once any is counted, so that a run that heard no
+/// group traffic tells an AP that sent none from frames dropped on the way
+/// in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProtectedCounts {
+    heard: [u32; 2],
+    unkeyed: [u32; 2],
+    icv: [u32; 2],
+}
+
+impl core::fmt::Display for ProtectedCounts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (at, kind) in ["unicast", "group"].into_iter().enumerate() {
+            if at > 0 {
+                f.write_str(" ")?;
+            }
+            write!(
+                f,
+                "protected {kind} heard={} unkeyed={} icv={}",
+                self.heard[at], self.unkeyed[at], self.icv[at]
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The most steps a [`JoinTrace`] keeps.
+const JOIN_TRACE: usize = 24;
+
+/// What the last join exchanged with its AP, so that a diagnostic tells an
+/// AP that never answered from an answer the station refused: each
+/// authentication or association request handed to the chip, its release
+/// report, each management frame to the station's address with its status
+/// or reason field, and why the station refused one. Each step carries the
+/// milliseconds since the join began; the first [`JOIN_TRACE`] are kept.
+#[derive(Debug, Default)]
+struct JoinTrace {
+    began: u64,
+    steps: Vec<String>,
+    more: u32,
+}
+
+impl JoinTrace {
+    fn begin(&mut self, now: u64) {
+        self.began = now;
+        self.steps.clear();
+        self.more = 0;
+    }
+
+    fn note(&mut self, now: u64, step: fmt::Arguments<'_>) {
+        if self.steps.len() >= JOIN_TRACE {
+            self.more = self.more.saturating_add(1);
+            return;
+        }
+        let ms = now.saturating_sub(self.began) / 1000;
+        self.steps.push(format!("+{ms} {step}"));
+    }
+
+    /// A management frame the station sent or heard, by its subtype, with
+    /// the status of an authentication or (re)association response and the
+    /// reason of a departure.
+    fn frame(bytes: &[u8]) -> String {
+        let field = |at: usize| {
+            bytes
+                .get(24 + at..26 + at)
+                .map(|value| u16::from_le_bytes([value[0], value[1]]))
+        };
+        let (name, field) = match bytes.first().map(|control| control & 0xfc) {
+            Some(0x00) => ("assoc request", None),
+            Some(0x10) => ("assoc response", field(2).map(|value| ("status", value))),
+            Some(0x20) => ("reassoc request", None),
+            Some(0x30) => ("reassoc response", field(2).map(|value| ("status", value))),
+            Some(0xa0) => ("disassociation", field(0).map(|value| ("reason", value))),
+            Some(0xb0) => ("authentication", field(4).map(|value| ("status", value))),
+            Some(0xc0) => ("deauthentication", field(0).map(|value| ("reason", value))),
+            Some(0xd0) => ("action", None),
+            Some(other) => return format!("management {other:#04x} len={}", bytes.len()),
+            None => return String::from("empty frame"),
+        };
+        match field {
+            Some((kind, value)) => format!("{name} {kind}={value} len={}", bytes.len()),
+            None => format!("{name} len={}", bytes.len()),
+        }
+    }
+}
+
+impl fmt::Display for JoinTrace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "last join: {}", self.steps.join(", "))?;
+        if self.more > 0 {
+            write!(f, " (+{} steps)", self.more)?;
+        }
+        Ok(())
+    }
 }
 
 /// The channels the country admits, which the real check gates at each frame.
@@ -284,40 +556,8 @@ fn management(local: Mac, ap: Mac, subtype: u16, protected: bool, body: &[u8]) -
     bytes
 }
 
-/// `rtw_init_ht_cap` and `rtw_init_vht_cap` of a two-stream 80 MHz RTL8822C, as
-/// the elements an association request carries.
-fn capability_elements(band: Band) -> Vec<u8> {
-    // SGI 20, max A-MSDU 7935, one RX STBC stream, LDPC, TX STBC, 40 MHz,
-    // DSSS/CCK in 40 MHz, SGI 40, and SM power save off.
-    let ht: u16 =
-        (1 << 5) | (1 << 11) | (1 << 8) | 1 | (1 << 7) | (1 << 1) | (1 << 12) | (1 << 6) | (3 << 2);
-    let mut elements = alloc::vec![45, 26];
-    elements.extend_from_slice(&ht.to_le_bytes());
-    // IEEE80211_HT_MAX_AMPDU_64K and IEEE80211_HT_MPDU_DENSITY_2.
-    elements.push(3 | (4 << 2));
-    elements.extend_from_slice(&[0xff, 0xff, 0, 0, 1, 0, 0, 0, 0, 0]);
-    elements.extend_from_slice(&300u16.to_le_bytes());
-    // IEEE80211_HT_MCS_TX_DEFINED.
-    elements.extend_from_slice(&[1, 0, 0, 0]);
-    elements.extend_from_slice(&[0; 7]);
-    // mac80211's `ext_capa`: operating mode notifications.
-    elements.extend_from_slice(&[127, 8, 0, 0, 0, 0, 0, 0, 0, 0x40]);
-    if band == Band::Ghz5 {
-        // MPDU 11454, SGI 80, RX LDPC, TX STBC, one RX STBC stream, HTC-VHT,
-        // the largest A-MPDU.
-        let vht: u32 = 2 | (1 << 5) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 22) | (7 << 23);
-        elements.extend_from_slice(&[191, 12]);
-        elements.extend_from_slice(&vht.to_le_bytes());
-        for _ in 0..2 {
-            // MCS 0-9 on two streams, and 780 Mb/s.
-            elements.extend_from_slice(&0xfffau16.to_le_bytes());
-            elements.extend_from_slice(&780u16.to_le_bytes());
-        }
-    }
-    elements
-}
-
-/// The rates of `rtw_band_2ghz` and `rtw_band_5ghz`.
+/// The rates of rtw88's `rtw_band_2ghz` and `rtw_band_5ghz`, which rtw89's
+/// `rtw89_sband_2ghz` and `rtw89_sband_5ghz` share.
 fn rate_elements(band: Band) -> &'static [u8] {
     match band {
         Band::Ghz2 => &[1, 8, 2, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108],
@@ -325,8 +565,15 @@ fn rate_elements(band: Band) -> &'static [u8] {
     }
 }
 
-/// `ieee80211_probereq_get`: the elements of a scan's probe on `band`.
-fn probe_request(local: Mac, ssid: &[u8], band: Band, extra: &[u8]) -> Vec<u8> {
+/// `ieee80211_probereq_get`: the elements of a scan's probe on `band`, the
+/// device's `capabilities` behind its rates.
+fn probe_request(
+    local: Mac,
+    ssid: &[u8],
+    band: Band,
+    capabilities: &[u8],
+    extra: &[u8],
+) -> Vec<u8> {
     let mut bytes = alloc::vec![0; 24];
     bytes[..2].copy_from_slice(&0x40u16.to_le_bytes());
     bytes[4..10].fill(0xff);
@@ -335,20 +582,9 @@ fn probe_request(local: Mac, ssid: &[u8], band: Band, extra: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&[0, ssid.len() as u8]);
     bytes.extend_from_slice(ssid);
     bytes.extend_from_slice(rate_elements(band));
-    bytes.extend_from_slice(&capability_elements(band));
+    bytes.extend_from_slice(capabilities);
     bytes.extend_from_slice(extra);
     bytes
-}
-
-/// `rtw_update_sta_info`'s rate ID and what it tells firmware of the peer, on
-/// a link `width` wide.
-/// `enum rtw_bandwidth`.
-fn width_code(width: Width) -> u8 {
-    match width {
-        Width::Mhz80 => 2,
-        Width::Mhz40 => 1,
-        _ => 0,
-    }
 }
 
 /// What `ieee80211_crypto_tkip_decrypt` and `ieee80211_rx_h_michael_mic_verify`
@@ -402,103 +638,13 @@ fn check_michael(frame: &mut Mpdu, key: &Key) -> Michael {
     }
 }
 
-fn rate_info(context: &AssociationContext, width: Width, initial: bool, level: u8) -> RateInfo {
-    let negotiated = context.negotiated();
-    let band = context.channel().band;
-    let ht = negotiated.ht.as_ref();
-    let vht = negotiated.vht.as_ref();
-    let legacy = u64::from(negotiated.legacy.supported);
-    let streams = if ht.is_some_and(|ht| ht.peer_rx_mcs[1] != 0) || vht.is_some() {
-        2
-    } else {
-        1
-    };
-    // CCK in bits 0..4, OFDM in 4..12, then HT's or VHT's rates.
-    let mut mask = if band == Band::Ghz2 {
-        legacy
-    } else {
-        legacy << 4
-    };
-    if let Some(vht) = vht {
-        mask |= vht_mask(vht.mcs.rx);
-    } else if let Some(ht) = ht {
-        mask |= (u64::from(ht.peer_rx_mcs[1]) << 20) | (u64::from(ht.peer_rx_mcs[0]) << 12);
-    }
-    let cck_only = band == Band::Ghz2 && vht.is_none() && ht.is_none() && legacy <= 0xf;
-    let mask = dynamic::rates_at_level(mask, level, cck_only);
-    let width = width_code(width);
-    // `get_rate_id`.
-    let rate_id = match (band, vht.is_some(), ht.is_some(), streams, width) {
-        (Band::Ghz2, true, _, 2, _) => 12,
-        (Band::Ghz2, true, _, _, _) => 11,
-        (_, true, _, 2, _) => 9,
-        (_, true, _, _, _) => 10,
-        (Band::Ghz2, _, true, 2, 1) => 0,
-        (Band::Ghz2, _, true, 1, 1) => 1,
-        (Band::Ghz2, _, true, 2, _) => 2,
-        (Band::Ghz2, _, true, _, _) => 3,
-        (_, _, true, 2, _) => 4,
-        (_, _, true, _, _) => 5,
-        (Band::Ghz2, ..) if legacy <= 0xf => RATE_ID_B,
-        (Band::Ghz2, ..) => 6,
-        _ => RATE_ID_G,
-    };
-    RateInfo {
-        mac_id: MAC_ID,
-        rate_id,
-        initial_level: u8::from(initial),
-        short_gi: match width {
-            2 => vht.is_some_and(|vht| vht.capability & (1 << 5) != 0),
-            1 => ht.is_some_and(|ht| ht.capability & (1 << 6) != 0),
-            _ => ht.is_some_and(|ht| ht.capability & (1 << 5) != 0),
-        },
-        width,
-        ldpc: vht.map_or(ht.is_some_and(|ht| ht.capability & 1 != 0), |vht| {
-            vht.capability & (1 << 4) != 0
-        }),
-        no_update: !initial,
-        vht: if vht.is_some() { 2 } else { 0 },
-        mask: mask as u32,
-    }
-}
-
 /// `si->stbc_en`.
-fn peer_stbc(context: &AssociationContext) -> bool {
+pub(super) fn peer_stbc(context: &AssociationContext) -> bool {
     let negotiated = context.negotiated();
     match (&negotiated.vht, &negotiated.ht) {
         (Some(vht), _) => vht.capability & 0x700 != 0,
         (_, Some(ht)) => ht.capability & 0x300 != 0,
         _ => false,
-    }
-}
-
-/// `get_vht_ra_mask`, of the two streams firmware's 32-bit mask reaches.
-fn vht_mask(map: u16) -> u64 {
-    let stream = |map: u16| match map & 3 {
-        0 => 0x0ff,
-        1 => 0x1ff,
-        2 => 0x3ff,
-        _ => 0,
-    };
-    (stream(map) << 12) | (stream(map >> 2) << 22)
-}
-
-/// `get_highest_vht_tx_rate` and `get_highest_ht_tx_rate`: the rate firmware's
-/// rate adaptation starts a frame's descriptor from.
-fn highest_rate(context: &AssociationContext) -> u8 {
-    let negotiated = context.negotiated();
-    if let Some(vht) = &negotiated.vht {
-        match (vht.mcs.tx >> 2) & 3 {
-            0 => 0x3d,
-            1 => 0x3e,
-            _ => 0x3f,
-        }
-    } else if let Some(ht) = &negotiated.ht {
-        if ht.peer_rx_mcs[1] != 0 { 0x1b } else { 0x13 }
-    } else if negotiated.legacy.supported <= 0xf {
-        3
-    } else {
-        0x0b
     }
 }
 
@@ -513,11 +659,11 @@ fn twenty(channel: Channel) -> ChannelDefinition {
     }
 }
 
-/// An RTL8822C kept connected to one network.
-pub type Wifi<D> = Keeper<Rtl8822c<D>>;
+/// A Realtek softMAC chip kept connected to one network.
+pub type Wifi<D> = Keeper<Realtek<D>>;
 
-/// An RTL8822C's association state.
-pub struct Rtl8822c<D: Device> {
+/// A Realtek softMAC chip's association state.
+pub struct Realtek<D: Device> {
     device: D,
     address: Mac,
     clock: Clock,
@@ -535,7 +681,7 @@ pub struct Rtl8822c<D: Device> {
     following: Option<follow::Following>,
     received: VecDeque<Vec<u8>>,
     /// Data frames waiting for room, each with its queue and descriptor.
-    held: VecDeque<(Queue, Packet, Vec<u8>)>,
+    held: VecDeque<(Queue, D::Descriptor, Vec<u8>)>,
     /// Data kept from a TID whose transmit agreement is changing, as
     /// `ieee80211_agg_stop_txq` keeps it in the TXQ.
     parked: VecDeque<(u8, Vec<u8>, TxClass)>,
@@ -574,12 +720,19 @@ pub struct Rtl8822c<D: Device> {
     departing: Option<Ticket>,
     left: bool,
     reported: Vec<&'static str>,
+    /// Why the station's last peer went: the AP's status or reason, a
+    /// frame never acknowledged, or one that never left.
+    departed: Option<crate::wifi::station::Failure>,
+    tkip: TkipCounts,
+    protected: ProtectedCounts,
+    trace: JoinTrace,
+    pending_join: Option<PendingJoin>,
 }
 
-impl<D: Device> Rtl8822c<D> {
+impl<D: Device> Realtek<D> {
     /// `device`, running at `address` under `country`, as a keeper's radio.
     pub fn new(device: D, address: Mac, country: Country, clock: Clock) -> Result<Self, Error> {
-        let channels = channels(&country);
+        let channels = channels(&country, D::CHANNELS_5GHZ);
         let watchdog_at = clock.now_us() + WATCHDOG_US;
         Ok(Self {
             device,
@@ -621,6 +774,11 @@ impl<D: Device> Rtl8822c<D> {
             departing: None,
             left: false,
             reported: Vec::new(),
+            departed: None,
+            tkip: TkipCounts::default(),
+            protected: ProtectedCounts::default(),
+            trace: JoinTrace::default(),
+            pending_join: None,
         })
     }
 
@@ -629,6 +787,17 @@ impl<D: Device> Rtl8822c<D> {
     pub fn keep(self, network: Network, entropy: Arc<dyn Entropy>) -> Wifi<D> {
         let clock = self.clock;
         Keeper::keep(self, network, entropy, clock)
+    }
+
+    /// The device, for its models and diagnostics.
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
+    /// The device, for its models and diagnostics, such as a firmware crash
+    /// asked for on purpose.
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.device
     }
 
     fn hardware<T>(result: Result<T, String>) -> Result<T, Error> {
@@ -669,6 +838,11 @@ impl<D: Device> Rtl8822c<D> {
     }
 
     fn depart(&mut self, ticket: Ticket, failure: Option<crate::wifi::station::Failure>) {
+        if let Some(failure) = failure {
+            self.departed = Some(failure);
+            self.trace
+                .note(self.clock.now_us(), format_args!("left: {failure:?}"));
+        }
         if let Some(failure) = failure
             && self.station.external_authentication().is_some()
         {
@@ -699,8 +873,11 @@ impl<D: Device> Rtl8822c<D> {
 
     /// `rtw_sta_remove` and `rtw_ops_bss_info_changed` of the disassociation.
     fn clear(&mut self) -> Result<(), Error> {
+        // mac80211 disables only the keys it uploaded.
         for key in core::mem::take(&mut self.keys) {
-            Self::hardware(self.device.clear_key(key.entry))?;
+            if key.hardware {
+                Self::hardware(self.device.clear_key(key.entry))?;
+            }
         }
         self.power_save(false)?;
         for agreement in &mut self.agreements {
@@ -710,7 +887,7 @@ impl<D: Device> Rtl8822c<D> {
         self.changes.clear();
         self.aggregating = Default::default();
         self.unaggregated = [false; 8];
-        Self::hardware(self.device.command(commands::media_status(MAC_ID, false)))?;
+        Self::hardware(self.device.left())?;
         Self::hardware(self.device.set_port(Mac([0; 6]), 0, false))?;
         Self::hardware(self.device.filter_beacons(false))?;
         self.context = None;
@@ -721,6 +898,51 @@ impl<D: Device> Rtl8822c<D> {
         self.left = false;
         self.reporting = None;
         Ok(())
+    }
+
+    /// The firmware went, and the device says `why` and what came of it:
+    /// the hardware's half of the association goes as [`Self::clear`] has
+    /// it go, whatever the device refuses, and the station's half starts
+    /// over, for the keeper to join again from a scan once told
+    /// ([`keeper::Event::FirmwareLost`]). Nothing is replayed, as
+    /// `ieee80211_restart_hw` would replay it: the chip came up cold.
+    fn lost(&mut self, why: String) -> Result<(), Error> {
+        // A device that stays off refuses these; `why` says so.
+        let _ = self.clear();
+        self.station = Station::new(self.address).map_err(Error::Station)?;
+        self.scanner = Scanner::new(self.address).map_err(Error::Scan)?;
+        self.hop = None;
+        self.scanned = None;
+        self.observed.clear();
+        self.pending_join = None;
+        self.outbox.clear();
+        self.held.clear();
+        self.parked.clear();
+        self.changes.clear();
+        self.aggregating = Default::default();
+        self.unaggregated = [false; 8];
+        self.no_amsdu = [false; 8];
+        self.rate_amsdu = 0;
+        self.tail_joins = false;
+        self.admitted = None;
+        self.context = None;
+        self.following = None;
+        self.keys.clear();
+        self.management_cipher = None;
+        self.integrity = None;
+        self.tuned = None;
+        self.agreements = Default::default();
+        self.fragments.clear();
+        self.reporting = None;
+        self.port_open = false;
+        self.departing = None;
+        self.left = false;
+        // What the lost association's frames would have the keeper do goes
+        // with it: an EAPOL or SAE frame the halt's look still delivered.
+        self.events
+            .retain(|event| matches!(event, keeper::Event::Unsupported(_)));
+        self.events.push_back(keeper::Event::FirmwareLost);
+        Err(Error::Lost(why))
     }
 
     fn observed(&self, handle: usize) -> Result<Arc<NativeBssObservation>, Error> {
@@ -761,7 +983,10 @@ impl<D: Device> Rtl8822c<D> {
         let active = request.active() && self.probes(channel);
         let probes: Vec<Vec<u8>> = if active {
             let extra = request.extra_elements();
-            let probe = |ssid: &Vec<u8>| probe_request(self.address, ssid, channel.band, extra);
+            let (capabilities, _) = self.device.advertisement(channel.band);
+            let probe = |ssid: &Vec<u8>| {
+                probe_request(self.address, ssid, channel.band, &capabilities, extra)
+            };
             request.ssids().iter().map(probe).collect()
         } else {
             Vec::new()
@@ -804,8 +1029,8 @@ impl<D: Device> Rtl8822c<D> {
         if self.watchdogs & 3 == 0
             && let Some(context) = &self.context
         {
-            let info = rate_info(context, self.width(context), false, level);
-            Self::hardware(self.device.command(commands::ra_info(info)))?;
+            let width = self.width(context);
+            Self::hardware(self.device.refresh_rates(context, width, level, false))?;
         }
         self.watchdogs = self.watchdogs.wrapping_add(1);
         // `rtw_recalc_lps`, with `ieee80211_powersave_allowed`.
@@ -856,34 +1081,21 @@ impl<D: Device> Rtl8822c<D> {
             .is_some_and(follow::Following::silent)
     }
 
-    /// `rtw_tx_mgmt_pkt_info_update` of `bytes`, at the BSS's lowest basic rate.
+    /// The device's descriptor of the management frame `bytes`, at the BSS's
+    /// lowest basic rate.
     fn management_packet(
         &self,
         band: Band,
         bytes: &[u8],
         report: Option<u8>,
         basic: Option<u16>,
-    ) -> Packet {
-        let (rate_id, lowest) = if band == Band::Ghz2 {
-            (RATE_ID_B, RATE_1M)
-        } else {
-            (RATE_ID_G, RATE_6M)
-        };
-        let rate = basic
-            .filter(|&basic| basic != 0)
-            .map_or(lowest, |basic| lowest + basic.trailing_zeros() as u8);
-        Packet {
-            size: bytes.len() as u16,
-            multicast: bytes[4] & 1 != 0,
-            mac_id: MAC_ID,
-            queue: QSEL_MANAGEMENT,
-            rate_id,
+    ) -> D::Descriptor {
+        self.device.management(&Management {
+            mpdu: bytes,
+            band,
+            basic,
             report,
-            fixed_rate: true,
-            rate,
-            device_sequence: true,
-            ..Packet::default()
-        }
+        })
     }
 
     fn send_management(&mut self) -> Result<(), Error> {
@@ -907,6 +1119,10 @@ impl<D: Device> Rtl8822c<D> {
             if let Some(ticket) = ticket {
                 self.reporting = report;
                 self.report = self.report.wrapping_add(4);
+                self.trace.note(
+                    self.clock.now_us(),
+                    format_args!("sent {}", JoinTrace::frame(&bytes)),
+                );
                 self.station.submitted(ticket).map_err(Error::Station)?;
             }
         }
@@ -947,9 +1163,9 @@ impl<D: Device> Rtl8822c<D> {
             if !Self::hardware(self.device.transmit(*queue, packet, mpdu))? {
                 return Ok(());
             }
-            let session = packet
-                .aggregate
-                .and(self.aggregating[usize::from(packet.queue)].clone());
+            let session = self.aggregating[usize::from(packet.tid())]
+                .clone()
+                .filter(|_| packet.aggregated());
             self.held.pop_front();
             if let Some(session) = session {
                 let now = self.clock.now_us();
@@ -997,7 +1213,7 @@ impl<D: Device> Rtl8822c<D> {
                     let tid = session.tid();
                     // mac80211 numbers a frame as it leaves the TXQ, so nothing
                     // it stopped has a number. What this numbered goes first.
-                    if self.held.iter().any(|(_, packet, _)| packet.queue == tid) {
+                    if self.held.iter().any(|(_, packet, _)| packet.tid() == tid) {
                         self.changes
                             .push_front(tx::Action::Prepare { ticket, session });
                         return Ok(());
@@ -1054,8 +1270,8 @@ impl<D: Device> Rtl8822c<D> {
                         let tid = session.tid();
                         self.aggregating[usize::from(tid)] = None;
                         for (_, packet, _) in &mut self.held {
-                            if packet.queue == tid {
-                                packet.aggregate = None;
+                            if packet.tid() == tid {
+                                packet.stop_aggregating();
                             }
                         }
                     }
@@ -1153,9 +1369,9 @@ impl<D: Device> Rtl8822c<D> {
                 )
                 .map_err(Error::Data)?;
             if let Some((_, packet, mpdu)) = self.held.back_mut() {
-                let iv = if packet.security == 0 { 0 } else { IV_BYTES };
+                let iv = if packet.protected() { IV_BYTES } else { 0 };
                 amsdu::append(mpdu, plan.plaintext_mpdu(), iv);
-                packet.size = mpdu.len() as u16;
+                packet.resize(mpdu.len());
             }
             return Ok(());
         }
@@ -1182,35 +1398,20 @@ impl<D: Device> Rtl8822c<D> {
         }
         .map_err(Error::Data)?;
         let (_, _, mpdu, protection, _, _) = plan.into_parts();
-        let security = match protection {
-            Protection::None => 0,
-            Protection::HostIv { .. } => SECURITY_CCMP,
+        let protected = match protection {
+            Protection::None => false,
+            Protection::HostIv { .. } => true,
             Protection::Firmware { .. } => return Err(Error::Refused("a firmware key")),
         };
         let queue = tid.map_or(Queue::BestEffort, tid_queue);
-        let info = rate_info(&context, self.width(&context), false, 0);
-        let aggregate = tid
-            .and_then(|tid| self.aggregating[usize::from(tid)].as_ref())
-            .and(context.negotiated().ht.as_ref())
-            .map(|ht| {
-                Aggregate::from_ht(ht.peer_ampdu_base_exponent | (ht.peer_mpdu_spacing << 2))
-            });
-        let packet = Packet {
-            size: mpdu.len() as u16,
-            multicast: mpdu[4] & 1 != 0,
-            mac_id: MAC_ID,
-            queue: tid.unwrap_or(0),
-            rate_id: info.rate_id,
-            security,
-            rate: highest_rate(&context),
-            width: info.width,
-            ldpc: info.ldpc,
-            stbc: u8::from(peer_stbc(&context)),
-            aggregate,
-            // `rtw_tx_pkt_info_update`: mac80211 numbers a data frame.
-            sequence: u16::from_le_bytes([mpdu[22], mpdu[23]]) >> 4,
-            ..Packet::default()
-        };
+        let packet = self.device.data(&Data {
+            mpdu: &mpdu,
+            context: &context,
+            width: self.width(&context),
+            tid,
+            protected,
+            aggregate: tid.is_some_and(|tid| self.aggregating[usize::from(tid)].is_some()),
+        });
         if self.held.len() >= MAX_HELD {
             self.held.pop_front();
         }
@@ -1247,21 +1448,9 @@ impl<D: Device> Rtl8822c<D> {
             && context.channel().band != Band::Ghz2
             && !self.no_amsdu[usize::from(tid)]
             && self.held.back().is_some_and(|(_, packet, mpdu)| {
-                packet.queue == tid
-                    && mpdu.len() + size + amsdu::SUBFRAME_OVERHEAD
-                        <= limit.min(transmit::MAX_FRAME)
+                packet.tid() == tid
+                    && mpdu.len() + size + amsdu::SUBFRAME_OVERHEAD <= limit.min(D::MAX_FRAME)
             })
-    }
-
-    /// `rtw_fw_ra_report_iter`'s `max_rc_amsdu_len`, on the width set up for
-    /// the peer when firmware does not name one.
-    fn rate_reported(&mut self, rate: u8, short_gi: bool, width: Option<u8>) {
-        let width = width.unwrap_or_else(|| {
-            self.context
-                .as_deref()
-                .map_or(0, |context| width_code(self.width(context)))
-        });
-        self.rate_amsdu = bit_rate::max_amsdu(bit_rate::bit_rate(rate, short_gi, width));
     }
 
     fn take_incoming(&mut self, now: u64) -> Result<(), Error> {
@@ -1272,27 +1461,34 @@ impl<D: Device> Rtl8822c<D> {
         }
         for item in incoming {
             match item {
-                Incoming::Report(Report::Transmitted {
-                    number,
-                    acknowledged,
-                }) => {
-                    if self.reporting == Some(number) {
-                        self.reporting = None;
-                        self.station
-                            .management_status(acknowledged, now)
-                            .map_err(Error::Station)?;
-                    }
-                    if let Some(following) = &mut self.following {
-                        following.reported(number, acknowledged, now);
+                Incoming::Report(report) => {
+                    // The width set up for the peer, which a report may leave
+                    // out.
+                    let width = self
+                        .context
+                        .as_deref()
+                        .map_or(Width::Mhz20, |context| self.width(context));
+                    match self.device.reported(&report, width) {
+                        Some(Reported::Transmitted {
+                            number,
+                            acknowledged,
+                        }) => {
+                            if self.reporting == Some(number) {
+                                self.reporting = None;
+                                let status = if acknowledged { "acked" } else { "unacked" };
+                                self.trace.note(now, format_args!("{status}"));
+                                self.station
+                                    .management_status(acknowledged, now)
+                                    .map_err(Error::Station)?;
+                            }
+                            if let Some(following) = &mut self.following {
+                                following.reported(number, acknowledged, now);
+                            }
+                        }
+                        Some(Reported::Amsdu(limit)) => self.rate_amsdu = limit,
+                        None => {}
                     }
                 }
-                Incoming::Report(Report::Rate {
-                    mac_id: MAC_ID,
-                    rate,
-                    short_gi,
-                    width,
-                }) => self.rate_reported(rate, short_gi, width),
-                Incoming::Report(_) => {}
                 Incoming::Frame(frame) => {
                     if let Some(mpdu) = self.mpdu(frame)
                         && let Err(error) = self.frame(mpdu, now)
@@ -1361,38 +1557,74 @@ impl<D: Device> Rtl8822c<D> {
             return Ok(());
         }
         if header.control & 12 == 0 {
-            return self.management_frame(frame, now);
+            let multicast = header.receiver.is_multicast();
+            // `ieee80211_accept_frame`: a station takes what is addressed to
+            // it or to everyone; the chip hands over others' frames too.
+            if !multicast && header.receiver != self.address {
+                return Ok(());
+            }
+            if !multicast {
+                let heard = JoinTrace::frame(frame.bytes());
+                self.trace.note(now, format_args!("heard {heard}"));
+            }
+            let result = self.management_frame(frame, now);
+            if !multicast && let Err(error) = &result {
+                self.trace.note(now, format_args!("refused: {error}"));
+            }
+            return result;
         }
         if header.control & 12 != 8 || !header.data_present() {
             return Ok(());
         }
         if header.protected() {
             let multicast = header.receiver.is_multicast();
+            let ours = match multicast {
+                true => self
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| header.transmitter == Some(context.bssid())),
+                false => header.receiver == self.address,
+            };
+            let kind = usize::from(multicast);
+            let tally = |field: &mut [u32; 2]| {
+                if ours {
+                    field[kind] = field[kind].saturating_add(1);
+                }
+            };
+            tally(&mut self.protected.heard);
             let index = frame.bytes().get(header.length + 3).map(|byte| byte >> 6);
             let held = self
                 .keys
                 .iter()
                 .position(|key| key.pairwise != multicast && Some(key.index) == index);
-            let Some(held) = held else {
-                return Ok(());
-            };
-            let Some(key) = self.keys[held].slot.installed() else {
+            let installed = held.and_then(|held| Some((held, self.keys[held].slot.installed()?)));
+            let Some((held, key)) = installed else {
+                tally(&mut self.protected.unkeyed);
                 return Ok(());
             };
             if frame.security.icv_error {
+                tally(&mut self.protected.icv);
                 return Ok(());
             }
-            if self.keys[held].material.len() == Cipher::Tkip.key_length()
-                && frame.security.decrypted
-            {
+            let tkip = self.keys[held].material.len() == Cipher::Tkip.key_length();
+            // A key the chip never took leaves its frames as they came.
+            let software = tkip && !self.keys[held].hardware && !frame.security.decrypted;
+            if tkip && (frame.security.decrypted || software) {
                 if header.fragmented() {
                     self.unsupported("a fragmented TKIP frame");
                     return Ok(());
+                }
+                if software {
+                    let Some(decrypted) = self.decrypt_tkip(&mut frame, held) else {
+                        return Ok(());
+                    };
+                    frame = decrypted;
                 }
                 match check_michael(&mut frame, &self.keys[held]) {
                     Michael::Intact => {}
                     Michael::Dropped => return Ok(()),
                     Michael::Failed => {
+                        self.tkip.michael_failures = self.tkip.michael_failures.saturating_add(1);
                         let pairwise = !multicast;
                         self.events
                             .push_back(keeper::Event::MichaelFailure { pairwise });
@@ -1408,6 +1640,46 @@ impl<D: Device> Rtl8822c<D> {
         }
         self.order(frame, now);
         Ok(())
+    }
+
+    /// `ieee80211_crypto_tkip_decrypt` of a data frame the chip left under a
+    /// TKIP key it refused: decrypted under the key's temporal half as the AP
+    /// sent it, the IV and ICV kept, and marked decrypted as a chip marks
+    /// what it decrypted (`RX_FLAG_DECRYPTED` alone), so the Michael and
+    /// replay checks follow as for rtw88's. `None` drops a frame from
+    /// another transmitter, as mac80211 drops one with no station, or one
+    /// `ieee80211_tkip_decrypt_data` refuses, its replay check first and a
+    /// failed ICV counted, with no verdict on its Michael.
+    fn decrypt_tkip(&mut self, frame: &mut Mpdu, held: usize) -> Option<Mpdu> {
+        let header = *frame.header();
+        let transmitter = header
+            .transmitter
+            .filter(|&transmitter| Some(transmitter) == self.station.pairwise_peer())?;
+        let (number, _) =
+            PacketNumber::from_tkip_header(frame.bytes().get(header.length..)?).ok()?;
+        frame.security.pn = Some(number);
+        if self.keys[held].slot.replays(frame) {
+            return None;
+        }
+        let temporal = self.keys[held].material.first_chunk::<16>()?;
+        let mut bytes = frame.bytes().to_vec();
+        let body = bytes.get_mut(header.length..)?;
+        match security::tkip::decrypt(temporal, &transmitter.0, body) {
+            Ok(()) => {}
+            Err(security::tkip::Failure::Icv) => {
+                self.tkip.icv_failures = self.tkip.icv_failures.saturating_add(1);
+                return None;
+            }
+            Err(_) => return None,
+        }
+        let security = SecurityStatus {
+            decrypted: true,
+            integrity: Integrity::Verified,
+            ..frame.security
+        };
+        let decrypted = Mpdu::new(bytes, frame.radio.clone(), security).ok()?;
+        self.tkip.decrypted = self.tkip.decrypted.saturating_add(1);
+        Some(decrypted)
     }
 
     /// `ieee80211_sta_manage_reorder_buf` for a frame under an agreement.
@@ -1499,6 +1771,23 @@ impl<D: Device> Rtl8822c<D> {
             .iter_mut()
             .find(|heard| heard.observation.bss().bssid == bss.bssid);
         match known {
+            // cfg80211 keeps a BSS's beacon apart from its probe responses
+            // (`beacon_ies`): a probe response on the beacon's channel
+            // leaves the beacon the observation, as the association needs
+            // its TIM, named by the response where the beacon hides its
+            // SSID (`cfg80211_update_hidden_bsses`).
+            Some(heard)
+                if bss.kind == ScanKind::ProbeResponse
+                    && heard.observation.bss().kind == ScanKind::Beacon
+                    && heard.observation.bss().channel == bss.channel =>
+            {
+                let mut beacon = heard.observation.bss().clone();
+                beacon.keep_name_of(&bss);
+                if beacon.ssid != heard.observation.bss().ssid {
+                    heard.observation = Arc::new(NativeBssObservation { bss: beacon });
+                }
+                heard.at = now;
+            }
             Some(heard) => {
                 bss.keep_name_of(heard.observation.bss());
                 heard.observation = Arc::new(NativeBssObservation { bss });
@@ -1511,10 +1800,63 @@ impl<D: Device> Rtl8822c<D> {
         }
     }
 
+    /// A beacon outside a scan from the BSS a pending join waits for: kept
+    /// as its observation, and the join begins.
+    fn beacon_for_join(&mut self, frame: &Mpdu, now: u64) -> Result<(), Error> {
+        let Some(pending) = &self.pending_join else {
+            return Ok(());
+        };
+        if frame.header().transmitter != Some(pending.bssid) {
+            return Ok(());
+        }
+        let ticket = self.observed(pending.handle)?.bss().ticket;
+        let mut policy = Admitted(&self.channels);
+        let Ok(bss) = self.scanner.observe_beacon(ticket, frame, &mut policy) else {
+            return Ok(());
+        };
+        if bss.bssid != pending.bssid {
+            return Ok(());
+        }
+        self.hear(bss, now);
+        self.trace.note(now, format_args!("heard its beacon"));
+        self.begin_pending(now)
+    }
+
+    /// Begin the pending join, at its beacon or once it waited long enough.
+    fn begin_pending(&mut self, now: u64) -> Result<(), Error> {
+        let Some(pending) = self.pending_join.take() else {
+            return Ok(());
+        };
+        if let Err(error) = self.begin(pending.handle, pending.join, now) {
+            self.trace
+                .note(now, format_args!("could not begin: {error}"));
+        }
+        Ok(())
+    }
+
+    /// `ieee80211_mgd_auth`: the station's authentication with the BSS a
+    /// scan observed.
+    fn begin(&mut self, handle: usize, join: Join, now: u64) -> Result<(), Error> {
+        let observed = self.observed(handle)?;
+        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
+        let mut policy = Admitted(&self.channels);
+        let action = if join.request.pmf().is_some() {
+            self.station
+                .begin_modern_pmf(join, observed, now, &mut policy)
+        } else {
+            self.station
+                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+        }
+        .map_err(Error::Station)?;
+        self.act(action);
+        Ok(())
+    }
+
     fn management_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         // What is heard outside a scan matters only of the associated AP.
         match header.control & 0xfc {
+            0x80 if self.pending_join.is_some() => return self.beacon_for_join(&frame, now),
             0x80 => return self.beacon_heard(&frame, now),
             0x50 => return Ok(()),
             _ => {}
@@ -1751,10 +2093,21 @@ impl<D: Device> Rtl8822c<D> {
     fn operate(&mut self) -> Result<(), Error> {
         let now = self.clock.now_us();
         self.take_incoming(now)?;
+        if let Some(why) = self.device.recover() {
+            return self.lost(why);
+        }
         Self::hardware(self.device.coexist(now))?;
         self.announce_streams()?;
         self.watchdog(now)?;
         self.walk(now)?;
+        if self
+            .pending_join
+            .as_ref()
+            .is_some_and(|pending| now >= pending.until)
+        {
+            self.trace.note(now, format_args!("no beacon heard"));
+            self.begin_pending(now)?;
+        }
         self.release_expired(now);
         let mut policy = Admitted(&self.channels);
         if !self.left
@@ -1796,8 +2149,9 @@ impl<D: Device> Rtl8822c<D> {
     }
 }
 
-/// The channels mac80211 registers, as `country` leaves them.
-fn channels(country: &Country) -> Vec<(Channel, u32)> {
+/// The channels mac80211 registers, 5 GHz's those of `channels_5ghz`, as
+/// `country` leaves them.
+fn channels(country: &Country, channels_5ghz: &[u16]) -> Vec<(Channel, u32)> {
     let mut out = Vec::new();
     let mut band = |band: Band, numbers: &[u16], frequency: fn(u16) -> u16| {
         let centers: Vec<u16> = numbers.iter().map(|&number| frequency(number)).collect();
@@ -1828,19 +2182,14 @@ fn channels(country: &Country) -> Vec<(Channel, u32)> {
             }
         },
     );
-    band(Band::Ghz5, &CHANNELS_5GHZ, |number| 5000 + 5 * number);
+    band(Band::Ghz5, channels_5ghz, |number| 5000 + 5 * number);
     out
 }
 
-/// `rtw_channeltable_5g`.
-const CHANNELS_5GHZ: [u16; 25] = [
-    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-    149, 153, 157, 161, 165,
-];
 const SUPPORTED_2GHZ: [u8; 2] = [1, 14];
 const SUPPORTED_5GHZ: [u8; 4] = [36, 28, 149, 9];
 
-/// `rtw_tx_ac_to_hwq` of a TID's access category.
+/// `ieee802_1d_to_ac`: a TID's access category.
 fn tid_queue(tid: u8) -> Queue {
     match tid {
         1 | 2 => Queue::Background,
@@ -1850,7 +2199,7 @@ fn tid_queue(tid: u8) -> Queue {
     }
 }
 
-impl<D: Device> Link for Rtl8822c<D> {
+impl<D: Device> Link for Realtek<D> {
     fn mac(&self) -> Mac {
         self.address
     }
@@ -1876,17 +2225,55 @@ impl<D: Device> Link for Rtl8822c<D> {
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         Ok(self.received.pop_front())
     }
+    /// Why the last peer went, when one did, then the hardware's own state.
+    fn diagnostic(&mut self) -> Option<String> {
+        let departed = self.departed.map(|failure| match failure {
+            crate::wifi::station::Failure::PeerRejected(status) => {
+                format!("the AP refused the last join with status {status}")
+            }
+            crate::wifi::station::Failure::PeerDeparture(reason) => {
+                format!("the AP ended the last association with reason {reason}")
+            }
+            crate::wifi::station::Failure::Timeout => {
+                String::from("the AP did not answer the last join in time")
+            }
+            crate::wifi::station::Failure::Transmit => {
+                String::from("a frame of the last join never left")
+            }
+            crate::wifi::station::Failure::MultiLink => {
+                String::from("the AP MLD's answer broke the last join's multi-link setup")
+            }
+        });
+        let tkip = self.tkip;
+        let tkip = (tkip != TkipCounts::default()).then(|| {
+            format!(
+                "tkip group decrypted={} icv-failures={} michael-failures={}",
+                tkip.decrypted, tkip.icv_failures, tkip.michael_failures
+            )
+        });
+        let protected = self.protected;
+        let protected = (protected != ProtectedCounts::default()).then(|| format!("{protected}"));
+        let trace = (!self.trace.steps.is_empty()).then(|| format!("{}", self.trace));
+        let parts: Vec<String> = [departed, protected, tkip, trace, self.device.diagnostic()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
 }
 
-impl<D: Device> Radio for Rtl8822c<D> {
+impl<D: Device> Radio for Realtek<D> {
     type Handle = usize;
     type Profile = ();
     type Management = Arc<ManagementKey>;
     type Error = Error;
 
-    const NAME: &'static str = "rtw88";
-    /// rtw88 leaves `max_listen_interval` at mac80211's default.
+    const NAME: &'static str = D::DRIVER;
+    /// rtw88 and rtw89 leave `max_listen_interval` at mac80211's default.
     const LISTEN_INTERVAL: u16 = 5;
+    /// A TKIP group key is the CAM's or, where the chip refuses it, the
+    /// host's.
+    const TKIP_GROUP: bool = true;
 
     fn deferred(error: &Error) -> bool {
         matches!(error, Error::Pending)
@@ -1907,7 +2294,10 @@ impl<D: Device> Radio for Rtl8822c<D> {
             Stage::Scanned
         } else if self.admitted.is_some() {
             Stage::Admitted
-        } else if self.hop.is_none() && self.station.phase() == Peering::Idle {
+        } else if self.hop.is_none()
+            && self.pending_join.is_none()
+            && self.station.phase() == Peering::Idle
+        {
             Stage::Idle
         } else {
             Stage::Busy
@@ -1945,18 +2335,16 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn advertisement(&self, band: Band) -> Result<Advertisement, Error> {
+        let (capability_elements, he_source_maps) = self.device.advertisement(band);
         let mut elements = rate_elements(band).to_vec();
-        elements.extend_from_slice(&capability_elements(band));
+        elements.extend_from_slice(&capability_elements);
         elements.extend_from_slice(&WMM_ELEMENT);
         let capabilities = Capabilities::parse(band, Role::Station, &elements)
             .map_err(|_| Error::Refused("advertisement"))?;
         Ok(Advertisement {
             capabilities,
             elements,
-            he_source_maps: [McsMaps {
-                rx: 0xffff,
-                tx: 0xffff,
-            }; 3],
+            he_source_maps,
             multi_link: Some(false),
         })
     }
@@ -2020,21 +2408,27 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn join(&mut self, handle: usize, join: Join, _: ()) -> Result<(), Error> {
-        let observed = self.observed(handle)?;
-        let bss = observed.bss().clone();
+        let bss = self.observed(handle)?.bss().clone();
         self.approach(&bss)?;
         let now = self.clock.now_us();
-        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
-        let mut policy = Admitted(&self.channels);
-        let action = if join.request.pmf().is_some() {
-            self.station
-                .begin_modern_pmf(join, observed, now, &mut policy)
-        } else {
-            self.station
-                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+        self.trace.begin(now);
+        if bss.kind == ScanKind::Beacon {
+            return self.begin(handle, join, now);
         }
-        .map_err(Error::Station)?;
-        self.act(action);
+        let wait = BEACON_WAIT_INTERVALS * u64::from(bss.beacon_interval.max(1)) * 1024;
+        self.trace.note(
+            now,
+            format_args!(
+                "heard only a probe response: waits {} ms for a beacon",
+                wait / 1000
+            ),
+        );
+        self.pending_join = Some(PendingJoin {
+            handle,
+            join,
+            bssid: bss.bssid,
+            until: now + wait,
+        });
         Ok(())
     }
 
@@ -2073,7 +2467,10 @@ impl<D: Device> Radio for Rtl8822c<D> {
         _: Option<Affiliation>,
         _: u64,
     ) -> Result<Arc<external::Session>, Error> {
-        Err(Error::Unsupported("6 GHz on an RTL8822C"))
+        Err(Error::Lacks {
+            what: "6 GHz",
+            chip: D::CHIP,
+        })
     }
 
     fn transmit_external_authentication(
@@ -2109,7 +2506,7 @@ impl<D: Device> Radio for Rtl8822c<D> {
         Ok(())
     }
 
-    /// `rtw_sta_add`, then `rtw_ops_bss_info_changed` of the association.
+    /// `sta_state`'s association, then `bss_info_changed` of it.
     fn configure(&mut self) -> Result<(), Error> {
         let (ticket, context) = self
             .admitted
@@ -2124,23 +2521,9 @@ impl<D: Device> Radio for Rtl8822c<D> {
             Self::hardware(self.device.set_edca(&wmm.access_categories, slot))?;
         }
         let following = follow::Following::new(&context, self.clock.now_us());
-        let info = rate_info(&context, following.width(), true, 0);
+        let width = following.width();
         self.following = Some(following);
-        Self::hardware(self.device.command(commands::ra_info(info)))?;
-        Self::hardware(self.device.command(commands::media_status(MAC_ID, true)))?;
-        Self::hardware(self.device.set_port(
-            context.bssid(),
-            context.response().aid & 0x7ff,
-            true,
-        ))?;
-        let interval = context.beacon().beacon_interval;
-        Self::hardware(self.device.set_beacon(interval, context.dtim_period()))?;
-        let wmm = context.negotiated().wmm.is_some();
-        let aid = context.response().aid & 0x7ff;
-        let band = context.channel().band;
-        let pages = templates::build(self.address, context.bssid(), aid, wmm, band);
-        Self::hardware(self.device.set_templates(&pages))?;
-        Self::hardware(self.device.command(commands::default_port(PORT, MAC_ID)))?;
+        Self::hardware(self.device.joined(self.address, &context, width))?;
         self.no_amsdu = [false; 8];
         self.rate_amsdu = 0;
         self.context = Some(context.clone());
@@ -2163,7 +2546,11 @@ impl<D: Device> Radio for Rtl8822c<D> {
         self.send(ethernet, class)
     }
 
-    /// `rtw_ops_set_key`: the CAM takes CCMP-128 alone of what a station uses.
+    /// `set_key`: the key table takes CCMP-128 alone of what a station uses,
+    /// and a TKIP group key where the chip takes TKIP. One that refuses it,
+    /// as `rtw89_cam_sec_key_add` does without `hw_tkip_crypto`, leaves the
+    /// TKIP group key to the host, which decrypts under it as mac80211 does
+    /// and tells the chip nothing.
     fn install_key(
         &mut self,
         pairwise: bool,
@@ -2171,16 +2558,19 @@ impl<D: Device> Radio for Rtl8822c<D> {
         material: &[u8],
         receive: ReplaySeed,
     ) -> Result<KeyIdentity, Error> {
-        // rtw88 takes TKIP as `RTW_CAM_TKIP` and leaves Michael to mac80211.
-        let (cipher, kind) = if material.len() == Cipher::Ccmp128.key_length() {
-            (Cipher::Ccmp128, CAM_AES)
+        // rtw88 takes a TKIP key's temporal half and leaves Michael to
+        // mac80211.
+        let cipher = if material.len() == Cipher::Ccmp128.key_length() {
+            Cipher::Ccmp128
         } else if !pairwise && material.len() == Cipher::Tkip.key_length() {
-            (Cipher::Tkip, CAM_TKIP)
+            Cipher::Tkip
         } else {
-            return Err(Error::Unsupported(
-                "a key other than CCMP-128 or a TKIP group key on an RTL8822C",
-            ));
+            return Err(Error::Lacks {
+                what: "a key other than CCMP-128 or a TKIP group key",
+                chip: D::CHIP,
+            });
         };
+        let hardware = cipher != Cipher::Tkip || D::HARDWARE_TKIP;
         let temporal = material
             .first_chunk::<16>()
             .ok_or(Error::Refused("key material"))?;
@@ -2206,30 +2596,57 @@ impl<D: Device> Radio for Rtl8822c<D> {
             .map_err(Error::Key)?;
         let identity = ticket.identity();
         let entry = if pairwise { PAIRWISE_CAM } else { index };
-        Self::hardware(self.device.write_key(&CamKey {
-            entry,
-            index,
-            kind,
-            group: !pairwise,
-            peer: if pairwise { peer } else { Mac::BROADCAST },
-            material: temporal,
-        }))?;
+        let replaced = self
+            .keys
+            .iter()
+            .position(|key| key.pairwise == pairwise && key.index == index);
+        if hardware {
+            Self::hardware(self.device.write_key(&KeyEntry {
+                entry,
+                index,
+                cipher,
+                group: !pairwise,
+                peer: if pairwise { peer } else { Mac::BROADCAST },
+                material: temporal,
+            }))?;
+        } else if let Some(old) = replaced.filter(|&old| self.keys[old].hardware) {
+            // `ieee80211_key_replace`: the key the CAM held at this index
+            // leaves it.
+            Self::hardware(self.device.clear_key(self.keys[old].entry))?;
+        }
         slot.complete_install(ticket, InstallOutcome::Accepted)
             .map_err(Error::Key)?;
-        self.keys
-            .retain(|key| !(key.pairwise == pairwise && key.index == index));
+        if let Some(old) = replaced {
+            self.keys.remove(old);
+        }
         self.keys.push(Key {
             slot,
             pairwise,
             index,
             entry,
+            hardware,
             material: Zeroizing::new(material.to_vec()),
         });
+        // A group key installed while the port is open is a group
+        // handshake's rekey, which the keeper installs only once its message
+        // 1 was authenticated: the port is authorized again with it, so the
+        // AP's frames under the new GTK pass, as mac80211 takes them under
+        // the group key it was last given.
+        if !pairwise && self.port_open {
+            let epoch = self
+                .station
+                .association_epoch()
+                .ok_or(Error::Refused("no association"))?;
+            self.authorize_port(epoch)?;
+        }
         Ok(identity)
     }
 
     fn install_link_key(&mut self, _: u8, _: u8, _: &[u8], _: ReplaySeed) -> Result<(), Error> {
-        Err(Error::Unsupported("MLO on an RTL8822C"))
+        Err(Error::Lacks {
+            what: "MLO",
+            chip: D::CHIP,
+        })
     }
 
     /// The IGTK stays in the host, where mac80211 runs BIP for rtw88.
@@ -2294,6 +2711,8 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn deauthenticate(&mut self, reason: u16) -> Result<(), Error> {
+        // A join still waiting for its beacon sent nothing to leave.
+        self.pending_join = None;
         if self.left || self.station.phase() == Peering::Idle {
             return Ok(());
         }

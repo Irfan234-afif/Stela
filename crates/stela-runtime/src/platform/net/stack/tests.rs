@@ -886,6 +886,28 @@ fn a_dhcp_wait_that_ends_without_a_lease_says_what_came_and_why_it_was_not_taken
     assert!(summary.ends_with("lease=unseen"), "{summary}");
 }
 
+/// A link that came back asks DHCP from discovery again: the lease goes
+/// at the next poll, and a new one comes; an address set by hand stays.
+#[test]
+fn rediscovery_drops_the_lease_and_takes_a_new_one() {
+    let (mut stack, _answering, _clock) = dhcpd(true);
+    stack.dhcp().unwrap();
+    stack.take_notes();
+    stack.rediscover();
+    stack.poll().unwrap();
+    assert!(stack.config().is_none());
+    let leased = stack.dhcp().unwrap().address;
+    assert_eq!(leased.address(), CLIENT_IP);
+    let notes = stack.take_notes();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[0].starts_with("DHCP lease 10.0.2.15/24 lost after "));
+    assert!(notes[1].starts_with("DHCP lease 10.0.2.15/24 lease="));
+    stack.set_ipv4(CLIENT_IP, 24, None).unwrap();
+    stack.rediscover();
+    stack.poll().unwrap();
+    assert!(stack.config().is_some());
+}
+
 /// LOG-2: a lease is noted with its time, server, mask and router, and its
 /// loss with its age; a stack configured by hand has no DHCP summary.
 #[test]
