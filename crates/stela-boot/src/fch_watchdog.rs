@@ -117,7 +117,7 @@ pub(crate) fn stop() -> bool {
     if !ARMED.load(Ordering::Acquire) {
         return false;
     }
-    mapped(|registers| fch::stop(registers));
+    mapped(fch::stop);
     true
 }
 
