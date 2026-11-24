@@ -28,7 +28,10 @@ use crate::{
             channel::{DISABLED, NO_IR},
             database::Country,
         },
-        scan::{self, Outcome, Retirement, Scanner, result::Bss},
+        scan::{
+            self, Outcome, Retirement, Scanner,
+            result::{Bss, Kind as ScanKind},
+        },
         security::{
             self, Cipher, InstallOutcome, Integrity, KeyIdentity, KeyScope, KeySlot, PacketNumber,
             ReplaySeed, SecurityStatus,
@@ -358,6 +361,21 @@ pub struct ManagementKey;
 struct Heard {
     observation: Arc<NativeBssObservation>,
     at: u64,
+}
+
+/// The beacon intervals a join whose BSS was heard only in a probe
+/// response waits on its channel for a beacon.
+const BEACON_WAIT_INTERVALS: u64 = 3;
+
+/// A join waiting on its BSS's channel for the beacon the association
+/// needs (its TIM's DTIM), having heard only a probe response: an active
+/// scan's 30 ms dwell rarely holds a 100 TU beacon. It begins at the beacon
+/// or at `until`, whichever comes first.
+struct PendingJoin {
+    handle: usize,
+    join: Join,
+    bssid: Mac,
+    until: u64,
 }
 
 /// A scan's walk over its channels, `ieee80211_scan_work`.
@@ -708,6 +726,7 @@ pub struct Realtek<D: Device> {
     tkip: TkipCounts,
     protected: ProtectedCounts,
     trace: JoinTrace,
+    pending_join: Option<PendingJoin>,
 }
 
 impl<D: Device> Realtek<D> {
@@ -759,6 +778,7 @@ impl<D: Device> Realtek<D> {
             tkip: TkipCounts::default(),
             protected: ProtectedCounts::default(),
             trace: JoinTrace::default(),
+            pending_join: None,
         })
     }
 
@@ -894,6 +914,7 @@ impl<D: Device> Realtek<D> {
         self.hop = None;
         self.scanned = None;
         self.observed.clear();
+        self.pending_join = None;
         self.outbox.clear();
         self.held.clear();
         self.parked.clear();
@@ -1750,6 +1771,23 @@ impl<D: Device> Realtek<D> {
             .iter_mut()
             .find(|heard| heard.observation.bss().bssid == bss.bssid);
         match known {
+            // cfg80211 keeps a BSS's beacon apart from its probe responses
+            // (`beacon_ies`): a probe response on the beacon's channel
+            // leaves the beacon the observation, as the association needs
+            // its TIM, named by the response where the beacon hides its
+            // SSID (`cfg80211_update_hidden_bsses`).
+            Some(heard)
+                if bss.kind == ScanKind::ProbeResponse
+                    && heard.observation.bss().kind == ScanKind::Beacon
+                    && heard.observation.bss().channel == bss.channel =>
+            {
+                let mut beacon = heard.observation.bss().clone();
+                beacon.keep_name_of(&bss);
+                if beacon.ssid != heard.observation.bss().ssid {
+                    heard.observation = Arc::new(NativeBssObservation { bss: beacon });
+                }
+                heard.at = now;
+            }
             Some(heard) => {
                 bss.keep_name_of(heard.observation.bss());
                 heard.observation = Arc::new(NativeBssObservation { bss });
@@ -1762,10 +1800,63 @@ impl<D: Device> Realtek<D> {
         }
     }
 
+    /// A beacon outside a scan from the BSS a pending join waits for: kept
+    /// as its observation, and the join begins.
+    fn beacon_for_join(&mut self, frame: &Mpdu, now: u64) -> Result<(), Error> {
+        let Some(pending) = &self.pending_join else {
+            return Ok(());
+        };
+        if frame.header().transmitter != Some(pending.bssid) {
+            return Ok(());
+        }
+        let ticket = self.observed(pending.handle)?.bss().ticket;
+        let mut policy = Admitted(&self.channels);
+        let Ok(bss) = self.scanner.observe_beacon(ticket, frame, &mut policy) else {
+            return Ok(());
+        };
+        if bss.bssid != pending.bssid {
+            return Ok(());
+        }
+        self.hear(bss, now);
+        self.trace.note(now, format_args!("heard its beacon"));
+        self.begin_pending(now)
+    }
+
+    /// Begin the pending join, at its beacon or once it waited long enough.
+    fn begin_pending(&mut self, now: u64) -> Result<(), Error> {
+        let Some(pending) = self.pending_join.take() else {
+            return Ok(());
+        };
+        if let Err(error) = self.begin(pending.handle, pending.join, now) {
+            self.trace
+                .note(now, format_args!("could not begin: {error}"));
+        }
+        Ok(())
+    }
+
+    /// `ieee80211_mgd_auth`: the station's authentication with the BSS a
+    /// scan observed.
+    fn begin(&mut self, handle: usize, join: Join, now: u64) -> Result<(), Error> {
+        let observed = self.observed(handle)?;
+        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
+        let mut policy = Admitted(&self.channels);
+        let action = if join.request.pmf().is_some() {
+            self.station
+                .begin_modern_pmf(join, observed, now, &mut policy)
+        } else {
+            self.station
+                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+        }
+        .map_err(Error::Station)?;
+        self.act(action);
+        Ok(())
+    }
+
     fn management_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         // What is heard outside a scan matters only of the associated AP.
         match header.control & 0xfc {
+            0x80 if self.pending_join.is_some() => return self.beacon_for_join(&frame, now),
             0x80 => return self.beacon_heard(&frame, now),
             0x50 => return Ok(()),
             _ => {}
@@ -2009,6 +2100,14 @@ impl<D: Device> Realtek<D> {
         self.announce_streams()?;
         self.watchdog(now)?;
         self.walk(now)?;
+        if self
+            .pending_join
+            .as_ref()
+            .is_some_and(|pending| now >= pending.until)
+        {
+            self.trace.note(now, format_args!("no beacon heard"));
+            self.begin_pending(now)?;
+        }
         self.release_expired(now);
         let mut policy = Admitted(&self.channels);
         if !self.left
@@ -2195,7 +2294,10 @@ impl<D: Device> Radio for Realtek<D> {
             Stage::Scanned
         } else if self.admitted.is_some() {
             Stage::Admitted
-        } else if self.hop.is_none() && self.station.phase() == Peering::Idle {
+        } else if self.hop.is_none()
+            && self.pending_join.is_none()
+            && self.station.phase() == Peering::Idle
+        {
             Stage::Idle
         } else {
             Stage::Busy
@@ -2306,22 +2408,27 @@ impl<D: Device> Radio for Realtek<D> {
     }
 
     fn join(&mut self, handle: usize, join: Join, _: ()) -> Result<(), Error> {
-        let observed = self.observed(handle)?;
-        let bss = observed.bss().clone();
+        let bss = self.observed(handle)?.bss().clone();
         self.approach(&bss)?;
         let now = self.clock.now_us();
         self.trace.begin(now);
-        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
-        let mut policy = Admitted(&self.channels);
-        let action = if join.request.pmf().is_some() {
-            self.station
-                .begin_modern_pmf(join, observed, now, &mut policy)
-        } else {
-            self.station
-                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+        if bss.kind == ScanKind::Beacon {
+            return self.begin(handle, join, now);
         }
-        .map_err(Error::Station)?;
-        self.act(action);
+        let wait = BEACON_WAIT_INTERVALS * u64::from(bss.beacon_interval.max(1)) * 1024;
+        self.trace.note(
+            now,
+            format_args!(
+                "heard only a probe response: waits {} ms for a beacon",
+                wait / 1000
+            ),
+        );
+        self.pending_join = Some(PendingJoin {
+            handle,
+            join,
+            bssid: bss.bssid,
+            until: now + wait,
+        });
         Ok(())
     }
 
@@ -2604,6 +2711,8 @@ impl<D: Device> Radio for Realtek<D> {
     }
 
     fn deauthenticate(&mut self, reason: u16) -> Result<(), Error> {
+        // A join still waiting for its beacon sent nothing to leave.
+        self.pending_join = None;
         if self.left || self.station.phase() == Peering::Idle {
             return Ok(());
         }

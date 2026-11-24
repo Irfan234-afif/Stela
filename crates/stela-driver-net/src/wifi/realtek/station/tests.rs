@@ -90,6 +90,11 @@ struct Air {
     gone: bool,
     /// The AP's beacons keep its name to themselves.
     hidden: bool,
+    /// The AP answers every probe on its channel, the wildcard's too, as
+    /// the user's AP does on 2.4 GHz, its response after its beacon.
+    answers_probes: bool,
+    /// No beacon of the AP falls in a scan's dwell on its channel.
+    scan_silent: bool,
     /// The AP's group traffic goes under TKIP.
     tkip: bool,
     /// The SSID of each probe.
@@ -128,7 +133,9 @@ impl Air {
                     let name = bytes[26..26 + usize::from(bytes[25])].to_vec();
                     self.probed.extend(self.tuned.last().map(|tuned| tuned.0));
                     let here = self.tuned.last().is_some_and(|t| t.0 == self.channel);
-                    if self.hidden && here && name == SSID {
+                    let answers = (self.hidden && name == SSID)
+                        || (self.answers_probes && (name.is_empty() || name == SSID));
+                    if here && answers {
                         let mut response = advertised(self, self.channel as u8);
                         response[0] = 0x50;
                         response[4..10].copy_from_slice(&LOCAL);
@@ -166,7 +173,7 @@ impl Rtw88 for Model {
         let number = definition.control.number;
         assert_eq!(eirp_mbm, 2000);
         air.tuned.push((number, scanning));
-        if scanning && number == air.channel {
+        if scanning && number == air.channel && !air.scan_silent {
             let mut heard = advertised(&air, number as u8);
             if air.hidden {
                 heard.drain(38..38 + SSID.len());
@@ -512,6 +519,44 @@ fn a_scan_probes_where_it_may_and_only_listens_where_it_may_not() {
     assert!(air.tuned.contains(&(36, true)) && air.tuned.contains(&(48, true)));
     assert_eq!(air.tuned.last(), Some(&(36, false)));
     assert_eq!(air.beacon_filters.first(), Some(&false));
+}
+
+/// The user's AP on 2.4 GHz: an active scan hears its beacon, then its
+/// answer to the probe. The beacon stays the BSS's observation, whose TIM
+/// the association needs, where the probe response took its place and the
+/// station refused each association response the AP sent.
+#[test]
+fn a_probe_response_after_the_beacon_leaves_the_beacon_for_the_association() {
+    let (mut wifi, model) = wifi(&OPEN, 1);
+    model.0.borrow_mut().answers_probes = true;
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let diagnostic = wifi.diagnostic().unwrap_or_default();
+    assert!(!diagnostic.contains("refused"), "{diagnostic}");
+    assert!(!diagnostic.contains("waits"), "{diagnostic}");
+}
+
+/// A scan that heard the AP only in its probe response: the join waits on
+/// the AP's channel for a beacon, then authenticates and associates.
+#[test]
+fn a_join_that_heard_only_a_probe_response_waits_for_the_aps_beacon() {
+    let (mut wifi, model) = wifi(&OPEN, 1);
+    {
+        let mut air = model.0.borrow_mut();
+        air.answers_probes = true;
+        air.scan_silent = true;
+    }
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let diagnostic = wifi.diagnostic().unwrap_or_default();
+    let waits = diagnostic
+        .find("heard only a probe response")
+        .expect(&diagnostic);
+    let beacon = diagnostic.find("heard its beacon").expect(&diagnostic);
+    let sent = diagnostic.find("sent authentication").expect(&diagnostic);
+    assert!(waits < beacon && beacon < sent, "{diagnostic}");
 }
 
 #[test]

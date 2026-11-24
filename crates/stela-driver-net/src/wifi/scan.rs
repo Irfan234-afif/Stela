@@ -405,6 +405,22 @@ impl Scanner {
         Ok(())
     }
 
+    /// A beacon heard outside a scan, from a BSS a scan under `ticket`
+    /// found: cfg80211 keeps a BSS's beacon apart from its probe response
+    /// (`beacon_ies`), and a join that heard only the latter waits on the
+    /// BSS's channel for the former.
+    pub fn observe_beacon(
+        &self,
+        ticket: Ticket,
+        frame: &super::frame::Mpdu,
+        policy: &mut impl Policy,
+    ) -> Result<result::Bss, Error> {
+        if frame.header().control & 0x00fc != 0x80 {
+            return Err(Error::Unsupported("non-beacon outside a scan"));
+        }
+        result::parse(ticket, frame, self.local, policy)
+    }
+
     /// Ticket is bound to the transport/RX scan generation.
     /// Device raw IDs may be narrower; old notification drain is required
     /// before their reuse, never a current-ticket lookup on an old event.
